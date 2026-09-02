@@ -38,7 +38,7 @@ exclude_re = [
     # Payload reader read_at clamps to_read via min(payload_len - offset).
     # The filesystem bounds the actual pread return value independently.
     "VerifiedPayloadReader::read_at",
-    # Dead export copy loop: standard pread/write pattern.
+    # Dead export: opens the object and copies it through std::io::copy.
     "export_dead",
     # Streaming named fallbacks only run when O_TMPFILE is unsupported.
     "named_fallback_streaming",
@@ -55,4 +55,7 @@ exclude_re = [
     # mutants only at 0, which the kernel never returns here. The |->& init
     # mutant is caught by timeout (blocking fd hangs drain).
     "inotify\\.rs.*in (init|add_appear_watch)$",
+    # Read-only open flags: |->^ is equivalent on the disjoint constants
+    # O_RDONLY (0), O_NOFOLLOW, and O_CLOEXEC.
+    "raw_read_open_flags",
 ]

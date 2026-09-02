@@ -428,7 +428,7 @@ fn verify_size(
     Ok(file_stat)
 }
 
-fn verify_payload(
+pub(crate) fn verify_payload(
     fd: BorrowedFd<'_>,
     header: &FixedHeader,
     ext_len: usize,

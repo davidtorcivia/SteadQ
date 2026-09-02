@@ -7362,3 +7362,58 @@ fn watermark_advance_under_enospc_refuses_without_poisoning() {
     );
     fs::fault::reset();
 }
+
+#[test]
+fn list_dead_returns_authenticated_dead_objects_only() {
+    let (tmp, mut queue) = create_test_queue();
+    assert_eq!(queue.list_dead().unwrap(), Vec::new());
+    let lease = enqueue_and_lease(&mut queue);
+    assert!(matches!(
+        queue.bury(&lease, DeadReason::AdministrativeBury),
+        TransitionOutcome::Committed
+    ));
+    let expected: Vec<_> = queue
+        .inspect(&lease.job_id)
+        .into_iter()
+        .filter(|s| s.state == "dead")
+        .collect();
+    assert_eq!(expected.len(), 1);
+    let dead_dir = tmp
+        .path()
+        .join(expected[0].relative_path.rsplit_once('/').unwrap().0);
+    // A stray name and a real name whose tag belongs to another queue are
+    // both invisible.
+    std::fs::write(dead_dir.join("garbage.sqj"), b"x").unwrap();
+    let foreign = expected[0].relative_path.rsplit_once('/').unwrap().1;
+    let mut foreign = foreign.to_string();
+    let tag_start = foreign.rfind(".k").unwrap() + 2;
+    foreign.replace_range(tag_start..tag_start + 1, "0");
+    if foreign == *expected[0].relative_path.rsplit_once('/').unwrap().1 {
+        foreign.replace_range(tag_start..tag_start + 1, "1");
+    }
+    std::fs::copy(
+        tmp.path().join(&expected[0].relative_path),
+        dead_dir.join(&foreign),
+    )
+    .unwrap();
+
+    let listed = queue.list_dead().unwrap();
+    assert_eq!(listed, expected);
+
+    // Opening dead/ (call 1) or a bucket (call 3, after the listing reopen)
+    // with an error is reported; a bucket that vanished is skipped.
+    for count in [1, 3] {
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", count, libc::EIO);
+        let unreadable = queue.list_dead();
+        fs::fault::reset();
+        assert!(
+            matches!(unreadable, Err(Error::IoFailure(_))),
+            "count {count}: {unreadable:?}"
+        );
+    }
+    fs::fault::inject_errno("open_directory", 3, libc::ENOENT);
+    let vanished = queue.list_dead();
+    fs::fault::reset();
+    assert_eq!(vanished.unwrap(), Vec::new());
+}

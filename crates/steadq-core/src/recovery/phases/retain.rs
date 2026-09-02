@@ -266,21 +266,6 @@ impl Queue {
         self.recovery_cursor.cleanup_temp = None;
     }
 
-    pub fn compact_receipts(
-        &mut self,
-        budget: &WorkBudget,
-        stats: &mut RecoveryStats,
-        deadline_mono: u64,
-    ) {
-        let scan_budget = RecoveryScanBudget::default();
-        let mut scan_stats = RecoveryScanStats::default();
-        let mut scan = RecoveryScanContext {
-            budget: &scan_budget,
-            stats: &mut scan_stats,
-        };
-        self.compact_receipts_with_scan_budget(budget, &mut scan, stats, deadline_mono);
-    }
-
     pub(crate) fn compact_receipts_with_scan_budget(
         &mut self,
         budget: &WorkBudget,
@@ -985,6 +970,7 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
+                    let previous_entry_cursor = self.recovery_cursor.delete_receipts.clone();
                     self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
                         bucket_entry.as_bytes(),
                         shard_entry.as_bytes(),
@@ -1003,14 +989,30 @@ impl Queue {
                     if !entry.ends_with(".rct") {
                         continue;
                     }
-                    // Validate the receipt filename before operating.
+                    // A receipt name that does not parse can never pass the
+                    // retention check, so it is quarantined like any other
+                    // malformed object instead of staying forever.
                     if steadq_names::parse_receipt(entry).is_err() {
+                        let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
                         Self::record_error(
                             stats,
                             "receipt_delete_parse",
-                            &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                            &relative_path,
                             "receipt filename does not parse",
                         );
+                        if !self.quarantine_recovery_object(
+                            RecoveryQuarantineCandidate {
+                                source_directory_fd: shard_fd.as_fd(),
+                                filename: entry,
+                                relative_path: &relative_path,
+                                reason: crate::QuarantineReason::FilenameParseFailed,
+                            },
+                            stats,
+                            budget,
+                        ) {
+                            self.recovery_cursor.delete_receipts = previous_entry_cursor;
+                            return;
+                        }
                         continue;
                     }
 

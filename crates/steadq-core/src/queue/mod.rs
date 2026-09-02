@@ -5,6 +5,7 @@ mod consumer;
 mod cursors;
 pub mod engine;
 mod inspect;
+pub(crate) use inspect::{copy_file_to_path, raw_read_open_flags};
 pub mod layout;
 mod lease;
 mod options;

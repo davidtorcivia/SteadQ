@@ -44,6 +44,19 @@ impl Queue {
         };
         bucket_dirs.sort();
 
+        // Only buckets at or below the current wall bucket are promoted.
+        let Some(current_wall_bucket) =
+            steadq_math::bucket_number(wall_floor.unix_ns(), self.format.delayed_bucket_width_ns())
+        else {
+            Self::block_phase(
+                stats,
+                "promote_wall_bucket",
+                "delayed",
+                "wall floor has no delayed bucket",
+            );
+            return;
+        };
+
         for bucket_entry in &bucket_dirs {
             // Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.promote_delayed {
@@ -77,15 +90,6 @@ impl Queue {
                     );
                     continue;
                 }
-            };
-
-            // Read effective wall floor
-            let current_wall_bucket = match steadq_math::bucket_number(
-                wall_floor.unix_ns(),
-                self.format.delayed_bucket_width_ns(),
-            ) {
-                Some(bucket) => bucket,
-                None => return,
             };
 
             // Only promote buckets at or below the current wall bucket
@@ -274,7 +278,30 @@ impl Queue {
 
                     let parsed = match steadq_names::parse_delayed(entry) {
                         Ok(p) => p,
-                        Err(_) => continue,
+                        Err(_) => {
+                            let relative_path =
+                                format!("delayed/{bucket_name}/{shard_name}/{entry}");
+                            Self::record_error(
+                                stats,
+                                "promote_parse",
+                                &relative_path,
+                                "malformed delayed filename",
+                            );
+                            if !self.quarantine_recovery_object(
+                                RecoveryQuarantineCandidate {
+                                    source_directory_fd: shard_fd.as_fd(),
+                                    filename: entry,
+                                    relative_path: &relative_path,
+                                    reason: crate::QuarantineReason::FilenameParseFailed,
+                                },
+                                stats,
+                                budget,
+                            ) {
+                                self.recovery_cursor.promote_delayed = previous_entry_cursor;
+                                return;
+                            }
+                            continue;
+                        }
                     };
 
                     // Validate object structure before promotion
@@ -315,7 +342,8 @@ impl Queue {
 
                     stats.operations_attempted += 1;
                     let relative_path = format!("delayed/{bucket_name}/{shard_name}/{entry}");
-                    match self.promote_to_ready(bucket_name, shard_name, entry, &parsed.common) {
+                    match self.promote_to_ready(shard_fd.as_fd(), shard_name, entry, &parsed.common)
+                    {
                         Ok(()) => stats.delayed_promoted += 1,
                         Err(failure) => Self::record_move_failure(
                             stats,
@@ -334,7 +362,7 @@ impl Queue {
 
     pub(crate) fn promote_to_ready(
         &self,
-        bucket: &str,
+        src_fd: BorrowedFd<'_>,
         shard: &str,
         delayed_name: &str,
         common: &steadq_names::CommonFields,
@@ -348,13 +376,7 @@ impl Queue {
             )?;
         let ready_name =
             steadq_names::make_ready_name(self.format.queue_id(), shard, &ready_common);
-        let src_dir = format!("delayed/{bucket}/{shard}");
         let dest_dir = format!("ready/{shard}");
-        let src_fd =
-            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: error,
-            })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
@@ -362,6 +384,6 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(src_fd.as_fd(), delayed_name, dest_fd.as_fd(), &ready_name)
+        move_verified_noreplace(src_fd, delayed_name, dest_fd.as_fd(), &ready_name)
     }
 }

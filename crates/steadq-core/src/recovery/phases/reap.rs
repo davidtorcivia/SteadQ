@@ -498,9 +498,7 @@ impl Queue {
                             );
                             stats.operations_attempted += 1;
                             match self.reap_to_dead(
-                                boot_dir_name,
-                                bucket_name,
-                                shard_name,
+                                shard_fd.as_fd(),
                                 entry,
                                 &parsed.common,
                                 DeadReason::AttemptsExhausted,
@@ -521,8 +519,7 @@ impl Queue {
                             );
                             stats.operations_attempted += 1;
                             match self.reap_to_ready(
-                                boot_dir_name,
-                                bucket_name,
+                                shard_fd.as_fd(),
                                 shard_name,
                                 entry,
                                 &parsed.common,
@@ -560,16 +557,19 @@ impl Queue {
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
-        for shard in 0..self.format.shard_count() {
+        let first_shard = self.recovery_cursor.reap_colocated_shard.unwrap_or(0);
+        for shard in first_shard..self.format.shard_count() {
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.reap_colocated_shard = Some(shard);
                 return;
             }
             let ready_dir = self.layout().ready_shard_dir(shard);
             let shard_fd = match open_relative(self.root_fd(), &ready_dir) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
+                    Self::record_error(stats, "reap_shard_open", &ready_dir, &error.to_string());
                     continue;
                 }
             };
@@ -638,6 +638,7 @@ impl Queue {
                 }
                 if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
+                    self.recovery_cursor.reap_colocated_shard = Some(shard);
                     return;
                 }
                 stats.operations_attempted += 1;
@@ -652,7 +653,7 @@ impl Queue {
                         continue;
                     };
                     match self.reap_colocated_to_dead(
-                        shard,
+                        shard_fd.as_fd(),
                         entry,
                         &parsed.common,
                         DeadReason::AttemptsExhausted,
@@ -667,7 +668,7 @@ impl Queue {
                         ),
                     }
                 } else {
-                    match self.reap_colocated_to_ready(shard, entry, &parsed.common) {
+                    match self.reap_colocated_to_ready(shard_fd.as_fd(), entry, &parsed.common) {
                         Ok(()) => stats.leases_reaped += 1,
                         Err(failure) => Self::record_move_failure(
                             stats,
@@ -679,15 +680,15 @@ impl Queue {
                 }
             }
         }
+        self.recovery_cursor.reap_colocated_shard = None;
     }
 
     pub(crate) fn reap_colocated_to_ready(
         &self,
-        shard: u32,
+        shard_fd: BorrowedFd<'_>,
         leased_name: &str,
         common: &steadq_names::CommonFields,
     ) -> Result<(), MoveFailure> {
-        let dest_dir = self.layout().ready_shard_dir(shard);
         let ready_common =
             crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToReady, common)
                 .map_err(|_| MoveFailure::NotCommitted {
@@ -695,24 +696,17 @@ impl Queue {
                     source: std::io::Error::other("generation or attempt overflow"),
                 })?;
         let ready_name = self.layout().ready(&ready_common).filename;
-        let dir_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
-            MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: error,
-            }
-        })?;
-        move_verified_noreplace(dir_fd.as_fd(), leased_name, dir_fd.as_fd(), &ready_name)
+        move_verified_noreplace(shard_fd, leased_name, shard_fd, &ready_name)
     }
 
     pub(crate) fn reap_colocated_to_dead(
         &self,
-        shard: u32,
+        src_fd: BorrowedFd<'_>,
         leased_name: &str,
         common: &steadq_names::CommonFields,
         reason: DeadReason,
         wall_floor: WallFloor,
     ) -> Result<(), MoveFailure> {
-        let src_dir = self.layout().ready_shard_dir(shard);
         let terminal_bucket = steadq_math::bucket_number(
             wall_floor.unix_ns(),
             self.format.terminal_bucket_width_ns(),
@@ -736,38 +730,22 @@ impl Queue {
                 phase: MovePhase::EnsureDest,
                 source: error,
             })?;
-        let src_fd =
-            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: error,
-            })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
                 source: error,
             }
         })?;
-        move_verified_noreplace(
-            src_fd.as_fd(),
-            leased_name,
-            dest_fd.as_fd(),
-            &dead_target.filename,
-        )
+        move_verified_noreplace(src_fd, leased_name, dest_fd.as_fd(), &dead_target.filename)
     }
 
     pub(crate) fn reap_to_ready(
         &self,
-        boot_dir: &str,
-        bucket: &str,
+        src_fd: BorrowedFd<'_>,
         shard: &str,
         leased_name: &str,
         common: &steadq_names::CommonFields,
     ) -> Result<(), MoveFailure> {
-        let leased_bucket =
-            steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: std::io::Error::other(format!("invalid bucket: {bucket}")),
-            })?;
         let shard_num = match u32::from_str_radix(shard, 16) {
             Ok(n) => n,
             Err(_) => {
@@ -777,9 +755,6 @@ impl Queue {
                 })
             }
         };
-        let src_dir = self
-            .layout()
-            .leased_shard_dir(boot_dir, leased_bucket, shard_num);
         let dest_dir = self.layout().ready_shard_dir(shard_num);
 
         let ready_common =
@@ -792,11 +767,6 @@ impl Queue {
         let ready_target = self.layout().ready(&ready_common);
         let ready_name = ready_target.filename;
 
-        let src_fd =
-            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: error,
-            })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
@@ -804,37 +774,18 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(src_fd.as_fd(), leased_name, dest_fd.as_fd(), &ready_name)
+        move_verified_noreplace(src_fd, leased_name, dest_fd.as_fd(), &ready_name)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reap_to_dead(
         &self,
-        boot_dir: &str,
-        bucket: &str,
-        shard: &str,
+        src_fd: BorrowedFd<'_>,
         leased_name: &str,
         common: &steadq_names::CommonFields,
         reason: DeadReason,
         wall_floor: WallFloor,
     ) -> Result<(), MoveFailure> {
-        let leased_bucket =
-            steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: std::io::Error::other(format!("invalid bucket: {bucket}")),
-            })?;
-        let shard_num = match u32::from_str_radix(shard, 16) {
-            Ok(n) => n,
-            Err(_) => {
-                return Err(MoveFailure::NotCommitted {
-                    phase: MovePhase::PreRename,
-                    source: std::io::Error::other(format!("invalid shard: {shard}")),
-                })
-            }
-        };
-        let src_dir = self
-            .layout()
-            .leased_shard_dir(boot_dir, leased_bucket, shard_num);
         let terminal_bucket = steadq_math::bucket_number(
             wall_floor.unix_ns(),
             self.format.terminal_bucket_width_ns(),
@@ -862,11 +813,6 @@ impl Queue {
                 phase: MovePhase::EnsureDest,
                 source: error,
             })?;
-        let src_fd =
-            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: error,
-            })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
@@ -874,6 +820,6 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(src_fd.as_fd(), leased_name, dest_fd.as_fd(), &dead_name)
+        move_verified_noreplace(src_fd, leased_name, dest_fd.as_fd(), &dead_name)
     }
 }
