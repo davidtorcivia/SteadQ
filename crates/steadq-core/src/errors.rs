@@ -51,6 +51,30 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Why a handle refuses further mutations. A handle poisons only when its
+/// cached state or capability can no longer be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoisonReason {
+    /// A transition linearized but a later barrier or check failed, so the
+    /// handle cannot know what is durable. The operation returned a ticket.
+    PostLinearizationStateUnknown,
+    /// The shared wall watermark could not be authenticated or advanced.
+    WatermarkAuthorityLost,
+    /// An object the handle itself published or leased no longer matches
+    /// the protocol, so its cached identities are unreliable.
+    InternalInvariantViolation,
+}
+
+impl std::fmt::Display for PoisonReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PostLinearizationStateUnknown => "post-linearization state unknown",
+            Self::WatermarkAuthorityLost => "wall watermark authority lost",
+            Self::InternalInvariantViolation => "internal invariant violation",
+        })
+    }
+}
+
 /// Operation result for mutations. Every mutating operation returns one of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationResult {

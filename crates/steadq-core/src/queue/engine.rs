@@ -174,14 +174,6 @@ pub enum MoveFailure {
     SourceMissing,
 }
 
-#[derive(Debug)]
-pub(super) enum MoveFailureWith<E> {
-    NotCommitted { phase: MovePhase, source: E },
-    OutcomeUnknown { phase: MovePhase, source: E },
-    AlreadyExists,
-    SourceMissing,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TmpfilePublishPhase {
     SourceIdentity,
@@ -341,20 +333,6 @@ impl MoveFailure {
     }
 }
 
-impl<E> MoveFailureWith<E> {
-    pub(super) fn is_outcome_unknown(&self) -> bool {
-        matches!(self, Self::OutcomeUnknown { .. })
-    }
-
-    #[cfg(test)]
-    fn phase(&self) -> Option<MovePhase> {
-        match self {
-            Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
-            Self::AlreadyExists | Self::SourceMissing => None,
-        }
-    }
-}
-
 impl TmpfilePublishFailure {
     #[cfg(test)]
     fn is_outcome_unknown(&self) -> bool {
@@ -366,19 +344,6 @@ impl TmpfilePublishFailure {
         match self {
             Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
             Self::AlreadyExists => None,
-        }
-    }
-}
-
-impl From<MoveFailureWith<std::io::Error>> for MoveFailure {
-    fn from(failure: MoveFailureWith<std::io::Error>) -> Self {
-        match failure {
-            MoveFailureWith::NotCommitted { phase, source } => Self::NotCommitted { phase, source },
-            MoveFailureWith::OutcomeUnknown { phase, source } => {
-                Self::OutcomeUnknown { phase, source }
-            }
-            MoveFailureWith::AlreadyExists => Self::AlreadyExists,
-            MoveFailureWith::SourceMissing => Self::SourceMissing,
         }
     }
 }
@@ -408,10 +373,8 @@ pub fn move_verified_noreplace(
             source_identity: None,
             directory_durability: DirectoryDurability::Strict,
         },
-        |error| error,
         |_| Ok(()),
     )
-    .map_err(MoveFailure::from)
 }
 
 pub fn move_witnessed_noreplace(
@@ -449,13 +412,11 @@ pub fn move_witnessed_noreplace_with<T>(
             source_identity: Some(source_identity),
             directory_durability: DirectoryDurability::Strict,
         },
-        |error| error,
         move |moved| {
             let moved = moved.expect("witnessed move authenticates its destination");
             after_linearization(moved).map(|output| (moved, output))
         },
     )
-    .map_err(MoveFailure::from)
 }
 
 pub(super) fn move_witnessed_noreplace_io(
@@ -464,7 +425,7 @@ pub(super) fn move_witnessed_noreplace_io(
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     source_identity: MoveIdentity,
-) -> Result<(), MoveFailureWith<std::io::Error>> {
+) -> Result<(), MoveFailure> {
     move_noreplace(
         src_dir_fd,
         src_name,
@@ -474,32 +435,30 @@ pub(super) fn move_witnessed_noreplace_io(
             source_identity: Some(source_identity),
             directory_durability: DirectoryDurability::Strict,
         },
-        |error| error,
         |_| Ok(()),
     )
 }
 
-fn move_noreplace<T, E>(
+fn move_noreplace<T>(
     src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     options: MoveOptions,
-    map_io_error: impl Fn(std::io::Error) -> E,
-    after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, E>,
-) -> Result<T, MoveFailureWith<E>> {
+    after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, std::io::Error>,
+) -> Result<T, MoveFailure> {
     match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
         Ok(()) => {}
         Err(e) if is_already_exists_io_kind(e.kind()) => {
-            return Err(MoveFailureWith::AlreadyExists);
+            return Err(MoveFailure::AlreadyExists);
         }
         Err(e) if is_not_found_io_kind(e.kind()) => {
-            return Err(MoveFailureWith::SourceMissing);
+            return Err(MoveFailure::SourceMissing);
         }
         Err(e) => {
-            return Err(MoveFailureWith::NotCommitted {
+            return Err(MoveFailure::NotCommitted {
                 phase: MovePhase::Rename,
-                source: map_io_error(e),
+                source: e,
             });
         }
     };
@@ -513,17 +472,15 @@ fn move_noreplace<T, E>(
                 size: stat.st_size.max(0) as u64,
             }),
             Ok(_) => {
-                return Err(MoveFailureWith::OutcomeUnknown {
+                return Err(MoveFailure::OutcomeUnknown {
                     phase: MovePhase::DestinationIdentity,
-                    source: map_io_error(std::io::Error::other(
-                        "destination identity changed after rename",
-                    )),
+                    source: std::io::Error::other("destination identity changed after rename"),
                 });
             }
             Err(error) => {
-                return Err(MoveFailureWith::OutcomeUnknown {
+                return Err(MoveFailure::OutcomeUnknown {
                     phase: MovePhase::DestinationIdentity,
-                    source: map_io_error(error),
+                    source: error,
                 });
             }
         }
@@ -531,7 +488,7 @@ fn move_noreplace<T, E>(
         None
     };
 
-    let output = after_linearization(moved).map_err(|source| MoveFailureWith::OutcomeUnknown {
+    let output = after_linearization(moved).map_err(|source| MoveFailure::OutcomeUnknown {
         phase: MovePhase::PostLinearization,
         source,
     })?;
@@ -541,9 +498,9 @@ fn move_noreplace<T, E>(
     }
 
     if let Err(e) = fs::fsync_dir_fd(dest_dir_fd) {
-        return Err(MoveFailureWith::OutcomeUnknown {
+        return Err(MoveFailure::OutcomeUnknown {
             phase: MovePhase::DestFsync,
-            source: map_io_error(e),
+            source: e,
         });
     }
 
@@ -552,9 +509,9 @@ fn move_noreplace<T, E>(
     }
 
     if let Err(e) = fs::fsync_dir_fd(src_dir_fd) {
-        return Err(MoveFailureWith::OutcomeUnknown {
+        return Err(MoveFailure::OutcomeUnknown {
             phase: MovePhase::SourceFsync,
-            source: map_io_error(e),
+            source: e,
         });
     }
     Ok(output)
@@ -908,13 +865,11 @@ pub fn move_witnessed_noreplace_deferred<T>(
             source_identity: Some(source_identity),
             directory_durability: DirectoryDurability::Deferred,
         },
-        |e| e,
         move |moved| {
             let moved = moved.expect("witnessed move authenticates its destination");
             after_linearization(moved).map(|output| (moved, output))
         },
     )
-    .map_err(MoveFailure::from)
 }
 
 pub(super) fn publish_tmpfile_noreplace_deferred_with_mode(
@@ -1609,8 +1564,8 @@ mod tests {
             assert_eq!(failure.phase(), Some(expected_phase));
             assert_eq!(failure.is_outcome_unknown(), outcome_unknown);
             let source = match failure {
-                MoveFailureWith::NotCommitted { source, .. }
-                | MoveFailureWith::OutcomeUnknown { source, .. } => source,
+                MoveFailure::NotCommitted { source, .. }
+                | MoveFailure::OutcomeUnknown { source, .. } => source,
                 other => panic!("expected I/O failure, got {other:?}"),
             };
             assert_eq!(source.raw_os_error(), Some(errno));
