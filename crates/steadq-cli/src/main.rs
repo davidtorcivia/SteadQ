@@ -57,6 +57,22 @@ fn exit_io(error: &std::io::Error) -> ExitCode {
     })
 }
 
+/// Open the queue or print the failure and hand back the spec exit code.
+fn open_or_exit(path: &std::path::Path) -> Result<Queue, ExitCode> {
+    Queue::open(path, &OpenOptions::default()).map_err(|e| {
+        eprintln!("open failed: {e}");
+        exit_core(&e)
+    })
+}
+
+/// Parse a 32-digit lowercase hex identifier or exit 1 naming the field.
+fn parse_hex_id(value: &str, label: &str) -> Result<[u8; 16], ExitCode> {
+    steadq_names::hex_decode_16(value).ok_or_else(|| {
+        eprintln!("invalid {label}");
+        exit(EXIT_ORDINARY)
+    })
+}
+
 fn escape_os_bytes(value: &std::ffi::OsStr) -> String {
     value
         .as_bytes()
@@ -395,9 +411,9 @@ fn main() -> ExitCode {
 }
 
 fn cmd_compact_receipts(path: PathBuf) -> ExitCode {
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     let stats = queue.recover(&steadq_core::WorkBudget::default());
     eprintln!(
@@ -408,16 +424,13 @@ fn cmd_compact_receipts(path: PathBuf) -> ExitCode {
 }
 
 fn cmd_quarantine_remove(path: PathBuf, quarantine_id: String) -> ExitCode {
-    let qid = match steadq_names::hex_decode_16(&quarantine_id) {
-        Some(b) => b,
-        None => {
-            eprintln!("invalid quarantine_id");
-            return exit(EXIT_ORDINARY);
-        }
+    let qid = match parse_hex_id(&quarantine_id, "quarantine_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     match queue.remove_quarantine(&qid) {
         Ok(true) => {
@@ -428,21 +441,21 @@ fn cmd_quarantine_remove(path: PathBuf, quarantine_id: String) -> ExitCode {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
-        Err(_) => exit(EXIT_IO_FAILURE),
+        Err(e) => {
+            eprintln!("remove failed: {e}");
+            exit_io(&e)
+        }
     }
 }
 
 fn cmd_quarantine_export(path: PathBuf, quarantine_id: String, output: PathBuf) -> ExitCode {
-    let qid = match steadq_names::hex_decode_16(&quarantine_id) {
-        Some(b) => b,
-        None => {
-            eprintln!("invalid quarantine_id");
-            return exit(EXIT_ORDINARY);
-        }
+    let qid = match parse_hex_id(&quarantine_id, "quarantine_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     match queue.export_quarantine(&qid, &output) {
         Ok(n) => {
@@ -453,21 +466,21 @@ fn cmd_quarantine_export(path: PathBuf, quarantine_id: String, output: PathBuf) 
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
-        Err(_) => exit(EXIT_IO_FAILURE),
+        Err(e) => {
+            eprintln!("export failed: {e}");
+            exit_io(&e)
+        }
     }
 }
 
 fn cmd_quarantine_inspect(path: PathBuf, quarantine_id: String) -> ExitCode {
-    let qid = match steadq_names::hex_decode_16(&quarantine_id) {
-        Some(b) => b,
-        None => {
-            eprintln!("invalid quarantine_id");
-            return exit(EXIT_ORDINARY);
-        }
+    let qid = match parse_hex_id(&quarantine_id, "quarantine_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     match queue.find_quarantine(&qid) {
         Some(entry) => {
@@ -490,9 +503,9 @@ fn cmd_quarantine_inspect(path: PathBuf, quarantine_id: String) -> ExitCode {
 }
 
 fn cmd_quarantine_list(path: PathBuf) -> ExitCode {
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     for entry in queue.list_quarantine() {
         println!(
@@ -506,13 +519,13 @@ fn cmd_quarantine_list(path: PathBuf) -> ExitCode {
 }
 
 fn cmd_dead_remove(path: PathBuf, job_id: String) -> ExitCode {
-    let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
-        Some(b) => b,
-        None => return exit(EXIT_ORDINARY),
+    let job_id_bytes = match parse_hex_id(&job_id, "job_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     match queue.remove_dead(&job_id_bytes) {
         Ok(true) => {
@@ -527,18 +540,21 @@ fn cmd_dead_remove(path: PathBuf, job_id: String) -> ExitCode {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
-        Err(_) => exit(EXIT_IO_FAILURE),
+        Err(e) => {
+            eprintln!("remove failed: {e}");
+            exit_core(&e)
+        }
     }
 }
 
 fn cmd_dead_export(path: PathBuf, job_id: String, output: PathBuf) -> ExitCode {
-    let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
-        Some(b) => b,
-        None => return exit(EXIT_ORDINARY),
+    let job_id_bytes = match parse_hex_id(&job_id, "job_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     match queue.export_dead(&job_id_bytes, &output) {
         Ok(n) => {
@@ -549,18 +565,21 @@ fn cmd_dead_export(path: PathBuf, job_id: String, output: PathBuf) -> ExitCode {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
-        Err(_) => exit(EXIT_IO_FAILURE),
+        Err(e) => {
+            eprintln!("export failed: {e}");
+            exit_core(&e)
+        }
     }
 }
 
 fn cmd_dead_inspect(path: PathBuf, job_id: String) -> ExitCode {
-    let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
-        Some(b) => b,
-        None => return exit(EXIT_ORDINARY),
+    let job_id_bytes = match parse_hex_id(&job_id, "job_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(code) => return code,
     };
     for s in queue
         .inspect(&job_id_bytes)
@@ -582,7 +601,10 @@ fn cmd_dead_list(path: PathBuf) -> ExitCode {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return exit(EXIT_SUCCESS);
         }
-        Err(_) => return exit(EXIT_IO_FAILURE),
+        Err(e) => {
+            eprintln!("dead list failed: {e}");
+            return exit_io(&e);
+        }
     };
     for bucket in entries.flatten() {
         let shards = match std::fs::read_dir(bucket.path()) {
@@ -614,40 +636,43 @@ fn cmd_bench(
     payload_size: usize,
     lease_duration_seconds: u64,
 ) -> ExitCode {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let Some(lease_ns) = parse_duration_seconds(lease_duration_seconds) else {
+        eprintln!("lease duration overflows nanoseconds");
+        return exit(EXIT_ORDINARY);
+    };
     eprintln!(
         "bench: {producers} producers, {consumers} consumers, {duration_seconds}s, {payload_size}B payload"
     );
 
     let payload = vec![0x42u8; payload_size];
-    let duration = std::time::Duration::from_secs(duration_seconds);
-    let deadline = std::time::Instant::now() + duration;
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-    use std::thread;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_seconds);
+    let open_worker = |p: &PathBuf| {
+        Queue::open(
+            p,
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+    };
 
     let enqueued = Arc::new(AtomicU64::new(0));
     let leased = Arc::new(AtomicU64::new(0));
     let acked = Arc::new(AtomicU64::new(0));
-
-    let mut handles = Vec::new();
+    let mut handles: Vec<thread::JoinHandle<Result<(), Error>>> = Vec::new();
 
     // Producers: reuse one queue handle per worker
     for _ in 0..producers {
         let p = path.clone();
         let payload = payload.clone();
         let enqueued = enqueued.clone();
-        let dl = deadline;
         handles.push(thread::spawn(move || {
-            let mut queue = Queue::open(
-                &p,
-                &OpenOptions {
-                    allow_unsupported_fs: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            while std::time::Instant::now() < dl {
+            let mut queue = open_worker(&p)?;
+            while std::time::Instant::now() < deadline {
                 if let steadq_core::EnqueueOutcome::Committed(_) = queue.enqueue(EnqueueInput {
                     maximum_attempts: 3,
                     content_type: "bench".to_string(),
@@ -657,26 +682,18 @@ fn cmd_bench(
                     enqueued.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            Ok(())
         }));
     }
 
     // Consumers: reuse one queue handle per worker
-    let lease_ns = lease_duration_seconds * 1_000_000_000;
     for _ in 0..consumers {
         let p = path.clone();
         let leased = leased.clone();
         let acked = acked.clone();
-        let dl = deadline;
         handles.push(thread::spawn(move || {
-            let mut queue = Queue::open(
-                &p,
-                &OpenOptions {
-                    allow_unsupported_fs: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            while std::time::Instant::now() < dl {
+            let mut queue = open_worker(&p)?;
+            while std::time::Instant::now() < deadline {
                 match queue.lease(0, lease_ns) {
                     steadq_core::LeaseOutcome::Leased(l) => {
                         leased.fetch_add(1, Ordering::Relaxed);
@@ -684,16 +701,26 @@ fn cmd_bench(
                             acked.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    _ => {
-                        thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                    _ => thread::sleep(std::time::Duration::from_millis(1)),
                 }
             }
+            Ok(())
         }));
     }
 
+    let mut failure = None;
     for h in handles {
-        h.join().unwrap();
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("worker open failed: {e}");
+                failure.get_or_insert(exit_core(&e));
+            }
+            Err(_) => {
+                eprintln!("worker panicked");
+                failure.get_or_insert(exit(EXIT_IO_FAILURE));
+            }
+        }
     }
 
     let elapsed = duration_seconds as f64;
@@ -704,7 +731,7 @@ fn cmd_bench(
     eprintln!("enqueued: {} ({:.0}/s)", eq, eq as f64 / elapsed);
     eprintln!("leased: {} ({:.0}/s)", lq, lq as f64 / elapsed);
     eprintln!("acked: {} ({:.0}/s)", aq, aq as f64 / elapsed);
-    exit(EXIT_SUCCESS)
+    failure.unwrap_or_else(|| exit(EXIT_SUCCESS))
 }
 
 fn cmd_resolve(path: PathBuf, result_file: PathBuf, stabilize: bool) -> ExitCode {
@@ -712,7 +739,7 @@ fn cmd_resolve(path: PathBuf, result_file: PathBuf, stabilize: bool) -> ExitCode
         Ok(d) => d,
         Err(e) => {
             eprintln!("read result file failed: {e}");
-            return exit(EXIT_ORDINARY);
+            return exit_io(&e);
         }
     };
     let ticket = match steadq_core::TransitionTicket::from_json(&data) {
@@ -723,12 +750,9 @@ fn cmd_resolve(path: PathBuf, result_file: PathBuf, stabilize: bool) -> ExitCode
         }
     };
 
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit(EXIT_IO_FAILURE);
-        }
+        Err(code) => return code,
     };
     let (source_path, dest_path) = match queue.transition_ticket_paths(&ticket) {
         Ok(paths) => paths,
@@ -764,7 +788,7 @@ fn cmd_resolve(path: PathBuf, result_file: PathBuf, stabilize: bool) -> ExitCode
         }
         steadq_core::ResolutionOutcome::ResolutionFailed(e) => {
             eprintln!("resolution failed: {e}");
-            exit(EXIT_IO_FAILURE)
+            exit_core(&e)
         }
     }
 }
@@ -774,12 +798,9 @@ fn cmd_recover(path: PathBuf, watch: bool, budget_ops: u32, budget_ms: u64) -> E
         max_operations: budget_ops,
         max_duration_ms: budget_ms,
     };
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     loop {
         let stats = queue.recover(&budget);
@@ -825,6 +846,95 @@ fn cmd_work(
     exit(work::run(&path, concurrency, lease_ns, once, &command))
 }
 
+/// Why a record file could not be described.
+enum RecordError {
+    Unrecognized,
+    Corrupt(String),
+}
+
+/// Decode any SteadQ on-disk record by magic into printable fields.
+/// `deep` also verifies a job's payload digest.
+fn describe_record(data: &[u8], deep: bool) -> Result<Vec<(&'static str, String)>, RecordError> {
+    let hex = steadq_names::hex_encode;
+    let magic = data.get(..8).ok_or(RecordError::Unrecognized)?;
+    let corrupt = |e: &dyn std::fmt::Display| RecordError::Corrupt(e.to_string());
+    if magic == steadq_format::JOB_MAGIC {
+        let envelope =
+            steadq_format::ValidatedEnvelope::from_bytes(data, deep).map_err(|e| corrupt(&e))?;
+        let h = envelope.header;
+        let mut fields = vec![
+            ("type", "job".to_string()),
+            ("job_id", hex(&h.job_id)),
+            ("payload_length", h.payload_length.to_string()),
+            (
+                "extension_header_length",
+                h.extension_header_length.to_string(),
+            ),
+            ("maximum_attempts", h.maximum_attempts.to_string()),
+            ("payload_digest", hex(&h.payload_digest)),
+            (
+                "envelope_digest",
+                format!("{} (verified)", hex(&h.envelope_digest)),
+            ),
+        ];
+        if deep {
+            fields.push(("payload_digest_verified", "true".to_string()));
+        }
+        return Ok(fields);
+    }
+    if magic == steadq_format::FORMAT_MAGIC {
+        let f = steadq_format::FormatRecord::decode(data).map_err(|e| corrupt(&e))?;
+        return Ok(vec![
+            ("type", "format".to_string()),
+            ("queue_id", hex(f.queue_id())),
+            ("shard_count", f.shard_count().to_string()),
+            (
+                "lease_bucket_width_ns",
+                f.lease_bucket_width_ns().to_string(),
+            ),
+            (
+                "delayed_bucket_width_ns",
+                f.delayed_bucket_width_ns().to_string(),
+            ),
+            (
+                "terminal_bucket_width_ns",
+                f.terminal_bucket_width_ns().to_string(),
+            ),
+            ("max_payload_length", f.max_payload_length().to_string()),
+        ]);
+    }
+    if magic == steadq_format::RECEIPT_MAGIC {
+        let r = steadq_format::CompactReceipt::decode(data).map_err(|e| corrupt(&e))?;
+        return Ok(vec![
+            ("type", "receipt".to_string()),
+            ("job_id", hex(&r.job_id)),
+            ("envelope_digest", hex(&r.envelope_digest)),
+            ("final_attempt", r.final_attempt.to_string()),
+            ("lease_token", hex(&r.lease_token)),
+            (
+                "receipt_bucket_start_unix_ns",
+                r.receipt_bucket_start_unix_ns.to_string(),
+            ),
+            (
+                "original_payload_length",
+                r.original_payload_length.to_string(),
+            ),
+        ]);
+    }
+    if magic == steadq_format::WATERMARK_MAGIC {
+        let w = steadq_format::WatermarkRecord::decode(data).map_err(|e| corrupt(&e))?;
+        return Ok(vec![
+            ("type", "watermark".to_string()),
+            (
+                "highest_observed_bucket",
+                w.highest_observed_bucket.to_string(),
+            ),
+            ("sequence", w.sequence.to_string()),
+        ]);
+    }
+    Err(RecordError::Unrecognized)
+}
+
 fn cmd_format_dump(file: PathBuf) -> ExitCode {
     let data = match std::fs::read(&file) {
         Ok(d) => d,
@@ -833,49 +943,21 @@ fn cmd_format_dump(file: PathBuf) -> ExitCode {
             return exit_io(&e);
         }
     };
-    if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
-        match steadq_format::FixedHeader::decode(&data[0..128]) {
-            Ok(h) => {
-                println!("type: job");
-                println!("job_id: {}", steadq_names::hex_encode(&h.job_id));
-                println!("payload_length: {}", h.payload_length);
-                println!("extension_header_length: {}", h.extension_header_length);
-                println!("maximum_attempts: {}", h.maximum_attempts);
-                println!(
-                    "payload_digest: {}",
-                    steadq_names::hex_encode(&h.payload_digest)
-                );
-                println!(
-                    "envelope_digest: {}",
-                    steadq_names::hex_encode(&h.envelope_digest)
-                );
-                exit(EXIT_SUCCESS)
+    match describe_record(&data, false) {
+        Ok(fields) => {
+            for (key, value) in fields {
+                println!("{key}: {value}");
             }
-            Err(e) => {
-                eprintln!("parse error: {e}");
-                exit(EXIT_ORDINARY)
-            }
+            exit(EXIT_SUCCESS)
         }
-    } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
-        match steadq_format::FormatRecord::decode(&data) {
-            Ok(f) => {
-                println!("type: format");
-                println!("queue_id: {}", steadq_names::hex_encode(f.queue_id()));
-                println!("shard_count: {}", f.shard_count());
-                println!("lease_bucket_width_ns: {}", f.lease_bucket_width_ns());
-                println!("delayed_bucket_width_ns: {}", f.delayed_bucket_width_ns());
-                println!("terminal_bucket_width_ns: {}", f.terminal_bucket_width_ns());
-                println!("max_payload_length: {}", f.max_payload_length());
-                exit(EXIT_SUCCESS)
-            }
-            Err(e) => {
-                eprintln!("parse error: {e}");
-                exit(EXIT_ORDINARY)
-            }
+        Err(RecordError::Corrupt(e)) => {
+            eprintln!("parse error: {e}");
+            exit(EXIT_ORDINARY)
         }
-    } else {
-        eprintln!("unrecognized format");
-        exit(EXIT_ORDINARY)
+        Err(RecordError::Unrecognized) => {
+            eprintln!("unrecognized format");
+            exit(EXIT_ORDINARY)
+        }
     }
 }
 
@@ -887,71 +969,29 @@ fn cmd_verify(file: PathBuf, deep: bool) -> ExitCode {
             return exit_io(&e);
         }
     };
-    if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
-        match steadq_format::FixedHeader::decode(&data[0..128]) {
-            Ok(header) => {
-                eprintln!("job_id: {}", steadq_names::hex_encode(&header.job_id));
-                eprintln!("payload_length: {}", header.payload_length);
-                eprintln!("maximum_attempts: {}", header.maximum_attempts);
-                let expected_size =
-                    128 + header.extension_header_length as usize + header.payload_length as usize;
-                if data.len() != expected_size {
-                    eprintln!(
-                        "CORRUPT: expected {} bytes, got {}",
-                        expected_size,
-                        data.len()
-                    );
-                    return exit(EXIT_CORRUPTION);
-                }
-                let ext_bytes = &data[128..128 + header.extension_header_length as usize];
-                if !steadq_format::verify_envelope_digest(&header, ext_bytes) {
-                    eprintln!("CORRUPT: envelope digest mismatch");
-                    return exit(EXIT_CORRUPTION);
-                }
-                eprintln!("envelope_digest: verified");
-                if deep {
-                    let payload = &data[128 + header.extension_header_length as usize..];
-                    let computed = steadq_format::payload_digest(payload);
-                    if computed != header.payload_digest {
-                        eprintln!("CORRUPT: payload digest mismatch");
-                        return exit(EXIT_CORRUPTION);
-                    }
-                    eprintln!("payload_digest: verified");
-                }
-                eprintln!("valid");
-                exit(EXIT_SUCCESS)
+    match describe_record(&data, deep) {
+        Ok(fields) => {
+            for (key, value) in fields {
+                eprintln!("{key}: {value}");
             }
-            Err(e) => {
-                eprintln!("CORRUPT: {e}");
-                exit(EXIT_CORRUPTION)
-            }
+            eprintln!("valid");
+            exit(EXIT_SUCCESS)
         }
-    } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
-        match steadq_format::FormatRecord::decode(&data) {
-            Ok(fmt) => {
-                eprintln!("queue_id: {}", steadq_names::hex_encode(fmt.queue_id()));
-                eprintln!("shard_count: {}", fmt.shard_count());
-                eprintln!("valid");
-                exit(EXIT_SUCCESS)
-            }
-            Err(e) => {
-                eprintln!("CORRUPT: {e}");
-                exit(EXIT_CORRUPTION)
-            }
+        Err(RecordError::Corrupt(e)) => {
+            eprintln!("CORRUPT: {e}");
+            exit(EXIT_CORRUPTION)
         }
-    } else {
-        eprintln!("unknown format");
-        exit(EXIT_ORDINARY)
+        Err(RecordError::Unrecognized) => {
+            eprintln!("unknown format");
+            exit(EXIT_ORDINARY)
+        }
     }
 }
 
 fn cmd_inspect(path: PathBuf, job_id: String) -> ExitCode {
-    let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
-        Some(b) => b,
-        None => {
-            eprintln!("invalid job_id: expected 32 lowercase hex chars");
-            return exit(EXIT_ORDINARY);
-        }
+    let job_id_bytes = match parse_hex_id(&job_id, "job_id") {
+        Ok(b) => b,
+        Err(code) => return code,
     };
     match Queue::open(&path, &OpenOptions::default()) {
         Ok(queue) => {
@@ -976,12 +1016,9 @@ fn cmd_inspect(path: PathBuf, job_id: String) -> ExitCode {
 }
 
 fn cmd_bury(path: PathBuf, handle_file: PathBuf, reason: u16) -> ExitCode {
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let lease = match load_handle(&handle_file, queue.format().queue_id()) {
         Ok(l) => l,
@@ -1013,12 +1050,9 @@ fn cmd_bury(path: PathBuf, handle_file: PathBuf, reason: u16) -> ExitCode {
 }
 
 fn cmd_retry(path: PathBuf, handle_file: PathBuf, after_seconds: Option<u64>) -> ExitCode {
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let lease = match load_handle(&handle_file, queue.format().queue_id()) {
         Ok(l) => l,
@@ -1056,12 +1090,9 @@ fn cmd_retry(path: PathBuf, handle_file: PathBuf, after_seconds: Option<u64>) ->
 }
 
 fn cmd_ack(path: PathBuf, handle_file: PathBuf) -> ExitCode {
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let lease = match load_handle(&handle_file, queue.format().queue_id()) {
         Ok(q) => q,
@@ -1201,12 +1232,9 @@ fn cmd_doctor(path: PathBuf, json: bool) -> ExitCode {
 }
 
 fn cmd_fsck(path: PathBuf, deep: bool, repair: bool) -> ExitCode {
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let opts = FsckOptions {
         mode: if repair {
@@ -1256,13 +1284,15 @@ fn cmd_stats(path: PathBuf, prometheus: bool, json: bool) -> ExitCode {
             let mut stats_map: std::collections::BTreeMap<String, StateStats> =
                 std::collections::BTreeMap::new();
             for state in [
-                "ready",
-                "leased",
-                "delayed",
-                "receipts",
-                "dead",
-                "quarantine",
-            ] {
+                steadq_names::State::Ready,
+                steadq_names::State::Leased,
+                steadq_names::State::Delayed,
+                steadq_names::State::Receipt,
+                steadq_names::State::Dead,
+                steadq_names::State::Quarantine,
+            ]
+            .map(|state| state.dir_name())
+            {
                 let state_path = root.join(state);
                 if state_path.exists() {
                     let stats = match state_stats(&state_path) {
@@ -1327,12 +1357,9 @@ fn cmd_lease(
     handle_file: Option<PathBuf>,
     ticket_out: Option<PathBuf>,
 ) -> ExitCode {
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let mut queue = queue;
 
@@ -1348,7 +1375,7 @@ fn cmd_lease(
             if let Some(ref hf) = handle_file {
                 if let Err(e) = save_handle_to_file(&path, queue.format().queue_id(), hf, &lease) {
                     eprintln!("failed to write handle file: {e}");
-                    return exit(EXIT_IO_FAILURE);
+                    return exit_io(&e);
                 }
             }
             println!("job_id: {}", steadq_names::hex_encode(&lease.job_id));
@@ -1409,12 +1436,9 @@ fn cmd_put(
         },
     };
 
-    let queue = match Queue::open(&path, &OpenOptions::default()) {
+    let queue = match open_or_exit(&path) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return exit_core(&e);
-        }
+        Err(code) => return code,
     };
     let mut queue = queue;
 
@@ -1537,6 +1561,37 @@ struct HandleFile {
     payload_digest: String,
 }
 
+/// Write `bytes` to `path` through a private temp file and rename, then sync
+/// the parent directory on a best-effort basis.
+fn atomic_write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let rand_bytes = steadq_fs_linux::random_128bit()
+        .map(|b| steadq_names::hex_encode(&b))
+        .unwrap_or_else(|_| format!("{}", std::process::id()));
+    let tmp_path = path.with_extension(format!("tmp.{rand_bytes}"));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp_path, path));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_dir) = std::fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 fn write_ticket_file(
     path: &std::path::Path,
     ticket: &steadq_core::TransitionTicket,
@@ -1544,30 +1599,7 @@ fn write_ticket_file(
     let json = ticket
         .to_json()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    let rand_bytes = steadq_fs_linux::random_128bit()
-        .map(|b| steadq_names::hex_encode(&b))
-        .unwrap_or_else(|_| format!("{}", std::process::id()));
-    let tmp_path = path.with_extension(format!("tmp.{rand_bytes}"));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        use std::io::Write;
-        let mut file = opts.open(&tmp_path)?;
-        file.write_all(&json)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(parent_dir) = std::fs::File::open(parent) {
-            let _ = parent_dir.sync_all();
-        }
-    }
-    Ok(())
+    atomic_write_private(path, &json)
 }
 
 fn save_handle_to_file(
@@ -1596,33 +1628,7 @@ fn save_handle_to_file(
         payload_digest: steadq_names::hex_encode(&lease.payload_digest),
     };
     let json = serde_json::to_string_pretty(&handle)?;
-
-    // Atomic write: unique temp name, then rename.
-    let rand_bytes = steadq_fs_linux::random_128bit()
-        .map(|b| steadq_names::hex_encode(&b))
-        .unwrap_or_else(|_| format!("{}", std::process::id()));
-    let tmp_path = handle_path.with_extension(format!("tmp.{rand_bytes}"));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        use std::io::Write;
-        let mut file = opts.open(&tmp_path)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, handle_path)?;
-    // Sync parent directory
-    if let Some(parent) = handle_path.parent() {
-        if let Ok(parent_dir) = std::fs::File::open(parent) {
-            let _ = parent_dir.sync_all();
-        }
-    }
-    Ok(())
+    atomic_write_private(handle_path, json.as_bytes())
 }
 
 fn load_handle(

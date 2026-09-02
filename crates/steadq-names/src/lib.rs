@@ -916,6 +916,44 @@ pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fixed_width_hex_decoders_accept_exact_lowercase_only() {
+        assert_eq!(shard_from_hex("0000"), Some(0));
+        assert_eq!(shard_from_hex("0001"), Some(1));
+        assert_eq!(shard_from_hex("03ef"), Some(0x03ef));
+        assert_eq!(shard_from_hex("ffff"), Some(0xffff));
+        for bad in ["03EF", "3ef", "003ef", "", "zzzz"] {
+            assert_eq!(shard_from_hex(bad), None, "{bad}");
+        }
+
+        let digest: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let encoded = hex_encode(&digest);
+        assert_eq!(hex_decode_32(&encoded), Some(digest));
+        assert_eq!(hex_decode_32(&encoded.to_uppercase()), None);
+        assert_eq!(hex_decode_32(&encoded[..62]), None);
+        assert_eq!(hex_decode_32(&format!("{encoded}00")), None);
+
+        assert_eq!(hex_decode_u16("0102"), Some(0x0102));
+        assert_eq!(hex_decode_u32("01020304"), Some(0x0102_0304));
+        assert_eq!(
+            hex_decode_u64("0102030405060708"),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(hex_decode_u64("010203040506070"), None);
+    }
+
+    #[test]
+    fn strip_tag_requires_prefix_and_nonempty_remainder() {
+        assert_eq!(strip_tag("kab", b'k').unwrap(), "ab");
+        assert_eq!(strip_tag("kcaf\u{e9}", b'k').unwrap(), "caf\u{e9}");
+        for bad in ["k", "", "xab"] {
+            assert!(
+                matches!(strip_tag(bad, b'k'), Err(ParseError::Malformed)),
+                "{bad:?}"
+            );
+        }
+    }
+
     fn test_queue_id() -> [u8; 16] {
         [0x42; 16]
     }

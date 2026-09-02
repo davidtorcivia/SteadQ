@@ -13,3 +13,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 steadq-core = { path = "../steadq-core" }
+
+[dev-dependencies]
+tempfile = "3"
