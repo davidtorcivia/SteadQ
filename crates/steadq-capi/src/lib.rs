@@ -652,27 +652,37 @@ pub extern "C" fn steadq_lease_open_reader(
     lease: *const SteadqLease,
     reader_out: *mut *mut SteadqPayloadReader,
 ) -> c_int {
+    clear_last_error();
     if queue.is_null() || lease.is_null() || reader_out.is_null() {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
     unsafe { *reader_out = std::ptr::null_mut() };
-    let steadq = unsafe { &*queue };
-    let lease_inner = unsafe { &(*lease).inner };
-    let guard = steadq.inner.lock();
-    let Ok(queue) = guard else {
-        return STEADQ_CORRUPTION;
-    };
-    match queue.open_verified_payload_reader(lease_inner) {
-        Ok(Some(reader)) => {
-            let boxed = Box::new(SteadqPayloadReader { inner: reader });
-            unsafe { *reader_out = Box::into_raw(boxed) };
-            STEADQ_OK
+    let result = std::panic::catch_unwind(|| {
+        let steadq = unsafe { &*queue };
+        let lease_inner = unsafe { &(*lease).inner };
+        let Ok(queue) = steadq.inner.lock() else {
+            set_last_error("queue mutex poisoned (previous panic during operation)");
+            return STEADQ_CORRUPTION;
+        };
+        match queue.open_verified_payload_reader(lease_inner) {
+            Ok(Some(reader)) => {
+                let boxed = Box::new(SteadqPayloadReader { inner: reader });
+                unsafe { *reader_out = Box::into_raw(boxed) };
+                STEADQ_OK
+            }
+            Ok(None) => STEADQ_NOT_COMMITTED,
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-        Ok(None) => STEADQ_NOT_COMMITTED,
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_lease_open_reader");
+            STEADQ_IO_FAILURE
         }
     }
 }
@@ -687,20 +697,30 @@ pub extern "C" fn steadq_reader_read(
     offset: u64,
     bytes_read_out: *mut usize,
 ) -> c_int {
+    clear_last_error();
     if reader.is_null() || buf.is_null() || bytes_read_out.is_null() {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
-    let reader = unsafe { &*reader };
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
-    match reader.inner.read_at(slice, offset) {
-        Ok(n) => {
-            unsafe { *bytes_read_out = n };
-            STEADQ_OK
+    let result = std::panic::catch_unwind(|| {
+        let reader = unsafe { &*reader };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
+        match reader.inner.read_at(slice, offset) {
+            Ok(n) => {
+                unsafe { *bytes_read_out = n };
+                STEADQ_OK
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_reader_read");
+            STEADQ_IO_FAILURE
         }
     }
 }
@@ -734,35 +754,44 @@ pub extern "C" fn steadq_resolve(
     ticket_len: usize,
     stabilize: c_int,
 ) -> c_int {
+    clear_last_error();
     if queue.is_null() || ticket_json.is_null() || ticket_len == 0 {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
-    let steadq = unsafe { &*queue };
-    let json = unsafe { std::slice::from_raw_parts(ticket_json, ticket_len) };
-    let ticket = match TransitionTicket::from_json(json) {
-        Ok(t) => t,
-        Err(e) => {
-            set_last_error(&format!("invalid ticket: {e}"));
-            return STEADQ_NOT_COMMITTED;
+    let result = std::panic::catch_unwind(|| {
+        let steadq = unsafe { &*queue };
+        let json = unsafe { std::slice::from_raw_parts(ticket_json, ticket_len) };
+        let ticket = match TransitionTicket::from_json(json) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(&format!("invalid ticket: {e}"));
+                return STEADQ_NOT_COMMITTED;
+            }
+        };
+        let Ok(queue) = steadq.inner.lock() else {
+            set_last_error("queue mutex poisoned (previous panic during operation)");
+            return STEADQ_CORRUPTION;
+        };
+        match queue.resolve(&ticket, stabilize != 0) {
+            ResolutionOutcome::SourceObserved
+            | ResolutionOutcome::SourceStabilized
+            | ResolutionOutcome::DestinationObserved
+            | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
+            ResolutionOutcome::BothObserved => STEADQ_CORRUPTION,
+            ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
+            ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
+            ResolutionOutcome::ResolutionFailed(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-    };
-    let guard = steadq.inner.lock();
-    let Ok(queue) = guard else {
-        return STEADQ_CORRUPTION;
-    };
-    let outcome = queue.resolve(&ticket, stabilize != 0);
-    match outcome {
-        ResolutionOutcome::SourceObserved
-        | ResolutionOutcome::SourceStabilized
-        | ResolutionOutcome::DestinationObserved
-        | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
-        ResolutionOutcome::BothObserved => STEADQ_CORRUPTION,
-        ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
-        ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
-        ResolutionOutcome::ResolutionFailed(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_resolve");
+            STEADQ_IO_FAILURE
         }
     }
 }

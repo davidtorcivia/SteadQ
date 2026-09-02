@@ -15,7 +15,8 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Rng { state: seed }
+        // xorshift has a fixed point at zero, so seed 0 must not be stored as is.
+        Rng { state: seed.max(1) }
     }
 
     pub fn next_u64(&mut self) -> u64 {
