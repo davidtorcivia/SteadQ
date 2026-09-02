@@ -236,14 +236,14 @@ impl Queue {
             }
             Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(prepared.ticket, e),
             Err(PublishError::OutcomeUnknown(e)) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 EnqueueOutcome::OutcomeUnknown(prepared.ticket, e)
             }
             Err(PublishError::OutcomeUnknownPublished {
                 envelope_digest,
                 error,
             }) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 let mut ticket = prepared.ticket;
                 ticket.envelope_digest = envelope_digest;
                 EnqueueOutcome::OutcomeUnknown(ticket, error)
@@ -488,21 +488,7 @@ impl Queue {
                     if failure.is_outcome_unknown() {
                         temp_guard.armed = false;
                     }
-                    let mapped = match failure {
-                        engine::MoveFailure::AlreadyExists => {
-                            PublishError::NotCommitted(Error::IdentityCollision)
-                        }
-                        engine::MoveFailure::SourceMissing => PublishError::NotCommitted(
-                            Error::IoFailure("temporary publication source missing".into()),
-                        ),
-                        engine::MoveFailure::NotCommitted { source, .. } => {
-                            PublishError::NotCommitted(Error::from(source))
-                        }
-                        engine::MoveFailure::OutcomeUnknown { source, .. } => {
-                            PublishError::OutcomeUnknown(Error::from(source))
-                        }
-                    };
-                    Err(mapped)
+                    Err(PublishError::from_move_failure(failure))
                 }
             }
         } else {
@@ -521,7 +507,7 @@ impl Queue {
                     if failure.is_outcome_unknown() {
                         temp_guard.armed = false;
                     }
-                    Err(PublishError::classify_move(failure))
+                    Err(PublishError::from_move_failure(failure))
                 }
             }
         }
@@ -749,7 +735,7 @@ impl Queue {
                 )
             }
             Err(PublishError::OutcomeUnknown(e)) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 return EnqueueOutcome::OutcomeUnknown(
                     EnqueueTicket {
                         job_id,
@@ -764,7 +750,7 @@ impl Queue {
                 envelope_digest,
                 error,
             }) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 return EnqueueOutcome::OutcomeUnknown(
                     EnqueueTicket {
                         job_id,
@@ -1168,7 +1154,8 @@ impl Queue {
                     if failure.is_outcome_unknown() {
                         let _ = fs::unlinkat(tmp_dir_fd, temp_name);
                     }
-                    Err(PublishError::classify_move(failure).with_published_digest(envelope_digest))
+                    Err(PublishError::from_move_failure(failure)
+                        .with_published_digest(envelope_digest))
                 }
             }
         }
@@ -1232,21 +1219,6 @@ impl PublishError {
                 PublishError::NotCommitted(Error::from(source))
             }
             engine::MoveFailure::OutcomeUnknown { source, .. } => {
-                PublishError::OutcomeUnknown(Error::from(source))
-            }
-        }
-    }
-
-    pub(super) fn classify_move(failure: engine::MoveFailureWith<io::Error>) -> Self {
-        match failure {
-            engine::MoveFailureWith::AlreadyExists => {
-                PublishError::NotCommitted(Error::IdentityCollision)
-            }
-            engine::MoveFailureWith::SourceMissing => PublishError::NotCommitted(Error::IoFailure(
-                "temporary publication source missing".into(),
-            )),
-            engine::MoveFailureWith::NotCommitted { source, .. } => Self::classify_write(source),
-            engine::MoveFailureWith::OutcomeUnknown { source, .. } => {
                 PublishError::OutcomeUnknown(Error::from(source))
             }
         }

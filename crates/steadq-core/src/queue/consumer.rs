@@ -79,14 +79,18 @@ impl Queue {
                 return AckOutcome::LeaseLost;
             }
             Err(Error::QueueCorrupt(e)) => {
-                self.poison();
+                self.poison(PoisonReason::InternalInvariantViolation);
                 return AckOutcome::NotCommitted(Error::QueueCorrupt(e));
             }
             Err(e) => return AckOutcome::NotCommitted(e),
         };
 
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
-            self.poison();
+            // A transient read failure before the rename leaves the handle
+            // usable; only an object that no longer matches the protocol poisons.
+            if matches!(e, Error::PayloadCorrupt | Error::QueueCorrupt(_)) {
+                self.poison(PoisonReason::InternalInvariantViolation);
+            }
             return AckOutcome::NotCommitted(e);
         }
 
@@ -98,7 +102,7 @@ impl Queue {
         ) {
             LeasedMoveOutcome::Committed => AckOutcome::Acked,
             LeasedMoveOutcome::OutcomeUnknown(phase) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 AckOutcome::OutcomeUnknown(transition_ticket.with_phase(phase))
             }
             LeasedMoveOutcome::Collision => {
@@ -109,12 +113,12 @@ impl Queue {
                     // Source exists and receipt is authentic: both observed.
                     // The lease is still live. Report as corruption rather
                     // than collapsing into idempotent success.
-                    self.poison();
+                    self.poison(PoisonReason::InternalInvariantViolation);
                     AckOutcome::NotCommitted(Error::QueueCorrupt(
                         "source lease and receipt both exist".into(),
                     ))
                 } else {
-                    self.poison();
+                    self.poison(PoisonReason::InternalInvariantViolation);
                     AckOutcome::NotCommitted(Error::QueueCorrupt(
                         "conflicting object at receipt path".into(),
                     ))
@@ -131,7 +135,7 @@ impl Queue {
                 }
             }
             LeasedMoveOutcome::SourceChanged => {
-                self.poison();
+                self.poison(PoisonReason::InternalInvariantViolation);
                 AckOutcome::NotCommitted(Error::QueueCorrupt(
                     "leased source identity changed before acknowledgment".into(),
                 ))
@@ -797,7 +801,7 @@ impl Queue {
             Ok(Some(source)) => source,
             Ok(None) => return TransitionOutcome::LeaseLost,
             Err(Error::QueueCorrupt(e)) => {
-                self.poison();
+                self.poison(PoisonReason::InternalInvariantViolation);
                 return TransitionOutcome::NotCommitted(Error::QueueCorrupt(e));
             }
             Err(e) => return TransitionOutcome::NotCommitted(e),
@@ -806,12 +810,12 @@ impl Queue {
         match Self::execute_leased_move_with_dirty(&source, dest_dir_fd.as_fd(), dest_name, dirty) {
             LeasedMoveOutcome::Committed => TransitionOutcome::Committed,
             LeasedMoveOutcome::OutcomeUnknown(phase) => {
-                self.poison();
+                self.poison(PoisonReason::PostLinearizationStateUnknown);
                 TransitionOutcome::OutcomeUnknown(ticket.with_phase(phase))
             }
             LeasedMoveOutcome::SourceGone => TransitionOutcome::LeaseLost,
             LeasedMoveOutcome::SourceChanged => {
-                self.poison();
+                self.poison(PoisonReason::InternalInvariantViolation);
                 TransitionOutcome::NotCommitted(Error::QueueCorrupt(
                     "leased source identity changed before transition".into(),
                 ))

@@ -1,4 +1,5 @@
 // Unit tests for the queue module.
+use super::lease::DeadLetterFailure;
 use super::publish::PublishError;
 use super::resolve::*;
 use super::*;
@@ -4437,7 +4438,7 @@ fn cached_wall_floor_contention_does_not_poison_the_handle() {
         Err(Error::MaintenanceBusy)
     );
     assert!(
-        !queue.poisoned,
+        !queue.is_poisoned(),
         "transient replacement contention poisoned the queue"
     );
     assert!(
@@ -5658,7 +5659,7 @@ fn reject_generation_overflow() {
 #[test]
 fn poisoned_queue_rejects_operations() {
     let (_tmp, mut queue) = create_test_queue();
-    queue.poison();
+    queue.poison(PoisonReason::InternalInvariantViolation);
     let outcome = queue.enqueue(EnqueueInput {
         maximum_attempts: 3,
         content_type: "x".to_string(),
@@ -6065,18 +6066,27 @@ fn dead_letter_move_preserves_each_failure_phase() {
         );
         fs::fault::reset();
 
+        // The mover reports the phase; the claim loop decides poisoning.
         let err = result.expect_err("expected error for fault");
-        if errno == libc::ENOSPC && !phase_unknown {
-            assert_eq!(err, Error::ResourceExhausted, "fault {fault}");
+        let (phase, source) = match (&err, phase_unknown) {
+            (
+                DeadLetterFailure::Move(engine::MoveFailure::NotCommitted { phase, source }),
+                false,
+            ) => (*phase, source),
+            (
+                DeadLetterFailure::Move(engine::MoveFailure::OutcomeUnknown { phase, source }),
+                true,
+            ) => (*phase, source),
+            _ => panic!("fault {fault}: {err:?}"),
+        };
+        let expected_phase = if phase_unknown {
+            engine::MovePhase::DestFsync
         } else {
-            let message = format!("{err}");
-            let expected = if phase_unknown {
-                "indeterminate at DestFsync"
-            } else {
-                "failed at Rename"
-            };
-            assert!(message.contains(expected), "fault {fault}: {err:?}");
-        }
+            engine::MovePhase::Rename
+        };
+        assert_eq!(phase, expected_phase, "fault {fault}");
+        assert_eq!(source.raw_os_error(), Some(errno), "fault {fault}");
+        assert!(!queue.is_poisoned());
         if phase_unknown {
             assert!(find_file_with_suffix(&tmp.path().join("dead"), ".sqj").is_some());
             assert!(!tmp.path().join(&ticket.expected_relative_path).exists());
@@ -7416,4 +7426,190 @@ fn list_dead_returns_authenticated_dead_objects_only() {
     let vanished = queue.list_dead();
     fs::fault::reset();
     assert_eq!(vanished.unwrap(), Vec::new());
+}
+
+#[test]
+fn poison_reason_is_recorded_once_and_named_in_the_error() {
+    let (_tmp, mut queue) = create_test_queue();
+    assert_eq!(queue.poison_reason(), None);
+    queue.poison(PoisonReason::WatermarkAuthorityLost);
+    queue.poison(PoisonReason::InternalInvariantViolation);
+    assert_eq!(
+        queue.poison_reason(),
+        Some(PoisonReason::WatermarkAuthorityLost)
+    );
+    let lease = queue.lease(0, 30_000_000_000);
+    assert!(
+        matches!(
+            &lease,
+            LeaseOutcome::NotCommitted(Error::QueuePoisoned(message))
+                if message == "wall watermark authority lost"
+        ),
+        "{lease:?}"
+    );
+}
+
+/// The claim-time dead-letter move poisons only past its linearization
+/// point, and then names that reason.
+#[test]
+fn dead_letter_move_poisons_only_after_linearization() {
+    for (fault, poisoned) in [("renameat2_noreplace", false), ("fsync_dir_fd", true)] {
+        let (tmp, mut queue) = create_test_queue();
+        let ticket = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"exhausted".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("enqueue failed: {outcome:?}"),
+        };
+        let (ready_dir, ready_name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+        let mut common = steadq_names::parse_ready(ready_name).unwrap().common;
+        common.attempt = common.maximum_attempts;
+        let shard_hex = ready_dir.rsplit_once('/').unwrap().1;
+        let exhausted_name = steadq_names::make_ready_name(queue.queue_id(), shard_hex, &common);
+        std::fs::rename(
+            tmp.path().join(&ticket.expected_relative_path),
+            tmp.path().join(ready_dir).join(&exhausted_name),
+        )
+        .unwrap();
+        let wall_floor = queue.wall_floor_for_mutation().unwrap();
+        let dead_bucket = steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            queue.format.terminal_bucket_width_ns(),
+        )
+        .unwrap();
+        queue
+            .ensure_dir(&format!(
+                "dead/{}/{shard_hex}",
+                steadq_names::bucket_hex(dead_bucket)
+            ))
+            .unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, 1, libc::EIO);
+        let outcome = queue.lease(0, 30_000_000_000);
+        fs::fault::reset();
+        assert!(
+            matches!(outcome, LeaseOutcome::NotCommitted(Error::IoFailure(_))),
+            "{fault}: {outcome:?}"
+        );
+        assert_eq!(
+            queue.poison_reason(),
+            poisoned.then_some(PoisonReason::PostLinearizationStateUnknown),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn claimed_object_validation_rejects_each_filename_mismatch_alone() {
+    let (tmp, mut queue) = create_test_queue();
+    let ticket = match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".to_string(),
+        payload: b"validate".to_vec(),
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(ticket) => ticket,
+        outcome => panic!("enqueue failed: {outcome:?}"),
+    };
+    let path = tmp.path().join(&ticket.expected_relative_path);
+    let file = std::fs::File::open(&path).unwrap();
+    let size = file.metadata().unwrap().len();
+    let common =
+        steadq_names::parse_ready(ticket.expected_relative_path.rsplit('/').next().unwrap())
+            .unwrap()
+            .common;
+
+    let valid = queue.validate_claimed_object(file.as_fd(), size, &common);
+    assert_eq!(
+        valid.as_ref().map(|(h, ct)| (h.job_id, ct.as_str())),
+        Some((common.job_id, "text/plain"))
+    );
+    let mut other_job = common.clone();
+    other_job.job_id[0] ^= 0xff;
+    assert!(queue
+        .validate_claimed_object(file.as_fd(), size, &other_job)
+        .is_none());
+    let mut other_attempts = common.clone();
+    other_attempts.maximum_attempts += 1;
+    assert!(queue
+        .validate_claimed_object(file.as_fd(), size, &other_attempts)
+        .is_none());
+    assert!(queue
+        .validate_claimed_object(file.as_fd(), size + 1, &common)
+        .is_none());
+}
+
+#[test]
+fn dead_letter_move_reports_identity_overflow_as_state_exhausted() {
+    let (_tmp, mut queue) = create_test_queue();
+    let common = steadq_names::CommonFields {
+        job_id: [0xAB; 16],
+        generation: u64::MAX,
+        attempt: 1,
+        maximum_attempts: 1,
+    };
+    let wall_floor = queue.wall_floor_for_mutation().unwrap();
+    let result = queue.move_to_dead(
+        "ready/0000",
+        "dummy",
+        &common,
+        DeadReason::AttemptsExhausted,
+        wall_floor,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(DeadLetterFailure::Invalid(Error::StateExhausted))
+        ),
+        "{result:?}"
+    );
+    assert!(!queue.is_poisoned());
+}
+
+/// A read failure while re-verifying the payload before the ack rename is
+/// transient: the handle stays usable. Corruption still poisons.
+#[test]
+fn ack_read_failure_before_rename_does_not_poison() {
+    // The last pread of a clean ack is the payload verification, so failing
+    // exactly that call exercises the path under test.
+    let total_preads = {
+        let (_tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        fs::fault::reset();
+        fs::fault::inject("pread", u64::MAX);
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+        let total = fs::fault::call_count("pread");
+        fs::fault::reset();
+        total
+    };
+    let mut saw_read_failure = false;
+    for count in 1..=total_preads {
+        let (_tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        fs::fault::reset();
+        fs::fault::inject_errno("pread", count, libc::EIO);
+        let outcome = queue.ack(&lease);
+        fs::fault::reset();
+        match (outcome, queue.poison_reason()) {
+            // An early count lands on the wall-watermark read, which
+            // poisons under its own policy; that is not the path under test.
+            (AckOutcome::NotCommitted(_), Some(PoisonReason::WatermarkAuthorityLost)) => {}
+            (AckOutcome::NotCommitted(Error::IoFailure(_)), None) => {
+                saw_read_failure = count == total_preads;
+                assert!(
+                    matches!(queue.ack(&lease), AckOutcome::Acked),
+                    "pread {count}"
+                );
+            }
+            (outcome, reason) => panic!("pread {count}: {outcome:?} {reason:?}"),
+        }
+    }
+    assert!(
+        saw_read_failure,
+        "the final pread of the ack did not fail as an unpoisoned read error"
+    );
 }

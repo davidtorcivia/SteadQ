@@ -113,7 +113,7 @@ impl Queue {
                         return Err(error)
                     }
                     Err(error) => {
-                        self.poison();
+                        self.poison(PoisonReason::WatermarkAuthorityLost);
                         return Err(error);
                     }
                 };
@@ -143,7 +143,7 @@ impl Queue {
             }
             Err(e @ (Error::MaintenanceBusy | Error::ResourceExhausted)) => Err(e),
             Err(e) => {
-                self.poison();
+                self.poison(PoisonReason::WatermarkAuthorityLost);
                 Err(e)
             }
         }

@@ -192,11 +192,36 @@ impl Queue {
                         operation_wall_floor,
                     ) {
                         Ok(()) => continue,
-                        Err(error) => {
-                            if error != Error::ResourceExhausted {
-                                self.poison();
-                            }
+                        // Nothing linearized: report and leave the handle usable.
+                        Err(DeadLetterFailure::Invalid(error)) => {
                             return LeaseOutcome::NotCommitted(error);
+                        }
+                        Err(DeadLetterFailure::Move(engine::MoveFailure::SourceMissing)) => {
+                            continue
+                        }
+                        Err(DeadLetterFailure::Move(engine::MoveFailure::AlreadyExists)) => {
+                            self.poison(PoisonReason::InternalInvariantViolation);
+                            return LeaseOutcome::NotCommitted(Error::IdentityCollision);
+                        }
+                        Err(DeadLetterFailure::Move(engine::MoveFailure::NotCommitted {
+                            phase,
+                            source,
+                        })) => {
+                            return LeaseOutcome::NotCommitted(match Error::from(source) {
+                                Error::IoFailure(message) => Error::IoFailure(format!(
+                                    "dead-letter move failed at {phase:?}: {message}"
+                                )),
+                                classified => classified,
+                            });
+                        }
+                        Err(DeadLetterFailure::Move(engine::MoveFailure::OutcomeUnknown {
+                            phase,
+                            source,
+                        })) => {
+                            self.poison(PoisonReason::PostLinearizationStateUnknown);
+                            return LeaseOutcome::NotCommitted(Error::IoFailure(format!(
+                                "dead-letter move indeterminate at {phase:?}: {source}"
+                            )));
                         }
                     }
                 }
@@ -346,7 +371,7 @@ impl Queue {
                                 .and_then(|()| d.record(leased_dir_fd.as_fd()))
                                 .is_err()
                             {
-                                self.poison();
+                                self.poison(PoisonReason::PostLinearizationStateUnknown);
                                 return LeaseOutcome::OutcomeUnknown(
                                     claim_ticket
                                         .with_phase(TransitionPhase::DestinationDirectoryDurable),
@@ -384,109 +409,19 @@ impl Queue {
                 };
                 match move_result {
                     Ok((leased_object, ())) => {
-                        // Post-rename validation failures must NOT continue as Empty.
-                        // The claim is committed; failures here are corruption or indeterminate.
+                        // The claim is committed; a failure here is corruption or
+                        // indeterminate, never Empty.
                         let leased_file = claim_source.file_fd;
-
-                        let mut header_buf = [0u8; 128];
-                        if fs::pread_exact(leased_file.as_fd(), &mut header_buf, 0).is_err() {
-                            self.poison();
+                        let Some((header, content_type)) = self.validate_claimed_object(
+                            leased_file.as_fd(),
+                            leased_object.size(),
+                            &parsed.common,
+                        ) else {
+                            self.poison(PoisonReason::PostLinearizationStateUnknown);
                             return LeaseOutcome::OutcomeUnknown(
                                 claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
                             );
-                        }
-
-                        let header = match FixedHeader::decode(&header_buf) {
-                            Ok(h) => h,
-                            Err(_) => {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
                         };
-
-                        // Verify job_id matches
-                        if header.job_id != parsed.common.job_id {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-
-                        // Full structural validation of the claimed object before return.
-                        // Verify envelope digest, exact size, and payload limit.
-                        let ext_len_h = header.extension_header_length as usize;
-                        if verified::is_extension_too_large(ext_len_h) {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-                        let mut ext_buf_claim = vec![0u8; ext_len_h];
-                        if fs::pread_exact(leased_file.as_fd(), &mut ext_buf_claim, 128).is_err() {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-                        if !steadq_format::verify_envelope_digest(&header, &ext_buf_claim) {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-                        let expected_claim_size =
-                            match verified::checked_total_size(ext_len_h, header.payload_length) {
-                                Ok(size) => size,
-                                Err(_) => {
-                                    self.poison();
-                                    return LeaseOutcome::OutcomeUnknown(
-                                        claim_ticket
-                                            .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                    );
-                                }
-                            };
-                        if leased_object.size() != expected_claim_size {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-                        if !payload_length_is_valid(
-                            header.payload_length,
-                            self.format.max_payload_length(),
-                        ) {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-                        if header.maximum_attempts != parsed.common.maximum_attempts {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-
-                        // Extension decode failure after claim is a post-linearization
-                        // corruption. Do not return an ordinary lease with empty content_type.
-                        let content_type = if verified::is_extension_present(ext_len_h) {
-                            match steadq_format::cbor::ExtensionHeader::decode(&ext_buf_claim) {
-                                Ok(e) => e.content_type,
-                                Err(_) => {
-                                    self.poison();
-                                    return LeaseOutcome::OutcomeUnknown(
-                                        claim_ticket
-                                            .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                    );
-                                }
-                            }
-                        } else {
-                            String::new()
-                        };
-
                         // Verify payload digest on held fd before delivery.
                         // Deterministic PayloadCorrupt is quarantined, not delivered.
                         // Indeterminate I/O poisons and yields OutcomeUnknown.
@@ -504,7 +439,9 @@ impl Queue {
                                             );
                                         }
                                         Err(failure) => {
-                                            self.poison();
+                                            self.poison(
+                                                PoisonReason::PostLinearizationStateUnknown,
+                                            );
                                             return LeaseOutcome::OutcomeUnknown(
                                                 claim_ticket.with_phase(failure.phase().map_or(
                                                     TransitionPhase::SourceDirectoryDurable,
@@ -515,7 +452,7 @@ impl Queue {
                                     }
                                 }
                                 _ => {
-                                    self.poison();
+                                    self.poison(PoisonReason::PostLinearizationStateUnknown);
                                     return LeaseOutcome::OutcomeUnknown(
                                         claim_ticket
                                             .with_phase(TransitionPhase::SourceDirectoryDurable),
@@ -523,7 +460,6 @@ impl Queue {
                                 }
                             }
                         }
-
                         let lease_info = LeaseInfo {
                             job_id: parsed.common.job_id,
                             envelope_digest: header.envelope_digest,
@@ -546,7 +482,7 @@ impl Queue {
                     }
                     Err(engine::MoveFailure::SourceMissing) => continue,
                     Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
-                        self.poison();
+                        self.poison(PoisonReason::PostLinearizationStateUnknown);
                         return LeaseOutcome::OutcomeUnknown(
                             claim_ticket.with_phase(ticket_phase_for_move_outcome_unknown(phase)),
                         );
@@ -568,6 +504,57 @@ impl Queue {
         } else {
             LeaseOutcome::Empty
         }
+    }
+}
+
+/// Why the claim-time dead-letter move did not complete.
+#[derive(Debug)]
+pub(super) enum DeadLetterFailure {
+    /// The identity or bucket arithmetic rejected the object; nothing was
+    /// touched on disk. Carries the already-classified error.
+    Invalid(Error),
+    Move(engine::MoveFailure),
+}
+
+impl Queue {
+    /// Structural checks on a just-claimed object: header, filename
+    /// agreement, envelope digest, exact size, payload limit, and extension
+    /// decode. `None` means the committed claim cannot be delivered.
+    pub(super) fn validate_claimed_object(
+        &self,
+        file: BorrowedFd<'_>,
+        size: u64,
+        common: &CommonFields,
+    ) -> Option<(FixedHeader, String)> {
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file, &mut header_buf, 0).ok()?;
+        let header = FixedHeader::decode(&header_buf).ok()?;
+        if header.job_id != common.job_id || header.maximum_attempts != common.maximum_attempts {
+            return None;
+        }
+        let ext_len = header.extension_header_length as usize;
+        if verified::is_extension_too_large(ext_len) {
+            return None;
+        }
+        let mut ext_buf = vec![0u8; ext_len];
+        fs::pread_exact(file, &mut ext_buf, 128).ok()?;
+        if !steadq_format::verify_envelope_digest(&header, &ext_buf) {
+            return None;
+        }
+        if verified::checked_total_size(ext_len, header.payload_length).ok()? != size {
+            return None;
+        }
+        if !payload_length_is_valid(header.payload_length, self.format.max_payload_length()) {
+            return None;
+        }
+        let content_type = if verified::is_extension_present(ext_len) {
+            steadq_format::cbor::ExtensionHeader::decode(&ext_buf)
+                .ok()?
+                .content_type
+        } else {
+            String::new()
+        };
+        Some((header, content_type))
     }
 
     pub(super) fn claim_transition_ticket(
@@ -651,6 +638,10 @@ impl Queue {
     }
 
     /// Move a ready object to dead (for exhausted attempts cleanup).
+    /// Move an attempt-exhausted ready object to dead. Failures before the
+    /// rename are `NotCommitted` or `Invalid`; the caller reports them without
+    /// poisoning, except `AlreadyExists`, an identity collision at the
+    /// deterministic dead path. Failures after it are `OutcomeUnknown`.
     pub(super) fn move_to_dead(
         &mut self,
         ready_dir: &str,
@@ -658,48 +649,37 @@ impl Queue {
         common: &CommonFields,
         reason: DeadReason,
         wall_floor: WallFloor,
-    ) -> Result<(), Error> {
-        let terminal_bucket = match steadq_math::bucket_number(
+    ) -> Result<(), DeadLetterFailure> {
+        let terminal_bucket = steadq_math::bucket_number(
             wall_floor.unix_ns(),
             self.format.terminal_bucket_width_ns(),
-        ) {
-            Some(bucket) => bucket,
-            None => return Err(Error::StateExhausted),
-        };
-
-        let dead_common = next_identity(ProtocolOperation::ExhaustedReadyCleanup, common)?;
-
+        )
+        .ok_or(DeadLetterFailure::Invalid(Error::StateExhausted))?;
+        let dead_common = next_identity(ProtocolOperation::ExhaustedReadyCleanup, common)
+            .map_err(DeadLetterFailure::Invalid)?;
         let target = self
             .layout()
             .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
         let dead_dir = target.directory();
-
-        self.ensure_dir(&dead_dir).map_err(Error::from)?;
-        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir).map_err(Error::from)?;
-        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir).map_err(Error::from)?;
-
+        let not_committed = |phase| {
+            move |source| {
+                DeadLetterFailure::Move(engine::MoveFailure::NotCommitted { phase, source })
+            }
+        };
+        self.ensure_dir(&dead_dir)
+            .map_err(not_committed(engine::MovePhase::EnsureDest))?;
+        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir)
+            .map_err(not_committed(engine::MovePhase::EnsureDest))?;
+        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir)
+            .map_err(not_committed(engine::MovePhase::PreRename))?;
         match engine::move_verified_noreplace(
             ready_dir_fd.as_fd(),
             ready_name,
             dead_dir_fd.as_fd(),
             &target.filename,
         ) {
-            Ok(()) => Ok(()),
-            Err(engine::MoveFailure::SourceMissing) => Ok(()),
-            Err(engine::MoveFailure::AlreadyExists) => Err(Error::IdentityCollision),
-            Err(engine::MoveFailure::NotCommitted { phase, source }) => {
-                Err(match Error::from(source) {
-                    Error::IoFailure(message) => {
-                        Error::IoFailure(format!("dead-letter move failed at {phase:?}: {message}"))
-                    }
-                    classified => classified,
-                })
-            }
-            // Past the rename the outcome is indeterminate, so no errno may
-            // downgrade it to a retryable classification.
-            Err(engine::MoveFailure::OutcomeUnknown { phase, source }) => Err(Error::IoFailure(
-                format!("dead-letter move indeterminate at {phase:?}: {source}"),
-            )),
+            Ok(()) | Err(engine::MoveFailure::SourceMissing) => Ok(()),
+            Err(failure) => Err(DeadLetterFailure::Move(failure)),
         }
     }
 }

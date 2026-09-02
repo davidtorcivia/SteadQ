@@ -140,7 +140,7 @@ impl<'a> Batch<'a> {
         let sync_result = dirty.sync_all();
 
         if let Err(e) = sync_result {
-            queue.poison();
+            queue.poison(PoisonReason::PostLinearizationStateUnknown);
             let e = Error::from(e);
             let outcome = BatchCommitOutcome {
                 committed_enqueues: Vec::new(),

@@ -43,7 +43,7 @@ pub struct Queue {
     pub(crate) format: FormatRecord,
     pub(crate) boot_id: String,
     pub(crate) boot_id_bytes: [u8; 16],
-    pub(crate) poisoned: bool,
+    pub(crate) poisoned: Option<PoisonReason>,
     pub(crate) scan_round: u64,
     pub(crate) ready_shard_hint: Option<u32>,
     pub(crate) worker_nonce: [u8; 16],
@@ -650,7 +650,7 @@ impl Queue {
             format: format_rec,
             boot_id,
             boot_id_bytes: boot_id_bin,
-            poisoned: false,
+            poisoned: None,
             scan_round: 0,
             ready_shard_hint: None,
             worker_nonce,
@@ -686,18 +686,25 @@ impl Queue {
     }
 
     pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// Why the handle refuses mutations, once it does.
+    pub fn poison_reason(&self) -> Option<PoisonReason> {
         self.poisoned
     }
 
     fn check_not_poisoned(&self) -> Result<(), Error> {
-        if self.poisoned {
-            return Err(Error::QueuePoisoned("handle is poisoned".into()));
+        match self.poisoned {
+            Some(reason) => Err(Error::QueuePoisoned(reason.to_string())),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    fn poison(&mut self) {
-        self.poisoned = true;
+    /// The first reason wins; a later failure on a poisoned handle does not
+    /// rewrite the cause the caller will read.
+    fn poison(&mut self, reason: PoisonReason) {
+        self.poisoned.get_or_insert(reason);
     }
 
     pub(crate) fn layout(&self) -> layout::Layout<'_> {
