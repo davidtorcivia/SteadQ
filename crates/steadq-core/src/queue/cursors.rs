@@ -124,6 +124,10 @@ pub(crate) struct RecoveryHierarchyRetry {
 pub(crate) struct RecoveryCursor {
     pub(crate) phase: RecoveryPhase,
     pub(crate) reap_leases: Option<FourLevelCursor>,
+    /// Ready shard at which the colocated-lease scan resumes after budget
+    /// exhaustion, so earlier shards are not rescanned every pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reap_colocated_shard: Option<u32>,
     pub(crate) promote_delayed: Option<ThreeLevelCursor>,
     pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
     pub(crate) compact_receipts: Option<ThreeLevelCursor>,

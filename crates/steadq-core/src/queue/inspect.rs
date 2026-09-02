@@ -486,34 +486,61 @@ impl Queue {
             .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
 
         let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel).map_err(Error::from)?;
-        let file_fd = fs::openat(
-            dir_fd.as_fd(),
-            name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-        .map_err(Error::from)?;
+        let file_fd =
+            fs::openat(dir_fd.as_fd(), name, raw_read_open_flags(), 0).map_err(Error::from)?;
 
-        let stat = fs::fstat(file_fd.as_fd()).map_err(Error::from)?;
-        if stat.st_size < 0 {
-            return Err(Error::QueueCorrupt("negative file size".into()));
-        }
-        let size = stat.st_size as u64;
+        copy_file_to_path(file_fd.as_fd(), output).map_err(Error::from)
+    }
 
-        let mut out = std::fs::File::create(output).map_err(Error::from)?;
-        let mut offset = 0u64;
-        let mut buf = vec![0u8; 65536];
-        while offset < size {
-            let n = fs::pread(file_fd.as_fd(), &mut buf, offset).map_err(Error::from)?;
-            if n == 0 {
-                break;
+    /// List every dead object whose name parses and whose tag authenticates
+    /// under its bucket and shard. An unreadable directory is an error, not
+    /// an empty list.
+    pub fn list_dead(&self) -> Result<Vec<Snapshot>, Error> {
+        let queue_id = self.format.queue_id();
+        let dead_fd = fs::open_directory(self.root_fd.as_fd(), "dead").map_err(Error::from)?;
+        let mut out = Vec::new();
+        for bucket in fs::read_dir_entries(dead_fd.as_fd()).map_err(Error::from)? {
+            let Some(bucket) = bucket.as_ascii_str() else {
+                continue;
+            };
+            let Some(bucket_fd) = open_child_dir(dead_fd.as_fd(), bucket)? else {
+                continue;
+            };
+            for shard in fs::read_dir_entries(bucket_fd.as_fd()).map_err(Error::from)? {
+                let Some(shard) = shard.as_ascii_str() else {
+                    continue;
+                };
+                let Some(shard_num) = steadq_names::shard_from_hex(shard) else {
+                    continue;
+                };
+                let Some(shard_fd) = open_child_dir(bucket_fd.as_fd(), shard)? else {
+                    continue;
+                };
+                for entry in fs::read_dir_entries(shard_fd.as_fd()).map_err(Error::from)? {
+                    let Some(entry) = entry.as_ascii_str() else {
+                        continue;
+                    };
+                    let Ok(parsed) = steadq_names::parse_dead(entry) else {
+                        continue;
+                    };
+                    if !parsed.authenticate_tag(queue_id, bucket, shard) {
+                        continue;
+                    }
+                    out.push(Snapshot {
+                        job_id: parsed.common.job_id,
+                        state: "dead".into(),
+                        generation: parsed.common.generation,
+                        attempt: parsed.common.attempt,
+                        maximum_attempts: parsed.common.maximum_attempts,
+                        shard: shard_num,
+                        relative_path: format!("dead/{bucket}/{shard}/{entry}"),
+                        size: 0,
+                    });
+                }
             }
-            use std::io::Write;
-            out.write_all(&buf[..n]).map_err(Error::from)?;
-            offset += n as u64;
         }
-        out.sync_all().map_err(Error::from)?;
-        Ok(offset)
+        out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(out)
     }
 
     /// Remove a dead job through the phase-aware unlink executor.
@@ -812,4 +839,37 @@ impl Queue {
             None => false,
         }
     }
+}
+
+/// Open a child directory for a listing. A child that vanished or is not
+/// a directory is skipped; any other failure is the caller's error.
+fn open_child_dir(parent: BorrowedFd<'_>, name: &str) -> Result<Option<OwnedFd>, Error> {
+    match fs::open_directory(parent, name) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
+/// Read-only open of an object by name, never through a symlink.
+pub(crate) fn raw_read_open_flags() -> i32 {
+    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
+/// Copy the whole file behind `file_fd` to a new file at `output` and sync
+/// it. Returns the bytes written.
+pub(crate) fn copy_file_to_path(
+    file_fd: BorrowedFd<'_>,
+    output: &std::path::Path,
+) -> std::io::Result<u64> {
+    let mut source = std::fs::File::from(file_fd.try_clone_to_owned()?);
+    let mut out = std::fs::File::create(output)?;
+    let written = std::io::copy(&mut source, &mut out)?;
+    out.sync_all()?;
+    Ok(written)
 }

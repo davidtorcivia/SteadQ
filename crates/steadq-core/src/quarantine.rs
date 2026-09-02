@@ -2,7 +2,6 @@
 
 use std::os::unix::io::{AsFd, BorrowedFd};
 
-use sha2::Digest;
 use steadq_fs_linux as fs;
 use steadq_names;
 
@@ -208,227 +207,122 @@ fn fsck_protocol_name<'a>(
     Some(name)
 }
 
+/// Record that `path` could not be listed or entered, so the report cannot
+/// claim the subtree below it is clean.
+fn fsck_scan_incomplete(path: &str, error: &std::io::Error, report: &mut FsckReport) {
+    report.findings.push(CorruptionFinding {
+        relative_path: path.to_string(),
+        finding_type: "directory_scan_incomplete".into(),
+        severity: FindingSeverity::Error,
+        details: format!("directory could not be scanned: {error}"),
+    });
+}
+
 impl Queue {
     /// Run fsck on the queue.
     pub fn fsck(&self, opts: &FsckOptions) -> FsckReport {
         let mut report = FsckReport::default();
 
-        // Check ready shards
-        self.fsck_state_dir("ready", opts, &mut report);
-        // Check leased
-        self.fsck_leased_dirs(opts, &mut report);
-        // Check delayed
-        self.fsck_state_dir("delayed", opts, &mut report);
-        // Check dead
-        self.fsck_state_dir("dead", opts, &mut report);
-        // Check receipts
-        self.fsck_state_dir("receipts", opts, &mut report);
+        for state_name in ["ready", "leased", "delayed", "dead", "receipts"] {
+            self.fsck_state_dir(state_name, opts, &mut report);
+        }
 
         report
     }
 
-    fn fsck_state_dir(&self, state_name: &str, opts: &FsckOptions, report: &mut FsckReport) {
-        let root_fd = self.root_fd();
-        let state_fd = match fs::open_directory(root_fd, state_name) {
-            Ok(fd) => fd,
-            Err(_) => return,
-        };
-
-        let top_entries = match fs::read_dir_entries(state_fd.as_fd()) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for raw_entry in &top_entries {
-            let Some(entry) = fsck_protocol_name(state_name, raw_entry, report) else {
-                continue;
-            };
-            let sub_fd = match fs::open_directory(state_fd.as_fd(), entry) {
-                Ok(fd) => fd,
-                Err(_) => continue,
-            };
-
-            let sub_entries = match fs::read_dir_entries(sub_fd.as_fd()) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let sub_parent = format!("{state_name}/{entry}");
-            for raw_sub_entry in &sub_entries {
-                let Some(sub_entry) = fsck_protocol_name(&sub_parent, raw_sub_entry, report) else {
-                    continue;
-                };
-                if sub_entry.ends_with(".sqj") || sub_entry.ends_with(".rct") {
-                    // Carry full root-relative path
-                    report.total_objects += 1;
-                    let full_path = format!("{state_name}/{entry}/{sub_entry}");
-                    self.fsck_file(
-                        sub_fd.as_fd(),
-                        state_name,
-                        &full_path,
-                        sub_entry,
-                        opts,
-                        report,
-                    );
-                } else {
-                    // Another directory level (shard under bucket) or unexpected file.
-                    let shard_fd = match fs::open_directory(sub_fd.as_fd(), sub_entry) {
-                        Ok(fd) => fd,
-                        Err(_) => {
-                            report.findings.push(CorruptionFinding {
-                                relative_path: format!("{state_name}/{entry}/{sub_entry}"),
-                                finding_type: "unexpected_entry".into(),
-                                severity: FindingSeverity::Warning,
-                                details: format!(
-                                    "unrecognized entry in state directory: {sub_entry}"
-                                ),
-                            });
-                            continue;
-                        }
-                    };
-                    let files = match fs::read_dir_entries(shard_fd.as_fd()) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let shard_parent = format!("{sub_parent}/{sub_entry}");
-                    for raw_file in &files {
-                        let Some(file) = fsck_protocol_name(&shard_parent, raw_file, report) else {
-                            continue;
-                        };
-                        if file.ends_with(".sqj") || file.ends_with(".rct") {
-                            report.total_objects += 1;
-                            let full_path = format!("{state_name}/{entry}/{sub_entry}/{file}");
-                            self.fsck_file(
-                                shard_fd.as_fd(),
-                                state_name,
-                                &full_path,
-                                file,
-                                opts,
-                                report,
-                            );
-                        } else {
-                            report.findings.push(CorruptionFinding {
-                                relative_path: format!("{state_name}/{entry}/{sub_entry}/{file}"),
-                                finding_type: "unexpected_entry".into(),
-                                severity: FindingSeverity::Warning,
-                                details: format!("unrecognized file in shard directory: {file}"),
-                            });
-                        }
-                    }
-                }
-            }
+    /// Directory levels between a state root and its object files.
+    fn fsck_depth(state_name: &str) -> usize {
+        match state_name {
+            "ready" => 1,
+            "leased" => 3,
+            _ => 2,
         }
     }
 
-    fn fsck_leased_dirs(&self, opts: &FsckOptions, report: &mut FsckReport) {
-        let root_fd = self.root_fd();
-        let leased_fd = match fs::open_directory(root_fd, "leased") {
+    fn fsck_state_dir(&self, state_name: &str, opts: &FsckOptions, report: &mut FsckReport) {
+        // Queue::open verified every state root exists, so any open failure
+        // here is an incomplete scan, not an empty state.
+        let state_fd = match fs::open_directory(self.root_fd(), state_name) {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(error) => {
+                fsck_scan_incomplete(state_name, &error, report);
+                return;
+            }
         };
+        self.fsck_walk(
+            state_fd.as_fd(),
+            state_name,
+            state_name,
+            Self::fsck_depth(state_name),
+            opts,
+            report,
+        );
+    }
 
-        let boot_dirs = match fs::read_dir_entries(leased_fd.as_fd()) {
-            Ok(e) => e,
-            Err(_) => return,
+    /// Walk `depth` directory levels below `dir_fd`, then verify the files.
+    /// A directory that cannot be listed or entered is an Error finding, so
+    /// an unreadable subtree never reads as clean.
+    fn fsck_walk(
+        &self,
+        dir_fd: BorrowedFd<'_>,
+        state_name: &str,
+        parent_path: &str,
+        depth: usize,
+        opts: &FsckOptions,
+        report: &mut FsckReport,
+    ) {
+        let entries = match fs::read_dir_entries(dir_fd) {
+            Ok(entries) => entries,
+            Err(error) => {
+                fsck_scan_incomplete(parent_path, &error, report);
+                return;
+            }
         };
-
-        for raw_boot_dir in &boot_dirs {
-            let Some(boot_dir) = fsck_protocol_name("leased", raw_boot_dir, report) else {
+        for raw_entry in &entries {
+            let Some(name) = fsck_protocol_name(parent_path, raw_entry, report) else {
                 continue;
             };
-            let boot_fd = match fs::open_directory(leased_fd.as_fd(), boot_dir) {
-                Ok(fd) => fd,
-                Err(_) => {
+            let path = format!("{parent_path}/{name}");
+            if depth == 0 {
+                if name.ends_with(".sqj") || name.ends_with(".rct") {
+                    report.total_objects += 1;
+                    self.fsck_file(dir_fd, state_name, &path, name, opts, report);
+                } else {
                     report.findings.push(CorruptionFinding {
-                        relative_path: format!("leased/{boot_dir}"),
+                        relative_path: path,
                         finding_type: "unexpected_entry".into(),
                         severity: FindingSeverity::Warning,
-                        details: format!("non-directory entry in leased: {boot_dir}"),
+                        details: format!("unrecognized file in shard directory: {name}"),
                     });
-                    continue;
                 }
-            };
-            let bucket_dirs = match fs::read_dir_entries(boot_fd.as_fd()) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let boot_parent = format!("leased/{boot_dir}");
-            for raw_bucket_dir in &bucket_dirs {
-                let Some(bucket_dir) = fsck_protocol_name(&boot_parent, raw_bucket_dir, report)
-                else {
-                    continue;
-                };
-                let bucket_fd = match fs::open_directory(boot_fd.as_fd(), bucket_dir) {
-                    Ok(fd) => fd,
-                    Err(_) => {
-                        report.findings.push(CorruptionFinding {
-                            relative_path: format!("leased/{boot_dir}/{bucket_dir}"),
-                            finding_type: "unexpected_entry".into(),
-                            severity: FindingSeverity::Warning,
-                            details: format!(
-                                "non-directory entry in leased boot dir: {bucket_dir}"
-                            ),
-                        });
-                        continue;
-                    }
-                };
-                let shard_dirs = match fs::read_dir_entries(bucket_fd.as_fd()) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let bucket_parent = format!("{boot_parent}/{bucket_dir}");
-                for raw_shard_dir in &shard_dirs {
-                    let Some(shard_dir) = fsck_protocol_name(&bucket_parent, raw_shard_dir, report)
-                    else {
-                        continue;
-                    };
-                    let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_dir) {
-                        Ok(fd) => fd,
-                        Err(_) => {
-                            report.findings.push(CorruptionFinding {
-                                relative_path: format!("{bucket_parent}/{shard_dir}"),
-                                finding_type: "unexpected_entry".into(),
-                                severity: FindingSeverity::Warning,
-                                details: format!(
-                                    "non-directory entry in leased bucket: {shard_dir}"
-                                ),
-                            });
-                            continue;
-                        }
-                    };
-                    let files = match fs::read_dir_entries(shard_fd.as_fd()) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let shard_parent = format!("{bucket_parent}/{shard_dir}");
-                    for raw_file in &files {
-                        let Some(file) = fsck_protocol_name(&shard_parent, raw_file, report) else {
-                            continue;
-                        };
-                        if file.ends_with(".sqj") {
-                            report.total_objects += 1;
-                            let full_path =
-                                format!("leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}");
-                            self.fsck_file(
-                                shard_fd.as_fd(),
-                                "leased",
-                                &full_path,
-                                file,
-                                opts,
-                                report,
-                            );
-                        } else {
-                            report.findings.push(CorruptionFinding {
-                                relative_path: format!(
-                                    "leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}"
-                                ),
-                                finding_type: "unexpected_entry".into(),
-                                severity: FindingSeverity::Warning,
-                                details: format!("unrecognized file in leased shard: {file}"),
-                            });
-                        }
-                    }
+                continue;
+            }
+            match fs::open_directory(dir_fd, name) {
+                Ok(child_fd) => {
+                    self.fsck_walk(child_fd.as_fd(), state_name, &path, depth - 1, opts, report)
                 }
+                // An object file above its shard level is verified like any
+                // other object; its name tag cannot authenticate at this
+                // depth, so it fails closed and is quarantined under repair.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENOTDIR)
+                        && (name.ends_with(".sqj") || name.ends_with(".rct")) =>
+                {
+                    report.total_objects += 1;
+                    self.fsck_file(dir_fd, state_name, &path, name, opts, report);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: path,
+                        finding_type: "unexpected_entry".into(),
+                        severity: FindingSeverity::Warning,
+                        details: format!("unrecognized entry in state directory: {name}"),
+                    });
+                }
+                // A concurrent retention pass may remove an empty bucket or
+                // shard between the listing and this open; nothing was missed.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => fsck_scan_incomplete(&path, &error, report),
             }
         }
     }
@@ -934,55 +828,34 @@ impl Queue {
 
         // Deep verification - hash the payload.
         if opts.depth == FsckDepth::Deep && state_name != "receipts" {
-            let payload_offset = (128 + ext_len) as u64;
-            let mut hasher = sha2::Sha256::new();
-            let mut buf = vec![0u8; 65536];
-            let mut offset = payload_offset;
-            let mut remaining = header.payload_length as usize;
-            let mut read_ok = true;
-            while remaining > 0 {
-                let to_read = remaining.min(buf.len());
-                match fs::pread(file_fd.as_fd(), &mut buf[..to_read], offset) {
-                    Ok(n) if n > 0 => {
-                        hasher.update(&buf[..n]);
-                        offset += n as u64;
-                        remaining -= n;
-                    }
-                    _ => {
-                        read_ok = false;
-                        break;
+            match crate::queue::verified::verify_payload(file_fd.as_fd(), &header, ext_len) {
+                Ok(()) => report.payloads_deep_verified += 1,
+                Err(crate::queue::verified::VerificationError::PayloadCorrupt) => {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "payload_digest_mismatch".into(),
+                        severity: FindingSeverity::Error,
+                        details: "payload digest does not match header".into(),
+                    });
+                    if opts.mode == FsckMode::Repair {
+                        self.quarantine_object_or_record(
+                            shard_fd,
+                            filename,
+                            full_path,
+                            crate::QuarantineReason::PayloadCorrupt,
+                            report,
+                        );
                     }
                 }
-            }
-            if !read_ok {
-                report.findings.push(CorruptionFinding {
-                    relative_path: full_path.to_string(),
-                    finding_type: "payload_read_failed".into(),
-                    severity: FindingSeverity::Error,
-                    details: "cannot read payload for deep verification".into(),
-                });
-                return;
-            }
-            let computed: [u8; 32] = hasher.finalize().into();
-            if computed != header.payload_digest {
-                report.findings.push(CorruptionFinding {
-                    relative_path: full_path.to_string(),
-                    finding_type: "payload_digest_mismatch".into(),
-                    severity: FindingSeverity::Error,
-                    details: "payload digest does not match header".into(),
-                });
-                if opts.mode == FsckMode::Repair {
-                    self.quarantine_object_or_record(
-                        shard_fd,
-                        filename,
-                        full_path,
-                        crate::QuarantineReason::PayloadCorrupt,
-                        report,
-                    );
+                Err(error) => {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "payload_read_failed".into(),
+                        severity: FindingSeverity::Error,
+                        details: format!("cannot read payload for deep verification: {error}"),
+                    });
                 }
-                return;
             }
-            report.payloads_deep_verified += 1;
         }
     }
 
@@ -1332,14 +1205,13 @@ impl Queue {
     ///
     /// Quarantine objects live as `quarantine/q{id}.x{reason}.raw` (flat).
     /// Nested layouts are also scanned for compatibility with older trees.
+    /// Every step is fd-relative with `O_NOFOLLOW`, like the rest of the
+    /// queue: a symlink under `quarantine/` is never followed.
     pub fn list_quarantine(&self) -> Vec<QuarantineEntry> {
         let mut out = Vec::new();
-        let root = &self.root_path;
-        let qroot = root.join("quarantine");
-        if !qroot.is_dir() {
-            return out;
+        if let Ok(fd) = fs::open_directory(self.root_fd(), "quarantine") {
+            collect_quarantine_entries(fd.as_fd(), "quarantine", &mut out);
         }
-        collect_quarantine_entries(&qroot, root, &mut out);
         out
     }
 
@@ -1352,13 +1224,12 @@ impl Queue {
 
     /// Remove a quarantined object by id. Returns true if a file was removed.
     pub fn remove_quarantine(&self, quarantine_id: &[u8; 16]) -> Result<bool, std::io::Error> {
-        match self.find_quarantine(quarantine_id) {
-            Some(entry) => {
-                std::fs::remove_file(self.root_path.join(&entry.relative_path))?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let Some(entry) = self.find_quarantine(quarantine_id) else {
+            return Ok(false);
+        };
+        let (dir_fd, name) = self.open_quarantine_parent(&entry)?;
+        fs::unlinkat(dir_fd.as_fd(), name)?;
+        Ok(true)
     }
 
     /// Copy a quarantined object's raw bytes to `output`. Returns bytes written.
@@ -1367,16 +1238,25 @@ impl Queue {
         quarantine_id: &[u8; 16],
         output: &std::path::Path,
     ) -> Result<u64, std::io::Error> {
-        match self.find_quarantine(quarantine_id) {
-            Some(entry) => {
-                let n = std::fs::copy(self.root_path.join(&entry.relative_path), output)?;
-                Ok(n)
-            }
-            None => Err(std::io::Error::new(
+        let Some(entry) = self.find_quarantine(quarantine_id) else {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "quarantine object not found",
-            )),
-        }
+            ));
+        };
+        let (dir_fd, name) = self.open_quarantine_parent(&entry)?;
+        let file_fd = fs::openat(dir_fd.as_fd(), name, crate::queue::raw_read_open_flags(), 0)?;
+        crate::queue::copy_file_to_path(file_fd.as_fd(), output)
+    }
+
+    fn open_quarantine_parent<'a>(
+        &self,
+        entry: &'a QuarantineEntry,
+    ) -> Result<(std::os::fd::OwnedFd, &'a str), std::io::Error> {
+        let (dir_rel, name) = entry.relative_path.rsplit_once('/').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid quarantine path")
+        })?;
+        Ok((crate::queue::open_relative(self.root_fd(), dir_rel)?, name))
     }
 }
 
@@ -1390,37 +1270,28 @@ pub struct QuarantineEntry {
 }
 
 fn collect_quarantine_entries(
-    dir: &std::path::Path,
-    root: &std::path::Path,
+    dir_fd: BorrowedFd<'_>,
+    relative_dir: &str,
     out: &mut Vec<QuarantineEntry>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = fs::read_dir_entries(dir_fd) else {
+        return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_quarantine_entries(&path, root, out);
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else {
+    for entry in &entries {
+        let Some(name) = entry.as_ascii_str() else {
             continue;
         };
-        if let Ok(parsed) = steadq_names::parse_quarantine(&name) {
-            let Some(relative) = path
-                .strip_prefix(root)
-                .ok()
-                .and_then(std::path::Path::to_str)
-            else {
-                continue;
-            };
+        if let Ok(parsed) = steadq_names::parse_quarantine(name) {
             out.push(QuarantineEntry {
                 quarantine_id: parsed.quarantine_id,
                 reason: parsed.reason,
-                filename: name,
-                relative_path: relative.to_string(),
+                filename: name.to_string(),
+                relative_path: format!("{relative_dir}/{name}"),
             });
+            continue;
+        }
+        if let Ok(child_fd) = fs::open_directory(dir_fd, name) {
+            collect_quarantine_entries(child_fd.as_fd(), &format!("{relative_dir}/{name}"), out);
         }
     }
 }
@@ -1428,6 +1299,119 @@ fn collect_quarantine_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsck_walks_the_legacy_leased_tree_three_levels_deep() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let shard = tmp
+            .path()
+            .join("leased/00000000-0000-0000-0000-000000000000/0000000000000000/0000");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("garbage.sqj"), b"x").unwrap();
+        let queue = open_test_queue(tmp.path());
+        let report = queue.fsck(&FsckOptions::default());
+        assert_eq!(report.total_objects, 1, "{:?}", report.findings);
+        assert!(report.findings.iter().any(|f| {
+            f.finding_type
+            == "filename_parse_failed"
+            && f.relative_path
+                == "leased/00000000-0000-0000-0000-000000000000/0000000000000000/0000/garbage.sqj"
+        }));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.finding_type == "directory_scan_incomplete"));
+    }
+
+    #[test]
+    fn fsck_fails_closed_on_an_object_above_its_shard_level() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let bucket = tmp.path().join("delayed/0000000000000000");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let misplaced = bucket.join("misplaced.sqj");
+        std::fs::write(&misplaced, b"x").unwrap();
+        let queue = open_test_queue(tmp.path());
+
+        let report = queue.fsck(&FsckOptions::default());
+        assert_eq!(report.total_objects, 1, "{:?}", report.findings);
+        assert!(report.findings.iter().any(|f| f.relative_path
+            == "delayed/0000000000000000/misplaced.sqj"
+            && matches!(f.severity, FindingSeverity::Error)));
+        assert!(misplaced.exists());
+
+        let repaired = queue.fsck(&FsckOptions {
+            mode: FsckMode::Repair,
+            ..FsckOptions::default()
+        });
+        assert_eq!(repaired.quarantined.len(), 1, "{:?}", repaired.findings);
+        assert!(!misplaced.exists());
+    }
+
+    #[test]
+    fn fsck_ignores_a_directory_removed_during_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let queue = open_test_queue(tmp.path());
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", 3, libc::ENOENT);
+        let report = queue.fsck(&FsckOptions::default());
+        fs::fault::reset();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn fsck_reports_a_directory_it_cannot_scan_instead_of_clean() {
+        for (fault, count, path) in [
+            ("open_directory", 1, "ready"),
+            ("open_directory", 3, "ready/"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            init_test_queue(tmp.path());
+            let queue = open_test_queue(tmp.path());
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let report = queue.fsck(&FsckOptions::default());
+            fs::fault::reset();
+            let incomplete: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.finding_type == "directory_scan_incomplete")
+                .collect();
+            assert_eq!(incomplete.len(), 1, "{fault}: {:?}", report.findings);
+            // Shard order follows readdir, so the shard row checks the prefix.
+            let found = &incomplete[0].relative_path;
+            let matches = if path.ends_with('/') {
+                found.starts_with(path)
+            } else {
+                found == path
+            };
+            assert!(matches, "{fault} at {count}: {found}");
+            assert!(matches!(incomplete[0].severity, FindingSeverity::Error));
+        }
+    }
+
+    #[test]
+    fn quarantine_operations_never_follow_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"outside the queue").unwrap();
+        let name = steadq_names::quarantine_filename(&[0x42; 16], 0x0001);
+        let link = tmp.path().join("quarantine").join(&name);
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let queue = open_test_queue(tmp.path());
+
+        let entry = queue.find_quarantine(&[0x42; 16]).unwrap();
+        assert_eq!(entry.relative_path, format!("quarantine/{name}"));
+        let export = queue.export_quarantine(&[0x42; 16], &tmp.path().join("export.raw"));
+        assert!(export.is_err(), "export followed the symlink");
+        assert!(queue.remove_quarantine(&[0x42; 16]).unwrap());
+        assert!(!link.exists() && !link.is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside the queue");
+        assert!(queue.find_quarantine(&[0x42; 16]).is_none());
+    }
     use crate::queue::{CreateOptions, EnqueueInput, OpenOptions, Queue};
     use tempfile::TempDir;
 
@@ -1756,11 +1740,48 @@ mod tests {
             .findings
             .iter()
             .filter(|f| f.finding_type == "unexpected_entry")
+            .map(|f| f.relative_path.as_str())
             .collect();
+        // Files at the object level are reported as shard-level entries,
+        // which pins the per-state depth table and the descent.
+        for (path, details) in [
+            (
+                "ready/0000/unexpected.txt",
+                "unrecognized file in shard directory: unexpected.txt",
+            ),
+            (
+                "delayed/0000000000000000/0001/stray.bin",
+                "unrecognized file in shard directory: stray.bin",
+            ),
+            (
+                "leased/not-a-dir.txt",
+                "unrecognized entry in state directory: not-a-dir.txt",
+            ),
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.relative_path == path && f.details == details),
+                "{path}: {:?}",
+                report.findings
+            );
+        }
+        // A regular file where a directory belongs is an unexpected entry,
+        // never an incomplete scan.
         assert!(
-            !unexpected.is_empty(),
-            "expected unexpected_entry findings, got {} findings: {:?}",
-            report.findings.len(),
+            unexpected.contains(&"leased/not-a-dir.txt")
+                && unexpected.contains(&"ready/0000/unexpected.txt")
+                && unexpected.contains(&"delayed/0000000000000000/0001/stray.bin"),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.finding_type == "directory_scan_incomplete"),
+            "{:?}",
             report.findings
         );
 

@@ -1817,6 +1817,7 @@ fn recovery_cursor_validation_checks_every_component() {
     let valid = RecoveryCursor {
         phase: RecoveryPhase::CompactReceipts,
         reap_leases: Some(valid_four),
+        reap_colocated_shard: None,
         promote_delayed: Some(valid_three.clone()),
         cleanup_temp: Some(valid_three.clone()),
         compact_receipts: Some(valid_three.clone()),
@@ -3432,9 +3433,7 @@ fn reap_to_dead_rejects_generation_overflow() {
         maximum_attempts: 3,
     };
     let res = queue.reap_to_dead(
-        "boot",
-        "0000000000000000",
-        "0000",
+        queue.root_fd(),
         "dummy",
         &common,
         crate::errors::DeadReason::AttemptsExhausted,
@@ -3494,8 +3493,8 @@ fn reap_to_ready_uses_phase_aware_move_executor() {
         let parts = lease_path_parts(&lease);
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
-        let shard = u32::from_str_radix(parts[1], 16).unwrap();
-        let result = queue.reap_colocated_to_ready(shard, parts[2], &common);
+        let shard_fd = open_relative(queue.root_fd(), &format!("ready/{}", parts[1])).unwrap();
+        let result = queue.reap_colocated_to_ready(shard_fd.as_fd(), parts[2], &common);
         fs::fault::reset();
         assert_injected_move_phase(result, phase, outcome_unknown);
     }
@@ -3527,9 +3526,9 @@ fn reap_to_dead_uses_phase_aware_move_executor() {
             .unwrap();
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
-        let shard = u32::from_str_radix(parts[1], 16).unwrap();
+        let shard_fd = open_relative(queue.root_fd(), &format!("ready/{}", parts[1])).unwrap();
         let result = queue.reap_colocated_to_dead(
-            shard,
+            shard_fd.as_fd(),
             parts[2],
             &common,
             DeadReason::AttemptsExhausted,
@@ -3570,7 +3569,12 @@ fn delayed_promotion_uses_phase_aware_move_executor() {
         assert!(tmp.path().join(&ticket.expected_relative_path).exists());
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
-        let result = queue.promote_to_ready(parts[1], parts[2], parts[3], &parsed.common);
+        let shard_fd = open_relative(
+            queue.root_fd(),
+            &format!("delayed/{}/{}", parts[1], parts[2]),
+        )
+        .unwrap();
+        let result = queue.promote_to_ready(shard_fd.as_fd(), parts[2], parts[3], &parsed.common);
         fs::fault::reset();
         assert_injected_move_phase(result, phase, outcome_unknown);
     }
@@ -4796,4 +4800,80 @@ fn recovery_does_not_invent_terminal_bucket_without_wall_floor() {
         .any(|error| error.operation == "reap_to_dead"));
     assert!(tmp.path().join(&lease.exact_source_path).exists());
     assert!(!tmp.path().join("dead/0000000000000000").exists());
+}
+
+#[test]
+fn colocated_reap_resumes_from_the_persisted_shard() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    for shard in [0, 1] {
+        enqueue_for_shard(&mut queue, &tmp, shard, None, b"colocated");
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+    }
+    let budget = WorkBudget {
+        max_operations: 1,
+        max_duration_ms: 5_000,
+    };
+    let first = reap_expired_with_budget(&mut queue, &budget);
+    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+
+    queue.persist_recovery_cursor().unwrap();
+    drop(queue);
+    let mut reopened = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.recovery_cursor.reap_colocated_shard, Some(1));
+
+    let second = reap_expired_with_budget(&mut reopened, &budget);
+    assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
+    assert!(!second.budget_exhausted);
+    assert_eq!(reopened.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn promote_quarantines_a_malformed_delayed_name() {
+    let (tmp, mut queue) = create_test_queue();
+    queue.ensure_dir("delayed/0000000000000000/0000").unwrap();
+    let stray = tmp.path().join("delayed/0000000000000000/0000/garbage.sqj");
+    std::fs::write(&stray, b"garbage").unwrap();
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert!(
+        stats.errors.iter().any(|e| e.operation == "promote_parse"),
+        "errors: {:?}",
+        stats.errors
+    );
+    assert!(!stray.exists());
+    assert_eq!(queue.list_quarantine().len(), 1);
+}
+
+#[test]
+fn receipt_retention_quarantines_a_malformed_receipt_name() {
+    let (tmp, mut queue) = create_test_queue();
+    queue.ensure_dir("receipts/0000000000000000/0000").unwrap();
+    let stray = tmp
+        .path()
+        .join("receipts/0000000000000000/0000/garbage.rct");
+    std::fs::write(&stray, b"garbage").unwrap();
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+    assert!(
+        stats
+            .errors
+            .iter()
+            .any(|e| e.operation == "receipt_delete_parse"),
+        "errors: {:?}",
+        stats.errors
+    );
+    assert!(!stray.exists());
+    assert_eq!(queue.list_quarantine().len(), 1);
 }

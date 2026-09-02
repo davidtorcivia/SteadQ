@@ -1,6 +1,5 @@
 // SteadQ command-line interface.
 
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,15 +70,6 @@ fn parse_hex_id(value: &str, label: &str) -> Result<[u8; 16], ExitCode> {
         eprintln!("invalid {label}");
         exit(EXIT_ORDINARY)
     })
-}
-
-fn escape_os_bytes(value: &std::ffi::OsStr) -> String {
-    value
-        .as_bytes()
-        .iter()
-        .flat_map(|byte| std::ascii::escape_default(*byte))
-        .map(char::from)
-        .collect()
 }
 
 #[derive(Parser)]
@@ -595,37 +585,29 @@ fn cmd_dead_inspect(path: PathBuf, job_id: String) -> ExitCode {
 }
 
 fn cmd_dead_list(path: PathBuf) -> ExitCode {
-    let qroot = path.join("dead");
-    let entries = match std::fs::read_dir(&qroot) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return exit(EXIT_SUCCESS);
+    let queue = match open_or_exit(&path) {
+        Ok(q) => q,
+        Err(code) => return code,
+    };
+    match queue.list_dead() {
+        Ok(entries) => {
+            for s in entries {
+                println!(
+                    "{} gen={} attempt={}/{} {}",
+                    steadq_names::hex_encode(&s.job_id),
+                    s.generation,
+                    s.attempt,
+                    s.maximum_attempts,
+                    s.relative_path
+                );
+            }
+            exit(EXIT_SUCCESS)
         }
         Err(e) => {
             eprintln!("dead list failed: {e}");
-            return exit_io(&e);
-        }
-    };
-    for bucket in entries.flatten() {
-        let shards = match std::fs::read_dir(bucket.path()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for shard in shards.flatten() {
-            let files = match std::fs::read_dir(shard.path()) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for file in files.flatten() {
-                let name = escape_os_bytes(&file.file_name());
-                let file_path = file.path();
-                let relative_path = file_path.strip_prefix(&path).unwrap_or(&file_path);
-                let rp = escape_os_bytes(relative_path.as_os_str());
-                println!("{name} {rp}");
-            }
+            exit_core(&e)
         }
     }
-    exit(EXIT_SUCCESS)
 }
 
 fn cmd_bench(
@@ -1702,7 +1684,6 @@ fn load_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     #[test]
     fn exit_codes_follow_spec_table() {
@@ -1736,12 +1717,6 @@ mod tests {
             exit(EXIT_ORDINARY)
         );
         assert_eq!(exit_io(&std::io::Error::other("io")), exit(EXIT_IO_FAILURE));
-    }
-
-    #[test]
-    fn os_byte_escaping_preserves_distinct_names() {
-        assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x80")), "bad-\\x80");
-        assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x81")), "bad-\\x81");
     }
 
     #[test]

@@ -678,7 +678,7 @@ pub enum ResolutionOutcome {
 }
 
 /// Diagnostic snapshot of a job's current state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub job_id: [u8; 16],
     pub state: String,
