@@ -234,13 +234,13 @@ impl Queue {
             Err(error) => match classify_presence_failure(&error) {
                 PresenceFailure::Absent => return ResolveObj::Absent,
                 PresenceFailure::Io => {
-                    return ResolveObj::Error(Error::IoFailure(error.to_string()));
+                    return ResolveObj::Error(Error::from(error));
                 }
             },
         };
         let directory_stat = match fs::fstat(dir_fd.as_fd()) {
             Ok(stat) => stat,
-            Err(error) => return ResolveObj::Error(Error::IoFailure(error.to_string())),
+            Err(error) => return ResolveObj::Error(Error::from(error)),
         };
 
         let file_fd = match fs::openat(dir_fd.as_fd(), name, resolver_file_open_flags(), 0) {
@@ -249,13 +249,13 @@ impl Queue {
                 ResolverObjectOpenFailure::Absent => return ResolveObj::Absent,
                 ResolverObjectOpenFailure::Conflict => return ResolveObj::Conflict,
                 ResolverObjectOpenFailure::Io => {
-                    return ResolveObj::Error(Error::IoFailure(error.to_string()));
+                    return ResolveObj::Error(Error::from(error));
                 }
             },
         };
         let stat = match fs::fstat(file_fd.as_fd()) {
             Ok(stat) => stat,
-            Err(error) => return ResolveObj::Error(Error::IoFailure(error.to_string())),
+            Err(error) => return ResolveObj::Error(Error::from(error)),
         };
 
         if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
@@ -268,7 +268,7 @@ impl Queue {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 ResolveObj::Conflict
             } else {
-                ResolveObj::Error(Error::IoFailure(error.to_string()))
+                ResolveObj::Error(Error::from(error))
             };
         }
 
@@ -473,9 +473,8 @@ impl Queue {
         path: &ResolvePath<'_>,
         object: &ResolvedObject,
     ) -> Result<bool, Error> {
-        fs::fsync(object.file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(object.directory_fd.as_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync(object.file_fd.as_fd()).map_err(Error::from)?;
+        fs::fsync_dir_fd(object.directory_fd.as_fd()).map_err(Error::from)?;
         let current_directory =
             match fs::open_directory_beneath(self.root_fd.as_fd(), path.directory) {
                 Ok(directory) => directory,
@@ -483,11 +482,10 @@ impl Queue {
                     if resolver_error_is_not_found(&error) {
                         return Ok(false);
                     }
-                    return Err(Error::IoFailure(error.to_string()));
+                    return Err(Error::from(error));
                 }
             };
-        let current_directory_stat = fs::fstat(current_directory.as_fd())
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let current_directory_stat = fs::fstat(current_directory.as_fd()).map_err(Error::from)?;
         if !identity_matches(
             current_directory_stat.st_dev as u64,
             current_directory_stat.st_ino as u64,
@@ -502,7 +500,7 @@ impl Queue {
                 if resolver_error_is_not_found(&error) {
                     return Ok(false);
                 }
-                return Err(Error::IoFailure(error.to_string()));
+                return Err(Error::from(error));
             }
         };
         Ok(resolved_identity_matches(

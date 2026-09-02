@@ -79,6 +79,7 @@ pub mod fault {
         readdir_reversed: bool,
         realtime_ns: Option<u64>,
         boottime_ns: Option<u64>,
+        pinned_realtime_ns: Option<u64>,
     }
 
     impl State {
@@ -91,6 +92,7 @@ pub mod fault {
                 readdir_reversed: false,
                 realtime_ns: None,
                 boottime_ns: None,
+                pinned_realtime_ns: None,
             }
         }
     }
@@ -108,8 +110,21 @@ pub mod fault {
             s.fd_identities.clear();
             s.readdir_rotation = 0;
             s.readdir_reversed = false;
-            s.realtime_ns = None;
+            s.realtime_ns = s.pinned_realtime_ns;
             s.boottime_ns = None;
+        });
+    }
+
+    /// Pin the realtime clock for the life of this thread. `reset()` restores
+    /// the pin instead of the wall clock, so a fixture's frozen time survives
+    /// every fault reset in the test. Fixtures pin so a bucket boundary cannot
+    /// trigger a wall-watermark advance that consumes a count-based fault
+    /// before the operation under test reaches it.
+    pub fn pin_clock_realtime_ns(unix_ns: u64) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.pinned_realtime_ns = Some(unix_ns);
+            state.realtime_ns = Some(unix_ns);
         });
     }
 
@@ -1289,24 +1304,6 @@ fn read_dir_entries_impl(dir_fd: OwnedFd) -> io::Result<Vec<DirEntryName>> {
         .map(|enumeration| enumeration.entries)
 }
 
-/// Iterate directory entries with a callback. The callback returns true to
-/// continue and false to stop.
-/// Returns the number of entries processed.
-pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
-    dir_fd: BorrowedFd<'_>,
-    mut f: F,
-) -> io::Result<usize> {
-    let mut dir = DirectoryStream::open(dir_fd)?;
-    let mut count = 0usize;
-    while let Some(name) = dir.next_entry()? {
-        count += 1;
-        if !f(&name) {
-            break;
-        }
-    }
-    Ok(count)
-}
-
 /// Get the filesystem type magic number.
 pub fn fs_type_magic(path: &Path) -> io::Result<i64> {
     let stat = statfs(path)?;
@@ -1411,57 +1408,6 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// True when both stats describe the same directory (device and inode).
-fn same_dir(a: &libc::stat, b: &libc::stat) -> bool {
-    a.st_dev == b.st_dev && a.st_ino == b.st_ino
-}
-
-/// Durable no-overwrite move: renameat2 with RENAME_NOREPLACE, then sync directories.
-/// If source and destination are the same directory, sync once.
-pub fn durable_move_noreplace(
-    src_dir_fd: BorrowedFd<'_>,
-    src_name: &str,
-    dest_dir_fd: BorrowedFd<'_>,
-    dest_name: &str,
-) -> io::Result<()> {
-    fault_check!("durable_move_noreplace");
-    renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
-
-    let src_stat = fstat(src_dir_fd)?;
-    let dest_stat = fstat(dest_dir_fd)?;
-
-    if same_dir(&src_stat, &dest_stat) {
-        fsync_dir_fd(dest_dir_fd)?;
-    } else {
-        fsync_dir_fd(dest_dir_fd)?;
-        fsync_dir_fd(src_dir_fd)?;
-    }
-    Ok(())
-}
-
-/// Replacing rename: for receipt compaction and wall-watermark replacement only.
-/// Performs a standard rename (overwrites destination), then syncs the directory.
-pub fn durable_move_replace(
-    src_dir_fd: BorrowedFd<'_>,
-    src_name: &str,
-    dest_dir_fd: BorrowedFd<'_>,
-    dest_name: &str,
-) -> io::Result<()> {
-    fault_check!("durable_move_replace");
-    renameat(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
-
-    let src_stat = fstat(src_dir_fd)?;
-    let dest_stat = fstat(dest_dir_fd)?;
-
-    if same_dir(&src_stat, &dest_stat) {
-        fsync_dir_fd(dest_dir_fd)?;
-    } else {
-        fsync_dir_fd(dest_dir_fd)?;
-        fsync_dir_fd(src_dir_fd)?;
-    }
-    Ok(())
-}
-
 /// Stabilization sync: sync a verified destination and its parent directories.
 /// Non-mutating: only performs fsync, no rename or write.
 pub fn stabilize(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -1473,17 +1419,6 @@ pub fn stabilize_dir(fd: BorrowedFd<'_>) -> io::Result<()> {
     fsync_dir_fd(fd)
 }
 
-/// syncfs: sync an entire filesystem. Caller must assert the queue owns the mount.
-pub fn syncfs(fd: BorrowedFd<'_>) -> io::Result<()> {
-    fault_check!("syncfs");
-    // SAFETY: `fd` remains live for the synchronous syscall.
-    let rc = unsafe { libc::syscall(libc::SYS_syncfs, fd.as_raw_fd()) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Check if an error indicates the source is gone (ENOENT).
 pub fn is_source_gone(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ENOENT)
@@ -1492,37 +1427,6 @@ pub fn is_source_gone(err: &io::Error) -> bool {
 /// Check if an error indicates a collision (EEXIST).
 pub fn is_collision(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::EEXIST)
-}
-
-/// Check if an error indicates resource exhaustion (ENOSPC, EDQUOT).
-pub fn is_resource_exhausted(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
-}
-
-/// Check if an error is a sync failure that should poison the handle.
-pub fn is_sync_failure(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::EIO) | Some(libc::ESTALE))
-}
-
-/// Check if an error is a capability/permission error (should not fall back).
-pub fn is_capability_error(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
-    )
-}
-
-/// Check if an error should suppress publication fallback.
-pub fn should_propagate_on_fallback(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EIO)
-            | Some(libc::ENOSPC)
-            | Some(libc::EDQUOT)
-            | Some(libc::ESTALE)
-            | Some(libc::EPERM)
-            | Some(libc::EACCES)
-    )
 }
 
 /// Probe unnamed-file publication modes. Returns which mode is available.
@@ -1680,6 +1584,18 @@ pub fn validate_relative_path(path: &str) -> io::Result<ValidatedRelativePath<'_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_restores_the_pinned_realtime_clock() {
+        fault::reset();
+        assert!(fault::clock_realtime_ns().is_none());
+        fault::pin_clock_realtime_ns(7);
+        fault::set_clock_realtime_ns(9);
+        assert_eq!(fault::clock_realtime_ns(), Some(9));
+        fault::reset();
+        assert_eq!(fault::clock_realtime_ns(), Some(7));
+        assert_eq!(super::clock_realtime_ns().unwrap(), 7);
+    }
+
     use super::*;
     use std::os::fd::{AsFd, RawFd};
 
@@ -1759,19 +1675,6 @@ mod tests {
         )));
         assert!(is_interrupted(&io::Error::from_raw_os_error(libc::EINTR)));
         assert!(!is_interrupted(&io::Error::from_raw_os_error(libc::EIO)));
-    }
-
-    #[test]
-    fn same_dir_compares_device_and_inode() {
-        let dir = test_dir("samedir");
-        let fd = open_dir_absolute(dir.path()).unwrap();
-        mkdirat(fd.as_fd(), "x", 0o700).unwrap();
-        let x = open_directory(fd.as_fd(), "x").unwrap();
-        let x_stat = fstat(x.as_fd()).unwrap();
-        let root_stat = fstat(fd.as_fd()).unwrap();
-        assert!(same_dir(&x_stat, &x_stat));
-        // Same device, different inode: not the same directory.
-        assert!(!same_dir(&x_stat, &root_stat));
     }
 
     #[test]
@@ -2086,50 +1989,6 @@ mod tests {
     }
 
     #[test]
-    fn read_dir_for_each_visits_all_entries() {
-        let directory = test_dir("read-dir-for-each");
-        let dir_path = directory.path();
-        std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
-        std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
-
-        let fd = std::fs::File::open(dir_path).unwrap();
-        let mut names = Vec::new();
-        let count = read_dir_for_each(fd.as_fd(), |name| {
-            names.push(name.as_bytes().to_vec());
-            true
-        })
-        .unwrap();
-        assert_eq!(count, 2);
-        assert!(names.contains(&b"a.txt".to_vec()));
-        assert!(names.contains(&b"b.txt".to_vec()));
-    }
-
-    #[test]
-    fn read_dir_for_each_stops_early() {
-        let directory = test_dir("read-dir-for-each-stop");
-        let dir_path = directory.path();
-        std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
-        std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
-        std::fs::write(dir_path.join("c.txt"), b"z").unwrap();
-
-        let fd = std::fs::File::open(dir_path).unwrap();
-        let mut count_seen = 0;
-        let _count = read_dir_for_each(fd.as_fd(), |_| {
-            count_seen += 1;
-            false // stop immediately
-        })
-        .unwrap();
-        assert_eq!(count_seen, 1);
-
-        let mut entries = read_dir_entries(fd.as_fd()).unwrap();
-        entries.sort();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].as_bytes(), b"a.txt");
-        assert_eq!(entries[1].as_bytes(), b"b.txt");
-        assert_eq!(entries[2].as_bytes(), b"c.txt");
-    }
-
-    #[test]
     fn directory_stream_closes_consumed_descriptor_on_success_and_failure() {
         let directory_owner = test_dir("directory-stream-ownership");
         let dir_path = directory_owner.path();
@@ -2206,17 +2065,6 @@ mod tests {
         owned.sort();
         assert_eq!(owned[0].as_bytes(), b"bad-\x80");
         assert_eq!(owned[1].as_bytes(), b"bad-\x81");
-
-        let callback_dir = std::fs::File::open(dir_path).unwrap();
-        let mut visited = Vec::new();
-        read_dir_for_each(callback_dir.as_fd(), |entry| {
-            visited.push(entry.as_bytes().to_vec());
-            true
-        })
-        .unwrap();
-        visited.sort();
-        assert_eq!(visited[0], b"bad-\x80");
-        assert_eq!(visited[1], b"bad-\x81");
     }
 
     #[test]
@@ -2556,17 +2404,6 @@ mod tests {
         );
 
         fault::reset();
-        fault::inject_errno("syncfs", 1, libc::EIO);
-        assert_eq!(
-            syncfs(directory.as_fd()).unwrap_err().raw_os_error(),
-            Some(libc::EIO)
-        );
-        assert_eq!(
-            fstat(directory.as_fd()).unwrap().st_mode & libc::S_IFMT,
-            libc::S_IFDIR
-        );
-
-        fault::reset();
         drop(child);
         drop(directory);
     }
@@ -2798,73 +2635,6 @@ mod tests {
         let r = pread(file.as_fd(), &mut buf, 0).unwrap();
         assert_eq!(r, data.len());
         assert_eq!(&buf, data);
-    }
-
-    #[test]
-    fn durable_move_noreplace_moves_and_syncs() {
-        let dir = test_dir("dmnr");
-        let fd = open_dir_absolute(dir.path()).unwrap();
-        mkdirat(fd.as_fd(), "src", 0o700).unwrap();
-        mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
-        let src = open_directory(fd.as_fd(), "src").unwrap();
-        let dst = open_directory(fd.as_fd(), "dst").unwrap();
-        std::fs::write(dir.path().join("src/f"), b"payload").unwrap();
-        durable_move_noreplace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
-        assert!(fstatat(src.as_fd(), "f").is_err());
-        assert!(fstatat(dst.as_fd(), "f").is_ok());
-    }
-
-    #[test]
-    fn durable_move_noreplace_syncs_same_dir_once_and_cross_dir_twice() {
-        let dir = test_dir("dmnr-sync");
-        let fd = open_dir_absolute(dir.path()).unwrap();
-        mkdirat(fd.as_fd(), "a", 0o700).unwrap();
-        mkdirat(fd.as_fd(), "b", 0o700).unwrap();
-        let a = open_directory(fd.as_fd(), "a").unwrap();
-        let b = open_directory(fd.as_fd(), "b").unwrap();
-        std::fs::write(dir.path().join("a/f"), b"payload").unwrap();
-        let a_id = fstat(a.as_fd()).unwrap();
-        let b_id = fstat(b.as_fd()).unwrap();
-
-        // Arm a never-firing fault so the counters and fd identities record.
-        fault::inject("fsync_dir_fd", u64::MAX);
-        durable_move_noreplace(a.as_fd(), "f", a.as_fd(), "g").unwrap();
-        assert_eq!(
-            fault::call_count("fsync_dir_fd"),
-            1,
-            "same dir must sync once"
-        );
-        durable_move_noreplace(a.as_fd(), "g", b.as_fd(), "h").unwrap();
-        assert_eq!(
-            fault::call_count("fsync_dir_fd"),
-            3,
-            "cross dir must sync twice"
-        );
-        assert_eq!(
-            fault::fd_identities("fsync_dir_fd"),
-            vec![
-                (a_id.st_dev as u64, a_id.st_ino as u64),
-                (b_id.st_dev as u64, b_id.st_ino as u64),
-                (a_id.st_dev as u64, a_id.st_ino as u64),
-            ]
-        );
-        fault::reset();
-    }
-
-    #[test]
-    fn durable_move_replace_overwrites() {
-        let dir = test_dir("dmr");
-        let fd = open_dir_absolute(dir.path()).unwrap();
-        mkdirat(fd.as_fd(), "src", 0o700).unwrap();
-        mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
-        let src = open_directory(fd.as_fd(), "src").unwrap();
-        let dst = open_directory(fd.as_fd(), "dst").unwrap();
-        std::fs::write(dir.path().join("src/f"), b"new").unwrap();
-        std::fs::write(dir.path().join("dst/f"), b"old").unwrap();
-        durable_move_replace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
-        assert!(fstatat(src.as_fd(), "f").is_err());
-        let st = fstatat(dst.as_fd(), "f").unwrap();
-        assert_eq!(st.st_size as usize, 3);
     }
 
     #[test]

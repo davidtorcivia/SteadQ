@@ -38,10 +38,7 @@ impl Queue {
         let job_id = match fs::random_128bit() {
             Ok(id) => id,
             Err(e) => {
-                return Err((
-                    EnqueueTicket::uncommitted([0; 16]),
-                    Error::IoFailure(e.to_string()),
-                ));
+                return Err((EnqueueTicket::uncommitted([0; 16]), Error::from(e)));
             }
         };
         let wall_floor = match self.wall_floor_for_mutation() {
@@ -329,15 +326,15 @@ impl Queue {
         // Ensure destination directory exists
         if let Some(d) = dirty.as_deref_mut() {
             self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         } else {
             self.ensure_dir(dest_dir_relative)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         }
 
         let dest_fd = self
             .open_or_cache_dir(dest_dir_relative)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
         if self.publication_mode == Some(fs::PublicationMode::NamedFallback) {
             return self.named_fallback_with_dirty(
@@ -377,9 +374,8 @@ impl Queue {
                     Ok(engine::TmpfilePublishOutcome::Published(mode)) => {
                         self.publication_mode = Some(mode);
                         if let Some(d) = dirty {
-                            d.record(dest_fd.as_fd()).map_err(|e| {
-                                PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
-                            })?;
+                            d.record(dest_fd.as_fd())
+                                .map_err(|e| PublishError::OutcomeUnknown(Error::from(e)))?;
                         }
                         Ok(())
                     }
@@ -433,20 +429,19 @@ impl Queue {
         let tmp_dir = format!("tmp/{}/{}", self.boot_id, shard_part);
         if let Some(d) = dirty.as_deref_mut() {
             self.ensure_dir_with_dirty(&tmp_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         } else {
             self.ensure_dir(&tmp_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let boottime = fs::clock_boottime_ns()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let random = fs::random_128bit()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let boottime =
+            fs::clock_boottime_ns().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let random = fs::random_128bit().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let temp_name = temp_filename(boottime, &random);
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         struct TempGuard<'a, 'fd> {
             dir_fd: BorrowedFd<'fd>,
             name: &'a str,
@@ -483,12 +478,10 @@ impl Queue {
             ) {
                 Ok(_) => {
                     temp_guard.armed = false;
-                    d.record(tmp_dir_fd.as_fd()).map_err(|e| {
-                        PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
-                    })?;
-                    d.record(dest_fd).map_err(|e| {
-                        PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
-                    })?;
+                    d.record(tmp_dir_fd.as_fd())
+                        .map_err(|e| PublishError::OutcomeUnknown(Error::from(e)))?;
+                    d.record(dest_fd)
+                        .map_err(|e| PublishError::OutcomeUnknown(Error::from(e)))?;
                     Ok(())
                 }
                 Err(failure) => {
@@ -503,10 +496,10 @@ impl Queue {
                             Error::IoFailure("temporary publication source missing".into()),
                         ),
                         engine::MoveFailure::NotCommitted { source, .. } => {
-                            PublishError::NotCommitted(Error::IoFailure(source.to_string()))
+                            PublishError::NotCommitted(Error::from(source))
                         }
                         engine::MoveFailure::OutcomeUnknown { source, .. } => {
-                            PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
+                            PublishError::OutcomeUnknown(Error::from(source))
                         }
                     };
                     Err(mapped)
@@ -519,7 +512,6 @@ impl Queue {
                 dest_fd,
                 dest_name,
                 engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
-                engine::MoveActor::Producer,
             ) {
                 Ok(()) => {
                     temp_guard.armed = false;
@@ -639,7 +631,7 @@ impl Queue {
             Err(e) => {
                 return EnqueueOutcome::NotCommitted(
                     EnqueueTicket::uncommitted([0; 16]),
-                    Error::IoFailure(e.to_string()),
+                    Error::from(e),
                 )
             }
         };
@@ -814,13 +806,13 @@ impl Queue {
     ) -> Result<[u8; 32], PublishError> {
         if let Some(d) = dirty.as_deref_mut() {
             self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         } else {
             self.ensure_dir(dest_dir_relative)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         }
         let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
         if self.publication_mode == Some(fs::PublicationMode::NamedFallback) {
             return self.named_fallback_streaming_init(
@@ -895,7 +887,7 @@ impl Queue {
                             d.record(dest_fd.as_fd()).map_err(|e| {
                                 PublishError::OutcomeUnknownPublished {
                                     envelope_digest: env_dig,
-                                    error: Error::IoFailure(e.to_string()),
+                                    error: Error::from(e),
                                 }
                             })?;
                         }
@@ -960,7 +952,7 @@ impl Queue {
         loop {
             let n = reader
                 .read(&mut buf)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
             if n == 0 {
                 break;
             }
@@ -994,21 +986,20 @@ impl Queue {
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
         if let Some(d) = dirty.as_deref_mut() {
             self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         } else {
             self.ensure_dir(&tmp_shard_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let boottime = fs::clock_boottime_ns()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let random = fs::random_128bit()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let boottime =
+            fs::clock_boottime_ns().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let random = fs::random_128bit().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let temp_name = temp_filename(boottime, &random);
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
         // Write the real header to the named temp.
         let header_bytes = header
@@ -1024,7 +1015,7 @@ impl Queue {
         while copied < payload_len {
             let to_read = (buf.len() as u64).min(payload_len - copied) as usize;
             let n = fs::pread(tmpfile_fd, &mut buf[..to_read], data_offset + copied)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
             if n == 0 {
                 break;
             }
@@ -1065,21 +1056,20 @@ impl Queue {
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
         if let Some(d) = dirty.as_deref_mut() {
             self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         } else {
             self.ensure_dir(&tmp_shard_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let boottime = fs::clock_boottime_ns()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let random = fs::random_128bit()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let boottime =
+            fs::clock_boottime_ns().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let random = fs::random_128bit().map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let temp_name = temp_filename(boottime, &random);
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
         // Stream payload to named temp while hashing.
         // Write placeholder header first, then extension, then payload.
@@ -1152,12 +1142,12 @@ impl Queue {
                     d.record(tmp_dir_fd)
                         .map_err(|e| PublishError::OutcomeUnknownPublished {
                             envelope_digest,
-                            error: Error::IoFailure(e.to_string()),
+                            error: Error::from(e),
                         })?;
                     d.record(dest_fd)
                         .map_err(|e| PublishError::OutcomeUnknownPublished {
                             envelope_digest,
-                            error: Error::IoFailure(e.to_string()),
+                            error: Error::from(e),
                         })?;
                     Ok(envelope_digest)
                 }
@@ -1171,12 +1161,7 @@ impl Queue {
             }
         } else {
             match engine::move_witnessed_noreplace_io(
-                tmp_dir_fd,
-                temp_name,
-                dest_fd,
-                dest_name,
-                identity,
-                engine::MoveActor::Producer,
+                tmp_dir_fd, temp_name, dest_fd, dest_name, identity,
             ) {
                 Ok(()) => Ok(envelope_digest),
                 Err(failure) => {
@@ -1217,19 +1202,20 @@ impl PublishError {
                 PublishError::NotCommitted(Error::IdentityCollision)
             }
             engine::TmpfilePublishFailure::NotCommitted { phase, source } => {
-                match source.raw_os_error() {
-                    Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
-                        PublishError::NotCommitted(Error::ResourceExhausted)
-                    }
-                    _ => PublishError::NotCommitted(Error::IoFailure(format!(
-                        "temporary-file publication failed at {phase:?}: {source}"
-                    ))),
-                }
+                PublishError::NotCommitted(match Error::from(source) {
+                    Error::IoFailure(message) => Error::IoFailure(format!(
+                        "temporary-file publication failed at {phase:?}: {message}"
+                    )),
+                    classified => classified,
+                })
             }
             engine::TmpfilePublishFailure::OutcomeUnknown { phase, source } => {
-                PublishError::OutcomeUnknown(Error::IoFailure(format!(
-                    "temporary-file publication failed at {phase:?}: {source}"
-                )))
+                PublishError::OutcomeUnknown(match Error::from(source) {
+                    Error::IoFailure(message) => Error::IoFailure(format!(
+                        "temporary-file publication failed at {phase:?}: {message}"
+                    )),
+                    classified => classified,
+                })
             }
         }
     }
@@ -1243,10 +1229,10 @@ impl PublishError {
                 "temporary publication source missing".into(),
             )),
             engine::MoveFailure::NotCommitted { source, .. } => {
-                PublishError::NotCommitted(Error::IoFailure(source.to_string()))
+                PublishError::NotCommitted(Error::from(source))
             }
             engine::MoveFailure::OutcomeUnknown { source, .. } => {
-                PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
+                PublishError::OutcomeUnknown(Error::from(source))
             }
         }
     }
@@ -1261,24 +1247,19 @@ impl PublishError {
             )),
             engine::MoveFailureWith::NotCommitted { source, .. } => Self::classify_write(source),
             engine::MoveFailureWith::OutcomeUnknown { source, .. } => {
-                PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
+                PublishError::OutcomeUnknown(Error::from(source))
             }
         }
     }
 
     pub(super) fn classify_write(e: io::Error) -> Self {
-        match e.raw_os_error() {
-            Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
-                PublishError::NotCommitted(Error::ResourceExhausted)
-            }
-            _ => PublishError::NotCommitted(Error::IoFailure(e.to_string())),
-        }
+        PublishError::NotCommitted(Error::from(e))
     }
 
     /// Classify a file fsync failure that occurs BEFORE the linearizing
     /// link/rename. Per spec section 7.8, this is NotCommitted.
     pub(super) fn classify_pre_pub_fsync(e: io::Error) -> Self {
-        PublishError::NotCommitted(Error::IoFailure(e.to_string()))
+        PublishError::NotCommitted(Error::from(e))
     }
 }
 

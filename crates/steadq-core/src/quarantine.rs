@@ -6,7 +6,7 @@ use sha2::Digest;
 use steadq_fs_linux as fs;
 use steadq_names;
 
-use crate::queue::engine::{move_verified_noreplace, MoveActor, MoveFailure};
+use crate::queue::engine::{move_verified_noreplace, MoveFailure};
 use crate::queue::Queue;
 
 const QUARANTINE_NAME_ATTEMPTS: usize = 8;
@@ -1156,7 +1156,6 @@ impl Queue {
                 filename,
                 quarantine_dir.as_fd(),
                 &quarantine_name,
-                MoveActor::Recovery,
             ) {
                 Ok(()) => {
                     return Ok(QuarantinePublication {
@@ -1432,6 +1431,13 @@ mod tests {
     use crate::queue::{CreateOptions, EnqueueInput, OpenOptions, Queue};
     use tempfile::TempDir;
 
+    /// Pins the realtime clock before init so no delayed-bucket boundary can
+    /// trigger a watermark advance that steals a count-based fault.
+    fn init_test_queue(path: &std::path::Path) {
+        fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
+        Queue::init(path, &CreateOptions::default()).unwrap();
+    }
+
     fn open_test_queue(path: &std::path::Path) -> Queue {
         Queue::open(
             path,
@@ -1445,7 +1451,7 @@ mod tests {
 
     fn queue_with_quarantine_candidate() -> (TempDir, Queue) {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         std::fs::write(tmp.path().join("candidate.raw"), b"candidate").unwrap();
         let queue = open_test_queue(tmp.path());
         (tmp, queue)
@@ -1585,7 +1591,7 @@ mod tests {
                         "candidate.raw",
                         crate::QuarantineReason::EnvelopeCorrupt,
                         QUARANTINE_NAME_ATTEMPTS,
-                        || Ok(replay_id),
+                        || Ok(replay_id)
                     ),
                     Err(QuarantinePublishFailure::Move {
                         failure: MoveFailure::SourceMissing,
@@ -1729,7 +1735,7 @@ mod tests {
     #[test]
     fn fsck_reports_unexpected_entries() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = open_test_queue(tmp.path());
         // Place an unexpected file directly in a ready shard directory.
         let ready_shard = tmp.path().join("ready/0000");
@@ -1760,7 +1766,7 @@ mod tests {
 
         // A clean queue should have zero objects and zero findings.
         let clean_tmp = TempDir::new().unwrap();
-        Queue::init(clean_tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(clean_tmp.path());
         let clean_queue = open_test_queue(clean_tmp.path());
         let clean_report = clean_queue.fsck(&FsckOptions::default());
         assert_eq!(
@@ -1772,7 +1778,7 @@ mod tests {
     #[test]
     fn fsck_clean_queue() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -1789,7 +1795,7 @@ mod tests {
     #[test]
     fn fsck_counts_objects_across_state_directories() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let mut queue = open_test_queue(tmp.path());
         for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
             let outcome = queue.enqueue(EnqueueInput {
@@ -1824,7 +1830,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let shard = tmp.path().join("ready/0000");
         // Filesystems with mandatory UTF-8 names (ZFS utf8only, ext4 strict
         // encoding) reject non-UTF-8 names with EILSEQ; the property is
@@ -1861,7 +1867,7 @@ mod tests {
     #[test]
     fn quarantine_list_export_remove() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -1900,7 +1906,7 @@ mod tests {
     #[test]
     fn fsck_shard_extraction_requires_each_exact_path_shape() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = open_test_queue(tmp.path());
 
         let cases: &[(&str, &[&str], Option<&str>)] = &[
@@ -1936,7 +1942,7 @@ mod tests {
     #[test]
     fn fsck_finds_valid_job() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let mut queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -1970,7 +1976,7 @@ mod tests {
     #[test]
     fn fsck_deep_verifies_payload() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let mut queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -2008,7 +2014,7 @@ mod tests {
     #[test]
     fn fsck_detects_header_corruption() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let mut queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -2058,7 +2064,7 @@ mod tests {
     #[test]
     fn fsck_repair_quarantines_corrupt_header() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let mut queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -2116,7 +2122,7 @@ mod tests {
     #[test]
     fn quarantine_opened_receipt_rejects_path_replacement() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -2167,7 +2173,7 @@ mod tests {
     #[test]
     fn receipt_repair_requires_an_opened_regular_candidate() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -2207,7 +2213,7 @@ mod tests {
     #[test]
     fn receipt_repair_quarantines_locked_regular_candidate() {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        init_test_queue(tmp.path());
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {

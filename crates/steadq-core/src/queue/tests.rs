@@ -20,6 +20,7 @@ use tempfile::TempDir;
 fn create_test_queue() -> (TempDir, Queue) {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(path, &CreateOptions::default()).unwrap();
     let queue = Queue::open(
         path,
@@ -572,6 +573,7 @@ fn filesystem_classification_preserves_strict_and_relaxed_behavior() {
 fn sync_flushes_deferred_directory_changes() {
     let (tmp, mut queue) = {
         let tmp = TempDir::new().unwrap();
+        fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
         let queue = Queue::open(
             tmp.path(),
@@ -614,6 +616,7 @@ fn sync_flushes_deferred_directory_changes() {
 #[test]
 fn deferred_enqueue_may_be_lost_before_sync_without_claiming_commit() {
     let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
     let mut queue = Queue::open(
         tmp.path(),
@@ -929,6 +932,7 @@ fn deferred_sync_via_queue_sync_actually_fsyncs() {
     // Queue::sync() will skip the actual fsync and not trigger the injected error.
     let (_tmp, mut queue) = {
         let tmp = TempDir::new().unwrap();
+        fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
         let queue = Queue::open(
             tmp.path(),
@@ -2122,6 +2126,7 @@ fn renew_extends_lease() {
 #[test]
 fn deferred_renew_defers_barrier_until_sync() {
     let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
     let mut queue = Queue::open(
         tmp.path(),
@@ -2201,6 +2206,7 @@ fn plain_renew_still_syncs_inline() {
 #[test]
 fn ack_after_deferred_renew_uses_the_returned_lease() {
     let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
     let mut queue = Queue::open(
         tmp.path(),
@@ -2702,6 +2708,7 @@ fn enqueue_survives_reopen() {
 
 fn create_test_queue_shards(shard_count: u32) -> (TempDir, Queue) {
     let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(
         tmp.path(),
         &CreateOptions {
@@ -6015,7 +6022,12 @@ fn remove_dead_deletes_file_through_core() {
 
 #[test]
 fn dead_letter_move_preserves_each_failure_phase() {
-    for (fault, phase_unknown) in [("renameat2_noreplace", false), ("fsync_dir_fd", true)] {
+    for (fault, errno, phase_unknown) in [
+        ("renameat2_noreplace", libc::EIO, false),
+        ("renameat2_noreplace", libc::ENOSPC, false),
+        ("fsync_dir_fd", libc::EIO, true),
+        ("fsync_dir_fd", libc::ENOSPC, true),
+    ] {
         let (tmp, mut queue) = create_test_queue();
         fs::fault::reset();
         fs::fault::set_clock_realtime_ns(1_000_000_000);
@@ -6043,7 +6055,7 @@ fn dead_letter_move_preserves_each_failure_phase() {
             ))
             .unwrap();
 
-        fs::fault::inject_errno(fault, 1, libc::EIO);
+        fs::fault::inject_errno(fault, 1, errno);
         let result = queue.move_to_dead(
             ready_dir,
             ready_name,
@@ -6053,18 +6065,21 @@ fn dead_letter_move_preserves_each_failure_phase() {
         );
         fs::fault::reset();
 
-        assert!(result.is_err(), "expected error for fault {fault}");
-        if phase_unknown {
-            let err = result.unwrap_err();
+        let err = result.expect_err("expected error for fault");
+        if errno == libc::ENOSPC && !phase_unknown {
+            assert_eq!(err, Error::ResourceExhausted, "fault {fault}");
+        } else {
             let message = format!("{err}");
-            assert!(
-                message.contains("indeterminate") && message.contains("DestFsync"),
-                "expected dest-dir fsync after rename, got {err:?}"
-            );
-            assert!(
-                tmp.path().join("dead").exists()
-                    || tmp.path().join(&ticket.expected_relative_path).exists()
-            );
+            let expected = if phase_unknown {
+                "indeterminate at DestFsync"
+            } else {
+                "failed at Rename"
+            };
+            assert!(message.contains(expected), "fault {fault}: {err:?}");
+        }
+        if phase_unknown {
+            assert!(find_file_with_suffix(&tmp.path().join("dead"), ".sqj").is_some());
+            assert!(!tmp.path().join(&ticket.expected_relative_path).exists());
         } else {
             assert!(tmp.path().join(&ticket.expected_relative_path).exists());
         }
@@ -7176,4 +7191,174 @@ fn shard_matches_table() {
     assert!(!Queue::shard_matches(6, 5));
     assert!(!Queue::shard_matches(0, 1));
     assert!(Queue::shard_matches(u32::MAX, u32::MAX));
+}
+
+/// Storage exhaustion before the linearizing rename must report
+/// `ResourceExhausted` and leave the handle usable, per the contract's
+/// disk-full classification, on every consumer transition.
+#[test]
+fn consumer_transitions_classify_enospc_as_resource_exhausted() {
+    for errno in [libc::ENOSPC, libc::EDQUOT] {
+        let (_tmp, mut queue) = create_test_queue();
+
+        let lease = enqueue_and_lease(&mut queue);
+        fs::fault::reset();
+        fs::fault::inject_errno("mkdirat", 1, errno);
+        let ack = queue.ack(&lease);
+        fs::fault::reset();
+        assert!(
+            matches!(ack, AckOutcome::NotCommitted(Error::ResourceExhausted)),
+            "ack under errno {errno}: {ack:?}"
+        );
+        assert!(!queue.is_poisoned());
+
+        fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+        let retry = queue.retry_now(&lease);
+        fs::fault::reset();
+        assert!(
+            matches!(
+                retry,
+                TransitionOutcome::NotCommitted(Error::ResourceExhausted)
+            ),
+            "retry under errno {errno}: {retry:?}"
+        );
+        assert!(!queue.is_poisoned());
+
+        fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+        let renew = queue.renew(&lease, 60_000_000_000);
+        fs::fault::reset();
+        assert!(
+            matches!(renew, RenewOutcome::NotCommitted(Error::ResourceExhausted)),
+            "renew under errno {errno}: {renew:?}"
+        );
+        assert!(!queue.is_poisoned());
+
+        fs::fault::inject_errno("mkdirat", 1, errno);
+        let bury = queue.bury(&lease, DeadReason::ConsumerRejected);
+        fs::fault::reset();
+        assert!(
+            matches!(
+                bury,
+                TransitionOutcome::NotCommitted(Error::ResourceExhausted)
+            ),
+            "bury under errno {errno}: {bury:?}"
+        );
+        assert!(!queue.is_poisoned());
+
+        // The lease is intact after every refused transition.
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+    }
+}
+
+#[test]
+fn attempt_exhaustion_under_enospc_refuses_without_poisoning() {
+    let (tmp, mut queue) = create_test_queue();
+    let ticket = match queue.enqueue(EnqueueInput {
+        maximum_attempts: 1,
+        content_type: "x".to_string(),
+        payload: b"exhausted".to_vec(),
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(ticket) => ticket,
+        outcome => panic!("enqueue failed: {outcome:?}"),
+    };
+    // Rewrite the ready name with attempt == maximum_attempts, the state a
+    // crashed retry can leave behind, so the next claim takes the
+    // dead-letter path.
+    let (ready_dir, ready_name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+    let mut common = steadq_names::parse_ready(ready_name).unwrap().common;
+    common.attempt = common.maximum_attempts;
+    let shard_hex = ready_dir.rsplit_once('/').unwrap().1;
+    let exhausted_name = steadq_names::make_ready_name(queue.queue_id(), shard_hex, &common);
+    std::fs::rename(
+        tmp.path().join(&ticket.expected_relative_path),
+        tmp.path().join(ready_dir).join(&exhausted_name),
+    )
+    .unwrap();
+
+    // The dead bucket does not exist yet, so mkdirat is the first
+    // allocating syscall on the dead-letter path.
+    fs::fault::reset();
+    fs::fault::inject_errno("mkdirat", 1, libc::ENOSPC);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(
+        matches!(
+            outcome,
+            LeaseOutcome::NotCommitted(Error::ResourceExhausted)
+        ),
+        "{outcome:?}"
+    );
+    assert!(!queue.is_poisoned());
+    assert!(tmp.path().join(ready_dir).join(&exhausted_name).exists());
+
+    // With space back, the same claim completes the dead-letter move.
+    assert!(matches!(
+        queue.lease(0, 30_000_000_000),
+        LeaseOutcome::Empty
+    ));
+    assert!(find_file_with_suffix(&tmp.path().join("dead"), ".sqj").is_some());
+}
+
+#[test]
+fn remove_dead_under_enospc_reports_resource_exhausted() {
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    assert!(matches!(
+        queue.bury(&lease, DeadReason::AdministrativeBury),
+        TransitionOutcome::Committed
+    ));
+    fs::fault::reset();
+    fs::fault::inject_errno("unlinkat", 1, libc::ENOSPC);
+    let result = queue.remove_dead(&lease.job_id);
+    fs::fault::reset();
+    assert_eq!(result, Err(Error::ResourceExhausted));
+    assert!(!queue.is_poisoned());
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(true));
+}
+
+#[test]
+fn watermark_advance_under_enospc_refuses_without_poisoning() {
+    let (tmp, mut queue) = create_test_queue();
+    // A realtime reading one year ahead of the stored watermark forces the
+    // advance path; its first write is the temp watermark record.
+    let now = fs::clock_realtime_ns().unwrap();
+    fs::fault::reset();
+    fs::fault::set_clock_realtime_ns(now + 365 * 24 * 3_600_000_000_000);
+    fs::fault::inject_errno("write_all", 1, libc::ENOSPC);
+    let job = EnqueueInput {
+        maximum_attempts: 1,
+        content_type: "x".to_string(),
+        payload: b"watermark".to_vec(),
+        ..Default::default()
+    };
+    let before = queue.read_wall_watermark().unwrap();
+    let outcome = queue.enqueue(job.clone());
+    assert!(
+        matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::ResourceExhausted)
+        ),
+        "{outcome:?}"
+    );
+    assert!(!queue.is_poisoned());
+    // The refused advance left neither a new record nor an orphaned temp.
+    let after = queue.read_wall_watermark().unwrap();
+    assert_eq!(after.sequence, before.sequence);
+    assert_eq!(
+        after.highest_observed_bucket,
+        before.highest_observed_bucket
+    );
+    let orphans: Vec<String> = std::fs::read_dir(tmp.path().join("control"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".wm.adv."))
+        .collect();
+    assert!(orphans.is_empty(), "{orphans:?}");
+    assert!(matches!(queue.enqueue(job), EnqueueOutcome::Committed(_)));
+    assert_eq!(
+        queue.read_wall_watermark().unwrap().sequence,
+        before.sequence + 1
+    );
+    fs::fault::reset();
 }

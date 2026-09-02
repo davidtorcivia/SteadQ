@@ -362,12 +362,6 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(
-            src_fd.as_fd(),
-            delayed_name,
-            dest_fd.as_fd(),
-            &ready_name,
-            MoveActor::Recovery,
-        )
+        move_verified_noreplace(src_fd.as_fd(), delayed_name, dest_fd.as_fd(), &ready_name)
     }
 }

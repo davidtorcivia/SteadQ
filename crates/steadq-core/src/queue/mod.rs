@@ -98,7 +98,7 @@ impl VerifiedPayloadReader {
         let to_read = (buf.len() as u64).min(self.payload_len - offset) as usize;
         let abs_offset = self.payload_start + offset;
         let n = fs::pread(self.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+            .map_err(Error::from)?;
         Ok(n)
     }
 
@@ -150,7 +150,7 @@ pub(super) fn observe_witness_path(
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
             Ok(WitnessPathObservation::Gone)
         }
-        Err(error) => Err(Error::IoFailure(error.to_string())),
+        Err(error) => Err(Error::from(error)),
     }
 }
 
@@ -257,7 +257,7 @@ pub(super) fn classify_filesystem_type(
         }
         Ok(_) => Err(Error::UnsupportedFilesystem),
         Err(_) if allow_unsupported => Ok(None),
-        Err(error) => Err(Error::IoFailure(error.to_string())),
+        Err(error) => Err(Error::from(error)),
     }
 }
 
@@ -300,8 +300,7 @@ impl Queue {
                 io::ErrorKind::Unsupported,
                 format!(
                     "filesystem type not supported for queue (observed magic {ft:#x}; requires ext4, xfs, btrfs, f2fs, or zfs)"
-                ),
-            ));
+                )));
         }
 
         // Create root directory if needed
@@ -492,7 +491,6 @@ impl Queue {
             &fmt_tmp_name,
             root_fd.as_fd(),
             "FORMAT",
-            engine::MoveActor::Producer,
         ) {
             Ok(()) => {}
             Err(engine::MoveFailure::AlreadyExists) => {
@@ -536,10 +534,10 @@ impl Queue {
     /// Open an existing queue.
     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
         // Open root first using descriptor-relative, no-symlink semantics
-        let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let root_fd = fs::open_dir_absolute(root).map_err(Error::from)?;
 
         // Validate root is a directory
-        let root_stat = fs::fstat(root_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let root_stat = fs::fstat(root_fd.as_fd()).map_err(Error::from)?;
         if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
@@ -557,7 +555,7 @@ impl Queue {
                 }
                 return Err(Error::QueueCorrupt("FORMAT file is missing".into()));
             }
-            Err(e) => return Err(Error::IoFailure(e.to_string())),
+            Err(e) => return Err(Error::from(e)),
         };
         let mut format_bytes = Vec::new();
         {
@@ -566,7 +564,7 @@ impl Queue {
                 match fs::read(format_fd.as_fd(), &mut buf) {
                     Ok(0) => break,
                     Ok(n) => format_bytes.extend_from_slice(&buf[..n]),
-                    Err(e) => return Err(Error::IoFailure(e.to_string())),
+                    Err(e) => return Err(Error::from(e)),
                 }
             }
         }
@@ -628,18 +626,17 @@ impl Queue {
         }
 
         // Read boot ID
-        let boot_id = fs::read_boot_id().map_err(|e| Error::IoFailure(e.to_string()))?;
+        let boot_id = fs::read_boot_id().map_err(Error::from)?;
         let boot_id_bin = steadq_names::boot_id_bytes(&boot_id)
             .ok_or_else(|| Error::InvalidInput("invalid boot_id format".into()))?;
 
         // Generate worker nonce
-        let worker_nonce = fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?;
+        let worker_nonce = fs::random_128bit().map_err(Error::from)?;
 
         // Acquire shared maintenance lock
         let maint_fd = fs::openat(root_fd.as_fd(), "control/maintenance.lock", 0o0, 0o600)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let locked =
-            fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+            .map_err(Error::from)?;
+        let locked = fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(Error::from)?;
         if !locked {
             return Err(Error::MaintenanceBusy);
         }

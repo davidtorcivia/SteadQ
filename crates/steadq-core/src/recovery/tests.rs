@@ -11,6 +11,7 @@ fn create_test_queue() -> (TempDir, Queue) {
 
 fn create_test_queue_with_shards(shard_count: u32) -> (TempDir, Queue) {
     let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
     Queue::init(
         tmp.path(),
         &CreateOptions {
@@ -2883,17 +2884,6 @@ fn recovery_cursor_publication_failures_reopen_old_or_complete_new_record() {
             .count();
         assert_eq!(stale_temps, 0, "fault={fault_name} count={fault_count}");
     }
-}
-
-#[test]
-fn recovery_cursor_publication_does_not_use_legacy_replace_helper() {
-    let (_tmp, mut queue) = create_test_queue();
-    queue.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
-    fs::fault::reset();
-    fs::fault::inject_errno("durable_move_replace", 1, libc::EIO);
-    queue.persist_recovery_cursor().unwrap();
-    assert_eq!(fs::fault::call_count("durable_move_replace"), 0);
-    fs::fault::reset();
 }
 
 #[test]

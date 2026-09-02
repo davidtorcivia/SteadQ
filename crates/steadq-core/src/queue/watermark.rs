@@ -109,7 +109,9 @@ impl Queue {
             let authenticated =
                 match self.authenticated_wall_floor_with_attempts(watermark_read_attempts) {
                     Ok(floor) => floor,
-                    Err(Error::MaintenanceBusy) => return Err(Error::MaintenanceBusy),
+                    Err(error @ (Error::MaintenanceBusy | Error::ResourceExhausted)) => {
+                        return Err(error)
+                    }
                     Err(error) => {
                         self.poison();
                         return Err(error);
@@ -139,7 +141,7 @@ impl Queue {
                 self.cached_wall_floor = Some(floor);
                 Ok(floor)
             }
-            Err(Error::MaintenanceBusy) => Err(Error::MaintenanceBusy),
+            Err(e @ (Error::MaintenanceBusy | Error::ResourceExhausted)) => Err(e),
             Err(e) => {
                 self.poison();
                 Err(e)
@@ -209,17 +211,16 @@ impl Queue {
         &self,
         action: impl FnOnce(BorrowedFd<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let control_fd = fs::open_directory(self.root_fd.as_fd(), "control")
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let control_fd =
+            fs::open_directory(self.root_fd.as_fd(), "control").map_err(Error::from)?;
         let lock_fd = fs::openat(
             control_fd.as_fd(),
             "wall-watermark.lock",
             libc::O_RDWR,
             0o600,
         )
-        .map_err(|error| Error::IoFailure(error.to_string()))?;
-        let locked = fs::try_ofd_write_lock(lock_fd.as_fd())
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        .map_err(Error::from)?;
+        let locked = fs::try_ofd_write_lock(lock_fd.as_fd()).map_err(Error::from)?;
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
@@ -399,17 +400,22 @@ impl Queue {
         // Write via unique temp, then atomic rename, then sync
         let tmp_name = format!(
             ".wm.adv.{}",
-            steadq_names::hex_encode(
-                &fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?
-            )
+            steadq_names::hex_encode(&fs::random_128bit().map_err(Error::from)?)
         );
-        let tmp_fd = fs::create_exclusive(control_fd, &tmp_name, 0o600)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::write_all(tmp_fd.as_fd(), &wm_bytes).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync(tmp_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::renameat(control_fd, &tmp_name, control_fd, "wall-watermark")
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(control_fd).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let tmp_fd = fs::create_exclusive(control_fd, &tmp_name, 0o600).map_err(Error::from)?;
+        let written = fs::write_all(tmp_fd.as_fd(), &wm_bytes)
+            .and_then(|()| fs::fsync(tmp_fd.as_fd()))
+            .and_then(|()| fs::renameat(control_fd, &tmp_name, control_fd, "wall-watermark"));
+        if let Err(error) = written {
+            // The temp never became the watermark, so drop it; a retry after
+            // ENOSPC must not leave one orphan per attempt in control/.
+            let _ = fs::unlinkat(control_fd, &tmp_name);
+            return Err(Error::from(error));
+        }
+        // Past the rename the outcome is indeterminate, so no errno may
+        // downgrade it to a retryable classification.
+        fs::fsync_dir_fd(control_fd)
+            .map_err(|e| Error::IoFailure(format!("watermark directory fsync: {e}")))?;
 
         Ok(WallFloor {
             unix_ns: observed.unix_ns(),

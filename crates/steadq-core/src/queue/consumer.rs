@@ -59,12 +59,12 @@ impl Queue {
             Err(error) => return AckOutcome::NotCommitted(error),
         };
         if let Err(e) = self.ensure_dir_with_dirty(&receipt_dir, dirty.as_deref_mut()) {
-            return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+            return AckOutcome::NotCommitted(Error::from(e));
         }
 
         let receipt_dir_fd = match open_relative(self.root_fd.as_fd(), &receipt_dir) {
             Ok(fd) => fd,
-            Err(e) => return AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+            Err(e) => return AckOutcome::NotCommitted(Error::from(e)),
         };
 
         // Validate the current lease source before acknowledging
@@ -396,7 +396,7 @@ impl Queue {
 
         let boottime_now = match fs::clock_boottime_ns() {
             Ok(t) => t,
-            Err(e) => return RenewOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+            Err(e) => return RenewOutcome::NotCommitted(Error::from(e)),
         };
         let wall_now = match self.wall_floor_for_mutation() {
             Ok(floor) => floor.unix_ns(),
@@ -537,7 +537,7 @@ impl Queue {
                     ));
                 }
                 LeaseDirectoryOpenFailure::Io => {
-                    return Err(Error::IoFailure(error.to_string()));
+                    return Err(Error::from(error));
                 }
             },
         };
@@ -546,7 +546,7 @@ impl Queue {
             Ok(s) => s,
             Err(error) => match classify_presence_failure(&error) {
                 PresenceFailure::Absent => return Ok(None),
-                PresenceFailure::Io => return Err(Error::IoFailure(error.to_string())),
+                PresenceFailure::Io => return Err(Error::from(error)),
             },
         };
 
@@ -601,9 +601,8 @@ impl Queue {
         }
 
         let file_fd = fs::openat(src_dir_fd.as_fd(), &src_name, resolver_file_open_flags(), 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let opened_stat =
-            fs::fstat(file_fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+            .map_err(Error::from)?;
+        let opened_stat = fs::fstat(file_fd.as_fd()).map_err(Error::from)?;
         if !stat_matches_witness(&opened_stat, lease.expected_dev, lease.expected_inode) {
             return Err(Error::QueueCorrupt(
                 "opened source identity does not match lease handle".into(),
@@ -619,8 +618,7 @@ impl Queue {
             ));
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
         let header = FixedHeader::decode(&header_buf)
             .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
 
@@ -663,8 +661,7 @@ impl Queue {
         // Always verify envelope digest (even when extension is empty).
         let mut ext_buf = vec![0u8; ext_len];
         if verified::is_extension_present(ext_len) {
-            fs::pread_exact(file_fd.as_fd(), &mut ext_buf, 128)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            fs::pread_exact(file_fd.as_fd(), &mut ext_buf, 128).map_err(Error::from)?;
         }
         if !steadq_format::verify_envelope_digest(&header, &ext_buf) {
             return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
@@ -736,7 +733,6 @@ impl Queue {
                 destination_directory_fd,
                 destination_name,
                 engine::MoveIdentity::new(source.device, source.inode),
-                engine::MoveActor::Consumer,
             ),
         };
         let outcome = match result {
@@ -744,7 +740,7 @@ impl Queue {
             Err(engine::MoveFailure::SourceMissing) => LeasedMoveOutcome::SourceGone,
             Err(engine::MoveFailure::AlreadyExists) => LeasedMoveOutcome::Collision,
             Err(engine::MoveFailure::NotCommitted { source, .. }) => {
-                LeasedMoveOutcome::Failed(Error::IoFailure(source.to_string()))
+                LeasedMoveOutcome::Failed(Error::from(source))
             }
             Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
                 LeasedMoveOutcome::OutcomeUnknown(ticket_phase_for_move_outcome_unknown(phase))
@@ -788,12 +784,12 @@ impl Queue {
         mut dirty: Option<&mut engine::DirtySet>,
     ) -> TransitionOutcome {
         if let Err(e) = self.ensure_dir_with_dirty(dest_dir, dirty.as_deref_mut()) {
-            return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+            return TransitionOutcome::NotCommitted(Error::from(e));
         }
 
         let dest_dir_fd = match open_relative(self.root_fd.as_fd(), dest_dir) {
             Ok(fd) => fd,
-            Err(e) => return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+            Err(e) => return TransitionOutcome::NotCommitted(Error::from(e)),
         };
 
         // Validate the current lease source before transitioning

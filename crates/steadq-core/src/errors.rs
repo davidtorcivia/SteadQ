@@ -40,6 +40,17 @@ pub enum Error {
     IoFailure(String),
 }
 
+impl From<std::io::Error> for Error {
+    /// `ENOSPC` and `EDQUOT` are resource exhaustion by contract; every
+    /// other operating-system error is an io failure.
+    fn from(error: std::io::Error) -> Self {
+        match error.raw_os_error() {
+            Some(libc::ENOSPC) | Some(libc::EDQUOT) => Error::ResourceExhausted,
+            _ => Error::IoFailure(error.to_string()),
+        }
+    }
+}
+
 /// Operation result for mutations. Every mutating operation returns one of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationResult {
@@ -682,6 +693,27 @@ pub struct Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_error_classification_table() {
+        for (errno, expected) in [
+            (libc::ENOSPC, super::Error::ResourceExhausted),
+            (libc::EDQUOT, super::Error::ResourceExhausted),
+            (
+                libc::EIO,
+                super::Error::IoFailure(std::io::Error::from_raw_os_error(libc::EIO).to_string()),
+            ),
+        ] {
+            assert_eq!(
+                super::Error::from(std::io::Error::from_raw_os_error(errno)),
+                expected
+            );
+        }
+        assert!(matches!(
+            super::Error::from(std::io::Error::other("no errno")),
+            super::Error::IoFailure(message) if message == "no errno"
+        ));
+    }
 
     #[test]
     fn dead_reason_round_trip() {
