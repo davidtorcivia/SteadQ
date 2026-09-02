@@ -78,7 +78,6 @@ impl Queue {
             q_dir_fd.as_fd(),
             &q_name,
             source_identity,
-            engine::MoveActor::Consumer,
         )
     }
     /// Read a chunk of a leased job's payload at the given offset.
@@ -113,8 +112,7 @@ impl Queue {
             return Err(e);
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
         let ext_len = header.extension_header_length as usize;
@@ -129,7 +127,7 @@ impl Queue {
         let to_read = (buf.len() as u64).min(remaining) as usize;
         let abs_offset = payload_start + offset;
         let n = fs::pread(source.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+            .map_err(Error::from)?;
         Ok(n)
     }
 
@@ -166,8 +164,7 @@ impl Queue {
         }
 
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
 
@@ -188,7 +185,7 @@ impl Queue {
                 &mut buf[..to_read],
                 payload_start + offset,
             )
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+            .map_err(Error::from)?;
             if n == 0 {
                 return Err(Error::QueueCorrupt("unexpected EOF during stream".into()));
             }
@@ -229,8 +226,7 @@ impl Queue {
             return Err(e);
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
         let ext_len = header.extension_header_length as usize;
@@ -489,38 +485,34 @@ impl Queue {
             .rsplit_once('/')
             .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
 
-        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel).map_err(Error::from)?;
         let file_fd = fs::openat(
             dir_fd.as_fd(),
             name,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        .map_err(Error::from)?;
 
-        let stat = fs::fstat(file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let stat = fs::fstat(file_fd.as_fd()).map_err(Error::from)?;
         if stat.st_size < 0 {
             return Err(Error::QueueCorrupt("negative file size".into()));
         }
         let size = stat.st_size as u64;
 
-        let mut out = std::fs::File::create(output).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut out = std::fs::File::create(output).map_err(Error::from)?;
         let mut offset = 0u64;
         let mut buf = vec![0u8; 65536];
         while offset < size {
-            let n = fs::pread(file_fd.as_fd(), &mut buf, offset)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            let n = fs::pread(file_fd.as_fd(), &mut buf, offset).map_err(Error::from)?;
             if n == 0 {
                 break;
             }
             use std::io::Write;
-            out.write_all(&buf[..n])
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            out.write_all(&buf[..n]).map_err(Error::from)?;
             offset += n as u64;
         }
-        out.sync_all()
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        out.sync_all().map_err(Error::from)?;
         Ok(offset)
     }
 
@@ -537,15 +529,19 @@ impl Queue {
             .rsplit_once('/')
             .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
 
-        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel).map_err(Error::from)?;
 
-        match engine::unlink_verified(dir_fd.as_fd(), name, engine::MoveActor::Consumer) {
+        match engine::unlink_verified(dir_fd.as_fd(), name) {
             Ok(()) => Ok(true),
             Err(engine::UnlinkFailure::SourceMissing) => Ok(false),
-            Err(engine::UnlinkFailure::NotCommitted { phase, source }) => Err(Error::IoFailure(
-                format!("dead removal failed at {phase:?}: {source}"),
-            )),
+            Err(engine::UnlinkFailure::NotCommitted { phase, source }) => {
+                Err(match Error::from(source) {
+                    Error::IoFailure(message) => {
+                        Error::IoFailure(format!("dead removal failed at {phase:?}: {message}"))
+                    }
+                    classified => classified,
+                })
+            }
             Err(engine::UnlinkFailure::OutcomeUnknown { phase, source }) => Err(Error::IoFailure(
                 format!("dead removal indeterminate at {phase:?}: {source}"),
             )),
@@ -577,7 +573,7 @@ impl Queue {
         ctx: &ActivePathContext,
     ) -> Result<FixedHeader, Error> {
         // Stat with NOFOLLOW
-        let stat = fs::fstatat(dir_fd, name).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let stat = fs::fstatat(dir_fd, name).map_err(Error::from)?;
 
         // Regular file
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
@@ -595,8 +591,7 @@ impl Queue {
         // Use central verifier for header, extension, envelope, and size.
         // stat has already been collected for mode and nlink; verify_envelope_on_fd
         // will re-stat the fd for size, which is fine since the fd is held open.
-        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0).map_err(Error::from)?;
         let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
         let header = verified.header();
 

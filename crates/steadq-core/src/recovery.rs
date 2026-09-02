@@ -10,8 +10,7 @@ use steadq_names;
 use crate::errors::*;
 use crate::queue::engine::{
     move_verified_noreplace, remove_empty_directory_verified, replace_verified, unlink_verified,
-    MoveActor, MoveFailure, MovePhase, RemoveDirectoryFailure, ReplaceFailure, ReplaceIdentity,
-    UnlinkFailure,
+    MoveFailure, MovePhase, RemoveDirectoryFailure, ReplaceFailure, ReplaceIdentity, UnlinkFailure,
 };
 use crate::queue::{
     open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
@@ -264,8 +263,7 @@ pub(crate) fn load_recovery_cursor(
     root_fd: BorrowedFd<'_>,
     queue_id: &[u8; 16],
 ) -> Result<RecoveryCursor, Error> {
-    let control_fd = fs::open_directory(root_fd, "control")
-        .map_err(|error| Error::IoFailure(error.to_string()))?;
+    let control_fd = fs::open_directory(root_fd, "control").map_err(Error::from)?;
     let cursor_fd = match fs::openat(
         control_fd.as_fd(),
         RECOVERY_CURSOR_FILE,
@@ -276,9 +274,9 @@ pub(crate) fn load_recovery_cursor(
         Err(error) if cursor_file_is_absent(&error) => {
             return Ok(RecoveryCursor::default());
         }
-        Err(error) => return Err(Error::IoFailure(error.to_string())),
+        Err(error) => return Err(Error::from(error)),
     };
-    let stat = fs::fstat(cursor_fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+    let stat = fs::fstat(cursor_fd.as_fd()).map_err(Error::from)?;
     if !cursor_file_metadata_is_valid(stat.st_mode, stat.st_nlink) {
         return Err(Error::QueueCorrupt(
             "recovery cursor is not a singly linked regular file".into(),
@@ -297,8 +295,7 @@ pub(crate) fn load_recovery_cursor(
             "recovery cursor size is unsupported".into()
         ))?
     ];
-    fs::pread_exact(cursor_fd.as_fd(), &mut bytes, 0)
-        .map_err(|error| Error::IoFailure(error.to_string()))?;
+    fs::pread_exact(cursor_fd.as_fd(), &mut bytes, 0).map_err(Error::from)?;
     let record: RecoveryCursorRecord = serde_json::from_slice(&bytes)
         .map_err(|error| Error::QueueCorrupt(format!("recovery cursor decode: {error}")))?;
     if !cursor_record_version_is_supported(&record) {
@@ -458,13 +455,11 @@ pub struct RecoveryError {
 
 impl Queue {
     fn acquire_recovery_lock(&self) -> Result<OwnedFd, Error> {
-        let control_fd = fs::open_directory(self.root_fd(), "control")
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let control_fd = fs::open_directory(self.root_fd(), "control").map_err(Error::from)?;
         let lock_fd = match fs::create_exclusive(control_fd.as_fd(), "recovery.lock", 0o600) {
             Ok(fd) => {
-                fs::fsync(fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
-                fs::fsync_dir_fd(control_fd.as_fd())
-                    .map_err(|error| Error::IoFailure(error.to_string()))?;
+                fs::fsync(fd.as_fd()).map_err(Error::from)?;
+                fs::fsync_dir_fd(control_fd.as_fd()).map_err(Error::from)?;
                 fd
             }
             Err(error) if recovery_lock_exists(&error) => fs::openat(
@@ -473,12 +468,10 @@ impl Queue {
                 RECOVERY_LOCK_OPEN_FLAGS,
                 0,
             )
-            .map_err(|error| Error::IoFailure(error.to_string()))?,
-            Err(error) => return Err(Error::IoFailure(error.to_string())),
+            .map_err(Error::from)?,
+            Err(error) => return Err(Error::from(error)),
         };
-        if !fs::try_ofd_write_lock(lock_fd.as_fd())
-            .map_err(|error| Error::IoFailure(error.to_string()))?
-        {
+        if !fs::try_ofd_write_lock(lock_fd.as_fd()).map_err(Error::from)? {
             return Err(Error::MaintenanceBusy);
         }
         Ok(lock_fd)
@@ -538,7 +531,6 @@ impl Queue {
             control_fd.as_fd(),
             RECOVERY_CURSOR_FILE,
             None,
-            MoveActor::Recovery,
         ) {
             Ok(()) => Ok(()),
             Err(failure) => {
@@ -581,7 +573,7 @@ impl Queue {
         temp_name: &str,
         primary_failure: String,
     ) -> Error {
-        match unlink_verified(control_fd, temp_name, MoveActor::Recovery) {
+        match unlink_verified(control_fd, temp_name) {
             Ok(()) | Err(UnlinkFailure::SourceMissing) => Error::IoFailure(primary_failure),
             Err(UnlinkFailure::NotCommitted { phase, source }) => Error::IoFailure(format!(
                 "{primary_failure}; stale recovery cursor temporary file requires later cleanup at control/{temp_name}: cleanup not committed at phase={phase:?}: {source}"
@@ -995,7 +987,7 @@ impl Queue {
         name: &str,
         relative_path: &str,
     ) {
-        match unlink_verified(directory_fd, name, MoveActor::Recovery) {
+        match unlink_verified(directory_fd, name) {
             Ok(()) | Err(UnlinkFailure::SourceMissing) => {}
             Err(failure) => Self::record_unlink_failure(
                 stats,

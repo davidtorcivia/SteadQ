@@ -87,14 +87,6 @@ impl DirtySet {
     }
 }
 
-/// Actor attribution for poisoning decisions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoveActor {
-    Producer,
-    Consumer,
-    Recovery,
-}
-
 /// Phase where the move failed. Determines whether the effect is known durable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MovePhase {
@@ -406,7 +398,6 @@ pub fn move_verified_noreplace(
     src_name: &str,
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
-    _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
     move_noreplace(
         src_dir_fd,
@@ -429,7 +420,6 @@ pub fn move_witnessed_noreplace(
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     source_identity: MoveIdentity,
-    _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
     move_witnessed_noreplace_with(
         src_dir_fd,
@@ -437,7 +427,6 @@ pub fn move_witnessed_noreplace(
         dest_dir_fd,
         dest_name,
         source_identity,
-        _actor,
         |_| Ok(()),
     )
     .map(|_| ())
@@ -449,7 +438,6 @@ pub fn move_witnessed_noreplace_with<T>(
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     source_identity: MoveIdentity,
-    _actor: MoveActor,
     after_linearization: impl FnOnce(MovedObject) -> Result<T, std::io::Error>,
 ) -> Result<(MovedObject, T), MoveFailure> {
     move_noreplace(
@@ -476,7 +464,6 @@ pub(super) fn move_witnessed_noreplace_io(
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     source_identity: MoveIdentity,
-    _actor: MoveActor,
 ) -> Result<(), MoveFailureWith<std::io::Error>> {
     move_noreplace(
         src_dir_fd,
@@ -786,11 +773,7 @@ fn same_directory(source: BorrowedFd<'_>, destination: BorrowedFd<'_>) -> bool {
     }
 }
 
-pub fn unlink_verified(
-    directory_fd: BorrowedFd<'_>,
-    name: &str,
-    _actor: MoveActor,
-) -> Result<(), UnlinkFailure> {
+pub fn unlink_verified(directory_fd: BorrowedFd<'_>, name: &str) -> Result<(), UnlinkFailure> {
     match fs::unlinkat(directory_fd, name) {
         Ok(()) => {}
         Err(error) if is_not_found_io_kind(error.kind()) => {
@@ -819,7 +802,6 @@ fn is_directory_not_empty(error: &std::io::Error) -> bool {
 pub fn remove_empty_directory_verified(
     parent_directory_fd: BorrowedFd<'_>,
     name: &str,
-    _actor: MoveActor,
 ) -> Result<(), RemoveDirectoryFailure> {
     match fs::unlinkat_dir(parent_directory_fd, name) {
         Ok(()) => {}
@@ -851,7 +833,6 @@ pub fn replace_verified(
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     expected_destination: Option<ReplaceIdentity>,
-    _actor: MoveActor,
 ) -> Result<(), ReplaceFailure> {
     if let Some(expected_destination) = expected_destination {
         let destination =
@@ -957,8 +938,8 @@ pub fn map_move_failure(f: MoveFailure) -> Error {
     match f {
         MoveFailure::AlreadyExists => Error::QueueCorrupt("destination already exists".into()),
         MoveFailure::SourceMissing => Error::QueueCorrupt("source missing".into()),
-        MoveFailure::NotCommitted { source, .. } => Error::IoFailure(source.to_string()),
-        MoveFailure::OutcomeUnknown { source, .. } => Error::IoFailure(source.to_string()),
+        MoveFailure::NotCommitted { source, .. } => Error::from(source),
+        MoveFailure::OutcomeUnknown { source, .. } => Error::from(source),
     }
 }
 
@@ -1010,7 +991,7 @@ mod tests {
             assert_eq!(
                 is_tmpfile_open_unsupported(&std::io::Error::from_raw_os_error(errno)),
                 expected,
-                "errno {errno}",
+                "errno {errno}"
             );
         }
     }
@@ -1378,13 +1359,7 @@ mod tests {
             .unwrap();
         fs::fault::reset();
         fs::fault::inject_errno("renameat2_noreplace", 1, libc::EIO);
-        let r = move_verified_noreplace(
-            dest_fd.as_fd(),
-            "nope.raw",
-            dest_fd.as_fd(),
-            "dest.raw",
-            MoveActor::Recovery,
-        );
+        let r = move_verified_noreplace(dest_fd.as_fd(), "nope.raw", dest_fd.as_fd(), "dest.raw");
         fs::fault::reset();
         assert!(matches!(
             &r,
@@ -1414,36 +1389,18 @@ mod tests {
             .read(true)
             .open(dest_dir.path())
             .unwrap();
-        let r = move_verified_noreplace(
-            src_fd.as_fd(),
-            "src.raw",
-            dest_fd.as_fd(),
-            "dest.raw",
-            MoveActor::Recovery,
-        );
+        let r = move_verified_noreplace(src_fd.as_fd(), "src.raw", dest_fd.as_fd(), "dest.raw");
         assert!(r.is_ok());
         assert!(dest_dir.path().join("dest.raw").exists());
         assert!(!src_dir.path().join("src.raw").exists());
 
         // second move of same source should be SourceMissing
-        let r2 = move_verified_noreplace(
-            src_fd.as_fd(),
-            "src.raw",
-            dest_fd.as_fd(),
-            "dest2.raw",
-            MoveActor::Recovery,
-        );
+        let r2 = move_verified_noreplace(src_fd.as_fd(), "src.raw", dest_fd.as_fd(), "dest2.raw");
         assert!(matches!(r2, Err(MoveFailure::SourceMissing)));
 
         // recreate source and try to overwrite existing dest
         std::fs::write(src_dir.path().join("src.raw"), b"again").unwrap();
-        let r3 = move_verified_noreplace(
-            src_fd.as_fd(),
-            "src.raw",
-            dest_fd.as_fd(),
-            "dest.raw",
-            MoveActor::Recovery,
-        );
+        let r3 = move_verified_noreplace(src_fd.as_fd(), "src.raw", dest_fd.as_fd(), "dest.raw");
         assert!(matches!(r3, Err(MoveFailure::AlreadyExists)));
     }
 
@@ -1505,7 +1462,6 @@ mod tests {
                 destination_fd.as_fd(),
                 "destination.raw",
                 MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
-                MoveActor::Consumer,
             )
             .unwrap_err();
             fs::fault::reset();
@@ -1538,7 +1494,6 @@ mod tests {
             destination_fd.as_fd(),
             "destination.raw",
             MoveIdentity::new(source_stat.st_dev, source_stat.st_ino.wrapping_add(1)),
-            MoveActor::Consumer,
         )
         .unwrap_err();
 
@@ -1569,7 +1524,6 @@ mod tests {
             destination_fd.as_fd(),
             "destination.raw",
             MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
-            MoveActor::Consumer,
         )
         .unwrap();
         assert_eq!(fs::fault::call_count("fsync_dir_fd"), 1);
@@ -1596,7 +1550,6 @@ mod tests {
             destination_fd.as_fd(),
             "destination.raw",
             MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
-            MoveActor::Consumer,
             |moved| {
                 assert!(!source_dir.join("source.raw").exists());
                 assert!(destination_dir.join("destination.raw").exists());
@@ -1649,7 +1602,6 @@ mod tests {
                 destination_fd.as_fd(),
                 "destination.raw",
                 MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
-                MoveActor::Producer,
             )
             .unwrap_err();
             fs::fault::reset();
@@ -1680,7 +1632,7 @@ mod tests {
                 .unwrap();
             fs::fault::reset();
             fs::fault::inject_errno(fault, 1, libc::EIO);
-            let result = unlink_verified(directory_fd.as_fd(), "object.raw", MoveActor::Recovery);
+            let result = unlink_verified(directory_fd.as_fd(), "object.raw");
             fs::fault::reset();
             let failure = result.unwrap_err();
             assert_eq!(failure.phase(), Some(expected_phase));
@@ -1697,13 +1649,13 @@ mod tests {
             .open(dir.path())
             .unwrap();
         assert!(matches!(
-            unlink_verified(directory_fd.as_fd(), "missing.raw", MoveActor::Recovery),
+            unlink_verified(directory_fd.as_fd(), "missing.raw"),
             Err(UnlinkFailure::SourceMissing)
         ));
         fs::fault::reset();
         fs::fault::inject_errno("unlinkat", 1, libc::EIO);
         assert!(matches!(
-            unlink_verified(directory_fd.as_fd(), "missing.raw", MoveActor::Recovery),
+            unlink_verified(directory_fd.as_fd(), "missing.raw"),
             Err(UnlinkFailure::NotCommitted {
                 phase: UnlinkPhase::Unlink,
                 ..
@@ -1748,8 +1700,7 @@ mod tests {
                 .unwrap();
             fs::fault::reset();
             fs::fault::inject_errno(fault, 1, libc::EIO);
-            let result =
-                remove_empty_directory_verified(parent.as_fd(), "empty", MoveActor::Recovery);
+            let result = remove_empty_directory_verified(parent.as_fd(), "empty");
             fs::fault::reset();
             let failure = result.unwrap_err();
             assert_eq!(failure.phase(), Some(expected_phase));
@@ -1765,8 +1716,7 @@ mod tests {
                 .read(true)
                 .open(root.path())
                 .unwrap();
-            let replay =
-                remove_empty_directory_verified(reopened.as_fd(), "empty", MoveActor::Recovery);
+            let replay = remove_empty_directory_verified(reopened.as_fd(), "empty");
             if directory_remains {
                 assert!(replay.is_ok());
             } else {
@@ -1785,17 +1735,17 @@ mod tests {
             .open(root.path())
             .unwrap();
         assert!(matches!(
-            remove_empty_directory_verified(parent.as_fd(), "missing", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "missing"),
             Err(RemoveDirectoryFailure::SourceMissing)
         ));
         assert!(matches!(
-            remove_empty_directory_verified(parent.as_fd(), "nonempty", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "nonempty"),
             Err(RemoveDirectoryFailure::NotEmpty)
         ));
         fs::fault::reset();
         fs::fault::inject_errno("unlinkat_dir", 1, libc::EIO);
         assert!(matches!(
-            remove_empty_directory_verified(parent.as_fd(), "missing", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "missing"),
             Err(RemoveDirectoryFailure::NotCommitted {
                 phase: RemoveDirectoryPhase::Remove,
                 ..
@@ -1828,7 +1778,6 @@ mod tests {
                 directory_fd.as_fd(),
                 "receipt.rct",
                 None,
-                MoveActor::Recovery,
             );
             fs::fault::reset();
             let failure = result.unwrap_err();
@@ -1855,8 +1804,7 @@ mod tests {
                 "missing.tmp",
                 directory_fd.as_fd(),
                 "receipt.rct",
-                None,
-                MoveActor::Recovery,
+                None
             ),
             Err(ReplaceFailure::SourceMissing)
         ));
@@ -1869,8 +1817,7 @@ mod tests {
                 "source.tmp",
                 directory_fd.as_fd(),
                 "receipt.rct",
-                None,
-                MoveActor::Recovery,
+                None
             ),
             Err(ReplaceFailure::NotCommitted {
                 phase: ReplacePhase::Rename,
@@ -1912,7 +1859,6 @@ mod tests {
                 destination_fd.as_fd(),
                 "receipt.rct",
                 None,
-                MoveActor::Recovery,
             )
             .unwrap_err();
             fs::fault::reset();
@@ -1949,7 +1895,6 @@ mod tests {
             destination_fd.as_fd(),
             "receipt.rct",
             None,
-            MoveActor::Recovery,
         )
         .unwrap();
         assert_eq!(fs::fault::call_count("fsync_dir_fd"), 1);
@@ -1978,7 +1923,6 @@ mod tests {
                 destination_stat.st_dev,
                 destination_stat.st_ino.wrapping_add(1),
             )),
-            MoveActor::Recovery,
         );
         assert!(matches!(changed, Err(ReplaceFailure::DestinationChanged)));
         assert!(source.exists());
@@ -1993,7 +1937,6 @@ mod tests {
                 destination_stat.st_dev,
                 destination_stat.st_ino,
             )),
-            MoveActor::Recovery,
         )
         .unwrap();
         assert!(!source.exists());

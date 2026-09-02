@@ -193,7 +193,9 @@ impl Queue {
                     ) {
                         Ok(()) => continue,
                         Err(error) => {
-                            self.poison();
+                            if error != Error::ResourceExhausted {
+                                self.poison();
+                            }
                             return LeaseOutcome::NotCommitted(error);
                         }
                     }
@@ -202,7 +204,7 @@ impl Queue {
                 // Re-capture clocks immediately before the claim
                 let boottime_claim = match fs::clock_boottime_ns() {
                     Ok(t) => t,
-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                    Err(e) => return LeaseOutcome::NotCommitted(Error::from(e)),
                 };
                 let wall_claim = match wall_floor {
                     Some(floor) => floor.unix_ns(),
@@ -217,7 +219,7 @@ impl Queue {
                 // Attempt claim: rename ready -> leased
                 let lease_token = match fs::random_128bit() {
                     Ok(t) => t,
-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                    Err(e) => return LeaseOutcome::NotCommitted(Error::from(e)),
                 };
                 let boottime_deadline = match boottime_claim.checked_add(lease_duration_ns) {
                     Some(d) => d,
@@ -360,7 +362,6 @@ impl Queue {
                         leased_dir_fd.as_fd(),
                         &lease_target.filename,
                         engine::MoveIdentity::new(claim_source.device, claim_source.inode),
-                        engine::MoveActor::Consumer,
                         |_| {
                             let refreshed_evidence = Self::read_claim_ticket_evidence(
                                 claim_source.file_fd.as_fd(),
@@ -607,9 +608,9 @@ impl Queue {
         let file = match fs::openat(directory_fd, name, resolver_file_open_flags(), 0) {
             Ok(file) => file,
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-            Err(error) => return Err(Error::IoFailure(error.to_string())),
+            Err(error) => return Err(Error::from(error)),
         };
-        let stat = fs::fstat(file.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+        let stat = fs::fstat(file.as_fd()).map_err(Error::from)?;
         if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
             return Err(Error::QueueCorrupt(
                 "ready source is not a singly-linked regular file".into(),
@@ -673,26 +674,29 @@ impl Queue {
             .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
         let dead_dir = target.directory();
 
-        self.ensure_dir(&dead_dir)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        self.ensure_dir(&dead_dir).map_err(Error::from)?;
+        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir).map_err(Error::from)?;
+        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir).map_err(Error::from)?;
 
         match engine::move_verified_noreplace(
             ready_dir_fd.as_fd(),
             ready_name,
             dead_dir_fd.as_fd(),
             &target.filename,
-            engine::MoveActor::Consumer,
         ) {
             Ok(()) => Ok(()),
             Err(engine::MoveFailure::SourceMissing) => Ok(()),
             Err(engine::MoveFailure::AlreadyExists) => Err(Error::IdentityCollision),
-            Err(engine::MoveFailure::NotCommitted { phase, source }) => Err(Error::IoFailure(
-                format!("dead-letter move failed at {phase:?}: {source}"),
-            )),
+            Err(engine::MoveFailure::NotCommitted { phase, source }) => {
+                Err(match Error::from(source) {
+                    Error::IoFailure(message) => {
+                        Error::IoFailure(format!("dead-letter move failed at {phase:?}: {message}"))
+                    }
+                    classified => classified,
+                })
+            }
+            // Past the rename the outcome is indeterminate, so no errno may
+            // downgrade it to a retryable classification.
             Err(engine::MoveFailure::OutcomeUnknown { phase, source }) => Err(Error::IoFailure(
                 format!("dead-letter move indeterminate at {phase:?}: {source}"),
             )),

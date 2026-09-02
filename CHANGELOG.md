@@ -17,6 +17,7 @@
 
 ### Structure
 
+- `steadq_fs_linux::fault::pin_clock_realtime_ns` freezes the realtime clock for the life of a test thread, and `fault::reset()` restores the pin instead of the wall clock. The shared test queue fixtures and the deferred-sync tests that build a queue inline pin before `Queue::init`, so a 10-second delayed-bucket boundary can no longer trigger a wall-watermark advance mid-test; that advance consumed count-based `fsync_dir_fd` faults before the operation under test reached them and made `claim_move_records_each_directory_barrier` fail on CI
 - Supported targets are now 64-bit x86_64 or aarch64 Linux with the gnu or musl environment; CI cross-checks `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` and still rejects 32-bit and out-of-set targets. `x86_64-unknown-linux-gnu` remains the certified release target
 
 - Claim keeps the leased file in `ready/<shard>/`. The leased filename includes boot id (`.o` + 32 hex). Recovery still walks `leased/` for the previous layout and reaps colocated leased names from `ready/`
@@ -28,6 +29,8 @@
 
 ### Fixes
 
+- Storage exhaustion (`ENOSPC`, `EDQUOT`) before linearization now reports `ResourceExhausted` on ack, retry, renew, bury, dead removal, and the dead-letter move that claim performs on attempt exhaustion, matching the contract's disk-full classification; these consumer transitions previously returned `IoFailure` with the errno inside the message, so the CLI exited 6 instead of 4 and the C ABI returned `STEADQ_IO_FAILURE` instead of `STEADQ_RESOURCE_EXHAUSTED`. One `From<io::Error>` classifier replaces the per-site `IoFailure(e.to_string())` conversions in `steadq-core`. The claim-time dead-letter move and the wall-watermark advance no longer poison the handle on `ResourceExhausted`; both previously poisoned on every error. Post-linearization failures in those paths keep the `IoFailure` classification and still poison. A failed watermark advance now unlinks its `control/.wm.adv.*` temp file instead of orphaning it
+- Deleted the unused `MoveActor` parameter from the transition engine and the unused `steadq-fs-linux` helpers `durable_move_noreplace`, `durable_move_replace`, `syncfs`, `read_dir_for_each`, `is_resource_exhausted`, `is_sync_failure`, `is_capability_error`, and `should_propagate_on_fallback`
 - The first `ensure_dir` of a shard leaf creates every sibling shard and `fsync`s the bucket once, matching how init fills `ready/`
 - Streaming tmpfile enqueue no longer fsyncs the destination directory after `publish_tmpfile_noreplace_with_mode`, which already synced it
 - Receipt compaction and retention record open and lock I/O instead of treating those failures as a busy skip

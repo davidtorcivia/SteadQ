@@ -250,7 +250,7 @@ impl Queue {
                     if should_delete {
                         let relative_path = format!("tmp/{boot_dir_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
-                        match unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery) {
+                        match unlink_verified(shard_fd.as_fd(), entry) {
                             Ok(()) => stats.temp_files_deleted += 1,
                             Err(failure) => Self::record_unlink_failure(
                                 stats,
@@ -530,9 +530,7 @@ impl Queue {
                     if compaction_temporary_name(entry) {
                         let temp_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
-                        if let Err(failure) =
-                            unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery)
-                        {
+                        if let Err(failure) = unlink_verified(shard_fd.as_fd(), entry) {
                             Self::record_unlink_failure(
                                 stats,
                                 "receipt_compact_stale_temp_cleanup",
@@ -695,7 +693,6 @@ impl Queue {
                         shard_fd.as_fd(),
                         entry,
                         Some(ReplaceIdentity::new(device, inode)),
-                        MoveActor::Recovery,
                     ) {
                         Ok(()) => stats.receipts_compacted += 1,
                         Err(failure) => {
@@ -1076,7 +1073,7 @@ impl Queue {
 
                     stats.operations_attempted += 1;
                     let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
-                    match unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery) {
+                    match unlink_verified(shard_fd.as_fd(), entry) {
                         Ok(()) => {
                             stats.receipts_expired += 1;
                             absent_entries += 1;
@@ -1108,11 +1105,7 @@ impl Queue {
                 }
                 stats.operations_attempted += 1;
                 let shard_path = format!("receipts/{bucket_name}/{shard_name}");
-                match remove_empty_directory_verified(
-                    bucket_fd.as_fd(),
-                    shard_name,
-                    MoveActor::Recovery,
-                ) {
+                match remove_empty_directory_verified(bucket_fd.as_fd(), shard_name) {
                     Ok(()) => {
                         stats.shards_removed += 1;
                         absent_shards += 1;
@@ -1137,11 +1130,7 @@ impl Queue {
             }
             stats.operations_attempted += 1;
             let bucket_path = format!("receipts/{bucket_name}");
-            match remove_empty_directory_verified(
-                receipts_fd.as_fd(),
-                bucket_name,
-                MoveActor::Recovery,
-            ) {
+            match remove_empty_directory_verified(receipts_fd.as_fd(), bucket_name) {
                 Ok(()) => stats.buckets_removed += 1,
                 Err(RemoveDirectoryFailure::SourceMissing | RemoveDirectoryFailure::NotEmpty) => {}
                 Err(failure) => Self::record_remove_directory_failure(

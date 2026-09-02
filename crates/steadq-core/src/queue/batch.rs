@@ -141,20 +141,17 @@ impl<'a> Batch<'a> {
 
         if let Err(e) = sync_result {
             queue.poison();
+            let e = Error::from(e);
             let outcome = BatchCommitOutcome {
                 committed_enqueues: Vec::new(),
                 outcome_unknown_enqueues: pending_enqueues
                     .into_iter()
-                    .map(|t| (t, Error::IoFailure(e.to_string())))
+                    .map(|t| (t, e.clone()))
                     .collect(),
                 committed_leases: 0,
-                outcome_unknown_leases: (0..pending_leases)
-                    .map(|_| Error::IoFailure(e.to_string()))
-                    .collect(),
+                outcome_unknown_leases: (0..pending_leases).map(|_| e.clone()).collect(),
                 committed_acks: 0,
-                outcome_unknown_acks: (0..pending_acks)
-                    .map(|_| Error::IoFailure(e.to_string()))
-                    .collect(),
+                outcome_unknown_acks: (0..pending_acks).map(|_| e.clone()).collect(),
             };
             return Err(outcome);
         }

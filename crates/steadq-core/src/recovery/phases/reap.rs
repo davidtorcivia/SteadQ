@@ -429,8 +429,7 @@ impl Queue {
                                         reason: crate::QuarantineReason::EnvelopeCorrupt,
                                     },
                                     stats,
-                                    budget,
-                                )
+                                    budget)
                             {
                                 self.recovery_cursor.reap_leases = previous_entry_cursor;
                                 return;
@@ -476,8 +475,7 @@ impl Queue {
                                 ),
                                 &format!(
                                     "bucket mismatch: dir {actual_bucket} != deadline-derived {expected_lease_bucket}"
-                                ),
-                            );
+                                ));
                             continue;
                         }
 
@@ -703,13 +701,7 @@ impl Queue {
                 source: error,
             }
         })?;
-        move_verified_noreplace(
-            dir_fd.as_fd(),
-            leased_name,
-            dir_fd.as_fd(),
-            &ready_name,
-            MoveActor::Recovery,
-        )
+        move_verified_noreplace(dir_fd.as_fd(), leased_name, dir_fd.as_fd(), &ready_name)
     }
 
     pub(crate) fn reap_colocated_to_dead(
@@ -760,7 +752,6 @@ impl Queue {
             leased_name,
             dest_fd.as_fd(),
             &dead_target.filename,
-            MoveActor::Recovery,
         )
     }
 
@@ -813,13 +804,7 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(
-            src_fd.as_fd(),
-            leased_name,
-            dest_fd.as_fd(),
-            &ready_name,
-            MoveActor::Recovery,
-        )
+        move_verified_noreplace(src_fd.as_fd(), leased_name, dest_fd.as_fd(), &ready_name)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -889,12 +874,6 @@ impl Queue {
             }
         })?;
 
-        move_verified_noreplace(
-            src_fd.as_fd(),
-            leased_name,
-            dest_fd.as_fd(),
-            &dead_name,
-            MoveActor::Recovery,
-        )
+        move_verified_noreplace(src_fd.as_fd(), leased_name, dest_fd.as_fd(), &dead_name)
     }
 }
