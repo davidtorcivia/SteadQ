@@ -126,6 +126,186 @@ fn main() {
     std::process::exit(if pass { 0 } else { 1 });
 }
 
+/// The oplog's durable prefix: jobs whose enqueue committed and jobs whose
+/// ack completed. Damage to anything else is legal power-loss loss.
+struct DurablePrefix {
+    committed: Vec<[u8; 16]>,
+    acked: Vec<[u8; 16]>,
+    committed_hex: Vec<String>,
+    acked_hex: Vec<String>,
+}
+
+impl DurablePrefix {
+    fn from_ops(ops: &[OpLine]) -> Self {
+        let committed: Vec<[u8; 16]> = ops
+            .iter()
+            .filter(|l| l.op == "enqueue" && l.result.starts_with("committed"))
+            .filter_map(|l| unhex(&l.job))
+            .collect();
+        let acked: Vec<[u8; 16]> = ops
+            .iter()
+            .filter(|l| l.op == "ack" && l.result == "acked")
+            .filter_map(|l| unhex(&l.job))
+            .collect();
+        let committed_hex = committed.iter().map(|j| hex(j)).collect();
+        let acked_hex = acked.iter().map(|j| hex(j)).collect();
+        DurablePrefix {
+            committed,
+            acked,
+            committed_hex,
+            acked_hex,
+        }
+    }
+
+    /// True when the object at `relative_path` belongs to no job in the
+    /// durable prefix, so findings about it cannot fail the state.
+    fn beyond(&self, relative_path: &str) -> bool {
+        let name = relative_path.rsplit('/').next().unwrap_or("");
+        let job_hex = name.split('.').next().unwrap_or("");
+        !self.committed_hex.iter().any(|c| c == job_hex)
+            && !self.acked_hex.iter().any(|a| a == job_hex)
+    }
+}
+
+struct RecoveryGate {
+    stats: steadq_core::RecoveryStats,
+    passes: u32,
+    errors: usize,
+    beyond_prefix: usize,
+}
+
+/// Run recovery to quiescence, splitting errors into prefix and beyond-prefix.
+fn recover_to_quiescence(queue: &mut Queue, prefix: &DurablePrefix) -> RecoveryGate {
+    let budget = WorkBudget {
+        max_operations: 100_000,
+        max_duration_ms: 60_000,
+    };
+    let mut passes = 0u32;
+    let mut errors = 0usize;
+    let mut beyond_prefix = 0usize;
+    let stats = loop {
+        let stats = queue.recover(&budget);
+        for e in &stats.errors {
+            if prefix.beyond(&e.relative_path) {
+                beyond_prefix += 1;
+            } else {
+                errors += 1;
+            }
+        }
+        passes += 1;
+        if !stats.budget_exhausted || passes > 100 {
+            break stats;
+        }
+    };
+    RecoveryGate {
+        stats,
+        passes,
+        errors,
+        beyond_prefix,
+    }
+}
+
+struct FsckGate {
+    report: steadq_core::FsckReport,
+    errors: usize,
+    beyond_prefix: usize,
+}
+
+/// Deep fsck in check-only mode, with Error findings split the same way.
+fn fsck_gate(queue: &Queue, prefix: &DurablePrefix) -> FsckGate {
+    let report = queue.fsck(&FsckOptions {
+        mode: FsckMode::Check,
+        depth: FsckDepth::Deep,
+    });
+    let mut errors = 0usize;
+    let mut beyond_prefix = 0usize;
+    for finding in &report.findings {
+        if matches!(finding.severity, steadq_core::FindingSeverity::Error) {
+            if prefix.beyond(&finding.relative_path) {
+                beyond_prefix += 1;
+            } else {
+                errors += 1;
+            }
+        }
+    }
+    FsckGate {
+        report,
+        errors,
+        beyond_prefix,
+    }
+}
+
+fn is_active(snapshots: &[steadq_core::Snapshot]) -> bool {
+    snapshots
+        .iter()
+        .any(|s| matches!(s.state.as_str(), "ready" | "leased" | "delayed"))
+}
+
+/// G1: committed jobs must still exist somewhere. G2: acked jobs must be
+/// terminal. Returns (missing, acked_bad).
+fn check_prefix_jobs(queue: &Queue, prefix: &DurablePrefix) -> (Vec<String>, Vec<String>) {
+    let mut missing = Vec::new();
+    let mut acked_bad = Vec::new();
+    for job in &prefix.committed {
+        let snapshots = queue.inspect(job);
+        if snapshots.is_empty() {
+            missing.push(hex(job));
+            continue;
+        }
+        if prefix.acked.contains(job) && is_active(&snapshots) {
+            acked_bad.push(format!("{}:{}", hex(job), snapshots[0].state));
+        }
+    }
+    // Acked jobs that were never seen as committed cannot exist (ack requires
+    // a prior lease of a committed job), but check them anyway if present.
+    for job in &prefix.acked {
+        if !prefix.committed.contains(job) {
+            let snapshots = queue.inspect(job);
+            if is_active(&snapshots) {
+                acked_bad.push(format!("{}:{}", hex(job), snapshots[0].state));
+            }
+        }
+    }
+    (missing, acked_bad)
+}
+
+struct DeliveryProbe {
+    delivered: Vec<String>,
+    phantom: Vec<String>,
+    quarantined_corrupt: u32,
+}
+
+/// G3: probe deliveries. An acknowledged job must never be delivered;
+/// corrupt payloads must be quarantined, not delivered. A job that exists
+/// on disk but has no durable oplog line is NOT a phantom: publication
+/// fsyncs before its oplog line is written, so the durable prefix is a
+/// lower bound on completed work and on-disk presence proves the enqueue.
+fn probe_deliveries(queue: &mut Queue, prefix: &DurablePrefix) -> DeliveryProbe {
+    let mut probe = DeliveryProbe {
+        delivered: Vec::new(),
+        phantom: Vec::new(),
+        quarantined_corrupt: 0,
+    };
+    for _ in 0..8 {
+        match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(info) => {
+                let jh = hex(&info.job_id);
+                if prefix.acked_hex.contains(&jh) {
+                    probe.phantom.push(format!("acked-delivered:{jh}"));
+                } else {
+                    probe.delivered.push(jh);
+                }
+            }
+            LeaseOutcome::NotCommitted(Error::PayloadCorrupt) => {
+                // Deterministic corruption was quarantined before delivery.
+                probe.quarantined_corrupt += 1;
+            }
+            _ => break,
+        }
+    }
+    probe
+}
+
 fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     // A crash state before the queue was initialized checks nothing: no
     // queue exists, no operations were durably completed.
@@ -148,20 +328,7 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         };
     }
     let ops = read_oplog(Path::new(&args.oplog))?;
-
-    let committed: Vec<[u8; 16]> = ops
-        .iter()
-        .filter(|l| l.op == "enqueue" && l.result.starts_with("committed"))
-        .filter_map(|l| unhex(&l.job))
-        .collect();
-    let acked: Vec<[u8; 16]> = ops
-        .iter()
-        .filter(|l| l.op == "ack" && l.result == "acked")
-        .filter_map(|l| unhex(&l.job))
-        .collect();
-
-    let committed_hex: Vec<String> = committed.iter().map(|j| hex(j)).collect();
-    let acked_hex: Vec<String> = acked.iter().map(|j| hex(j)).collect();
+    let prefix = DurablePrefix::from_ops(&ops);
 
     let mut queue = Queue::open(
         Path::new(&args.queue),
@@ -172,68 +339,14 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     )
     .map_err(|e| format!("open failed: {e}"))?;
 
-    // Recovery to quiescence.
-    let budget = WorkBudget {
-        max_operations: 100_000,
-        max_duration_ms: 60_000,
-    };
-    // Recovery errors referencing objects with no durable obligation are
-    // the same legal power-loss loss class as beyond-prefix fsck findings.
-    let error_beyond_prefix = |e: &steadq_core::recovery::RecoveryError| -> bool {
-        let name = e.relative_path.rsplit('/').next().unwrap_or("");
-        let job_hex = name.split('.').next().unwrap_or("");
-        !committed_hex.iter().any(|c| c == job_hex) && !acked_hex.iter().any(|a| a == job_hex)
-    };
-    let mut passes = 0u32;
-    let mut total_errors = 0usize;
-    let mut recovery_beyond_prefix = 0usize;
-    let mut recovery_beyond_errors: Vec<String> = Vec::new();
-    let last = loop {
-        let stats = queue.recover(&budget);
-        for e in &stats.errors {
-            if error_beyond_prefix(e) {
-                recovery_beyond_prefix += 1;
-                if recovery_beyond_errors.len() < 20 {
-                    recovery_beyond_errors.push(format!("{e:?}"));
-                }
-            } else {
-                total_errors += 1;
-            }
-        }
-        passes += 1;
-        if !stats.budget_exhausted || passes > 100 {
-            break stats;
-        }
-    };
+    let recovery = recover_to_quiescence(&mut queue, &prefix);
+    let fsck = fsck_gate(&queue, &prefix);
+    let (missing, acked_bad) = check_prefix_jobs(&queue, &prefix);
+    let probe = probe_deliveries(&mut queue, &prefix);
 
-    // Deep fsck in check-only mode.
-    let report = queue.fsck(&FsckOptions {
-        mode: FsckMode::Check,
-        depth: FsckDepth::Deep,
-    });
-    // Findings on objects with no durable obligation are legal power-loss
-    // loss: the contract protects only work whose completion is in the
-    // durable oplog prefix. Damage beyond the prefix (never-acknowledged
-    // jobs, receipts without durable acks) must not fail the state; the
-    // same damage on a durably committed job still fails it.
-    let beyond_prefix = |finding: &steadq_core::CorruptionFinding| -> bool {
-        let name = finding.relative_path.rsplit('/').next().unwrap_or("");
-        let job_hex = name.split('.').next().unwrap_or("");
-        !committed_hex.iter().any(|c| c == job_hex) && !acked_hex.iter().any(|a| a == job_hex)
-    };
-    let mut fsck_errors = 0usize;
-    let mut beyond_prefix_findings = 0usize;
-    for finding in &report.findings {
-        if matches!(finding.severity, steadq_core::FindingSeverity::Error) {
-            if beyond_prefix(finding) {
-                beyond_prefix_findings += 1;
-            } else {
-                fsck_errors += 1;
-            }
-        }
-    }
-    let fsck_warnings = report.findings.len() - fsck_errors - beyond_prefix_findings;
-    let fsck_findings: Vec<serde_json::Value> = report
+    let fsck_warnings = fsck.report.findings.len() - fsck.errors - fsck.beyond_prefix;
+    let fsck_findings: Vec<serde_json::Value> = fsck
+        .report
         .findings
         .iter()
         .take(20)
@@ -246,69 +359,8 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
             })
         })
         .collect();
-
-    // G1: committed jobs must still exist somewhere.
-    let mut missing = Vec::new();
-    let mut acked_bad = Vec::new();
-    for job in &committed {
-        let snapshots = queue.inspect(job);
-        if snapshots.is_empty() {
-            missing.push(hex(job));
-            continue;
-        }
-        // G2: if this job was later acked, its state must be terminal.
-        if acked.contains(job) {
-            let active = snapshots
-                .iter()
-                .any(|s| matches!(s.state.as_str(), "ready" | "leased" | "delayed"));
-            if active {
-                acked_bad.push(format!("{}:{}", hex(job), snapshots[0].state));
-            }
-        }
-    }
-    // Acked jobs that were never seen as committed cannot exist (ack requires
-    // a prior lease of a committed job), but check them anyway if present.
-    for job in &acked {
-        if !committed.contains(job) {
-            let snapshots = queue.inspect(job);
-            let active = snapshots
-                .iter()
-                .any(|s| matches!(s.state.as_str(), "ready" | "leased" | "delayed"));
-            if active {
-                acked_bad.push(format!("{}:{}", hex(job), snapshots[0].state));
-            }
-        }
-    }
-
-    // G3: probe deliveries. An acknowledged job must never be delivered;
-    // corrupt payloads must be quarantined, not delivered. A job that exists
-    // on disk but has no durable oplog line is NOT a phantom: publication
-    // fsyncs before its oplog line is written, so the durable prefix is a
-    // lower bound on completed work and on-disk presence proves the enqueue.
-    let acked_hex: Vec<String> = acked.iter().map(|j| hex(j)).collect();
-    let mut delivered = Vec::new();
-    let mut phantom = Vec::new();
-    let mut quarantined_corrupt = 0u32;
-    for _ in 0..8 {
-        match queue.lease(0, 30_000_000_000) {
-            LeaseOutcome::Leased(info) => {
-                let jh = hex(&info.job_id);
-                if acked_hex.contains(&jh) {
-                    phantom.push(format!("acked-delivered:{jh}"));
-                } else {
-                    delivered.push(jh);
-                }
-            }
-            LeaseOutcome::NotCommitted(Error::PayloadCorrupt) => {
-                // Deterministic corruption was quarantined before delivery.
-                quarantined_corrupt += 1;
-            }
-            _ => break,
-        }
-    }
-
-    let stats = last;
-    let recovery_errors: Vec<String> = stats
+    let recovery_errors: Vec<String> = recovery
+        .stats
         .errors
         .iter()
         .take(20)
@@ -323,42 +375,42 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         .collect();
     let gates_pass = missing.is_empty()
         && acked_bad.is_empty()
-        && phantom.is_empty()
-        && total_errors == 0
-        && fsck_errors == 0;
+        && probe.phantom.is_empty()
+        && recovery.errors == 0
+        && fsck.errors == 0;
 
     Ok(json!({
         "pass": gates_pass,
         "ops": ops.len(),
         "oplog_tail": oplog_tail,
-        "committed": committed.len(),
-        "acked": acked.len(),
+        "committed": prefix.committed.len(),
+        "acked": prefix.acked.len(),
         "gates": {
-            "committed_not_lost": { "checked": committed.len(), "missing": missing },
-            "acked_terminal": { "checked": acked.len(), "violations": acked_bad },
-            "no_phantom_or_acked_delivery": { "violations": phantom, "delivered_probe": delivered.len() },
+            "committed_not_lost": { "checked": prefix.committed.len(), "missing": missing },
+            "acked_terminal": { "checked": prefix.acked.len(), "violations": acked_bad },
+            "no_phantom_or_acked_delivery": { "violations": probe.phantom, "delivered_probe": probe.delivered.len() },
             "recovery_clean": {
-                "passes": passes,
-                "errors": total_errors,
+                "passes": recovery.passes,
+                "errors": recovery.errors,
                 "error_detail": recovery_errors,
             },
-            "beyond_prefix_findings": beyond_prefix_findings,
-            "beyond_prefix_recovery_errors": recovery_beyond_prefix,
+            "beyond_prefix_findings": fsck.beyond_prefix,
+            "beyond_prefix_recovery_errors": recovery.beyond_prefix,
             "fsck_clean": {
-                "errors": fsck_errors,
+                "errors": fsck.errors,
                 "warnings": fsck_warnings,
-                "total_objects": report.total_objects,
-                "structurally_verified": report.structurally_verified,
-                "payloads_deep_verified": report.payloads_deep_verified,
+                "total_objects": fsck.report.total_objects,
+                "structurally_verified": fsck.report.structurally_verified,
+                "payloads_deep_verified": fsck.report.payloads_deep_verified,
                 "findings": fsck_findings,
             },
-            "quarantined_corrupt_payloads": quarantined_corrupt,
+            "quarantined_corrupt_payloads": probe.quarantined_corrupt,
         },
         "recovery": {
-            "reaped": stats.leases_reaped,
-            "promoted": stats.delayed_promoted,
-            "temp_deleted": stats.temp_files_deleted,
-            "to_dead": stats.leases_to_dead,
+            "reaped": recovery.stats.leases_reaped,
+            "promoted": recovery.stats.delayed_promoted,
+            "temp_deleted": recovery.stats.temp_files_deleted,
+            "to_dead": recovery.stats.leases_to_dead,
         },
     }))
 }

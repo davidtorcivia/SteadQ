@@ -18,12 +18,36 @@ use steadq_core::{
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_TICKET: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn clear_last_error() {
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = None;
     });
+}
+
+/// Only the mutating calls clear the slot, so the pointer from
+/// steadq_last_ticket_json stays valid through the steadq_resolve call that
+/// consumes it. Enqueue clears it too: its indeterminate outcome carries no
+/// transition ticket, and a stale one must not be mistaken for it.
+fn clear_last_ticket() {
+    LAST_TICKET.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+fn store_last_ticket(json: Vec<u8>) {
+    LAST_TICKET.with(|cell| {
+        *cell.borrow_mut() = CString::new(json).ok();
+    });
+}
+
+/// Stash the ticket of an indeterminate outcome for steadq_last_ticket_json.
+fn set_last_ticket(ticket: &TransitionTicket) {
+    if let Ok(json) = ticket.to_json() {
+        store_last_ticket(json);
+    }
 }
 
 fn set_last_error(msg: &str) {
@@ -97,6 +121,21 @@ pub struct SteadqJobId {
 #[no_mangle]
 pub extern "C" fn steadq_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| {
+        let b = cell.borrow();
+        b.as_ref().map_or(ptr::null(), |cs| cs.as_ptr())
+    })
+}
+
+/// After steadq_lease, steadq_ack, steadq_retry, or steadq_bury returns
+/// STEADQ_INDETERMINATE, the transition ticket as JSON for steadq_resolve.
+/// Returns NULL when the last such call left no ticket, and after an
+/// indeterminate steadq_enqueue, which has no transition ticket. Thread-local;
+/// valid until the next steadq_enqueue, steadq_lease, steadq_ack,
+/// steadq_retry, or steadq_bury on the same thread, so it may be passed
+/// straight into steadq_resolve. Do not free.
+#[no_mangle]
+pub extern "C" fn steadq_last_ticket_json() -> *const c_char {
+    LAST_TICKET.with(|cell| {
         let b = cell.borrow();
         b.as_ref().map_or(ptr::null(), |cs| cs.as_ptr())
     })
@@ -200,6 +239,7 @@ pub extern "C" fn steadq_enqueue(
     job_id_out: *mut SteadqJobId,
 ) -> c_int {
     clear_last_error();
+    clear_last_ticket();
     if !job_id_out.is_null() {
         unsafe { (*job_id_out).bytes = [0; 16] };
     }
@@ -285,6 +325,7 @@ pub extern "C" fn steadq_lease(
     lease_out: *mut *mut SteadqLease,
 ) -> c_int {
     clear_last_error();
+    clear_last_ticket();
     if queue.is_null() || lease_out.is_null() {
         set_last_error("null queue or lease_out");
         return STEADQ_NOT_COMMITTED;
@@ -313,7 +354,10 @@ pub extern "C" fn steadq_lease(
                 set_last_error(&leak_error(e));
                 code
             }
-            LeaseOutcome::OutcomeUnknown(_) => STEADQ_INDETERMINATE,
+            LeaseOutcome::OutcomeUnknown(ticket) => {
+                set_last_ticket(&ticket);
+                STEADQ_INDETERMINATE
+            }
         }
     });
     match result {
@@ -365,6 +409,7 @@ pub extern "C" fn steadq_lease_verify(queue: *mut SteadqQueue, lease: *mut Stead
 #[no_mangle]
 pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
+    clear_last_ticket();
     if queue.is_null() || lease.is_null() {
         set_last_error("null queue or lease");
         return STEADQ_NOT_COMMITTED;
@@ -391,7 +436,10 @@ pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -
                 set_last_error(&leak_error(e));
                 code
             }
-            steadq_core::AckOutcome::OutcomeUnknown(_) => STEADQ_INDETERMINATE,
+            steadq_core::AckOutcome::OutcomeUnknown(ticket) => {
+                set_last_ticket(&ticket);
+                STEADQ_INDETERMINATE
+            }
         }
     });
     match result {
@@ -407,6 +455,7 @@ pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -
 #[no_mangle]
 pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
+    clear_last_ticket();
     if queue.is_null() || lease.is_null() {
         set_last_error("null queue or lease");
         return STEADQ_NOT_COMMITTED;
@@ -432,7 +481,10 @@ pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease)
                 set_last_error(&leak_error(e));
                 code
             }
-            TransitionOutcome::OutcomeUnknown(_) => STEADQ_INDETERMINATE,
+            TransitionOutcome::OutcomeUnknown(ticket) => {
+                set_last_ticket(&ticket);
+                STEADQ_INDETERMINATE
+            }
         }
     });
     match result {
@@ -452,6 +504,7 @@ pub extern "C" fn steadq_bury(
     reason: c_uint,
 ) -> c_int {
     clear_last_error();
+    clear_last_ticket();
     if queue.is_null() || lease.is_null() {
         set_last_error("null queue or lease");
         return STEADQ_NOT_COMMITTED;
@@ -479,7 +532,10 @@ pub extern "C" fn steadq_bury(
                 set_last_error(&leak_error(e));
                 code
             }
-            TransitionOutcome::OutcomeUnknown(_) => STEADQ_INDETERMINATE,
+            TransitionOutcome::OutcomeUnknown(ticket) => {
+                set_last_ticket(&ticket);
+                STEADQ_INDETERMINATE
+            }
         }
     });
     match result {
@@ -652,27 +708,37 @@ pub extern "C" fn steadq_lease_open_reader(
     lease: *const SteadqLease,
     reader_out: *mut *mut SteadqPayloadReader,
 ) -> c_int {
+    clear_last_error();
     if queue.is_null() || lease.is_null() || reader_out.is_null() {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
     unsafe { *reader_out = std::ptr::null_mut() };
-    let steadq = unsafe { &*queue };
-    let lease_inner = unsafe { &(*lease).inner };
-    let guard = steadq.inner.lock();
-    let Ok(queue) = guard else {
-        return STEADQ_CORRUPTION;
-    };
-    match queue.open_verified_payload_reader(lease_inner) {
-        Ok(Some(reader)) => {
-            let boxed = Box::new(SteadqPayloadReader { inner: reader });
-            unsafe { *reader_out = Box::into_raw(boxed) };
-            STEADQ_OK
+    let result = std::panic::catch_unwind(|| {
+        let steadq = unsafe { &*queue };
+        let lease_inner = unsafe { &(*lease).inner };
+        let Ok(queue) = steadq.inner.lock() else {
+            set_last_error("queue mutex poisoned (previous panic during operation)");
+            return STEADQ_CORRUPTION;
+        };
+        match queue.open_verified_payload_reader(lease_inner) {
+            Ok(Some(reader)) => {
+                let boxed = Box::new(SteadqPayloadReader { inner: reader });
+                unsafe { *reader_out = Box::into_raw(boxed) };
+                STEADQ_OK
+            }
+            Ok(None) => STEADQ_NOT_COMMITTED,
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-        Ok(None) => STEADQ_NOT_COMMITTED,
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_lease_open_reader");
+            STEADQ_IO_FAILURE
         }
     }
 }
@@ -687,20 +753,30 @@ pub extern "C" fn steadq_reader_read(
     offset: u64,
     bytes_read_out: *mut usize,
 ) -> c_int {
+    clear_last_error();
     if reader.is_null() || buf.is_null() || bytes_read_out.is_null() {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
-    let reader = unsafe { &*reader };
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
-    match reader.inner.read_at(slice, offset) {
-        Ok(n) => {
-            unsafe { *bytes_read_out = n };
-            STEADQ_OK
+    let result = std::panic::catch_unwind(|| {
+        let reader = unsafe { &*reader };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
+        match reader.inner.read_at(slice, offset) {
+            Ok(n) => {
+                unsafe { *bytes_read_out = n };
+                STEADQ_OK
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_reader_read");
+            STEADQ_IO_FAILURE
         }
     }
 }
@@ -734,35 +810,45 @@ pub extern "C" fn steadq_resolve(
     ticket_len: usize,
     stabilize: c_int,
 ) -> c_int {
+    clear_last_error();
     if queue.is_null() || ticket_json.is_null() || ticket_len == 0 {
+        set_last_error("null argument");
         return STEADQ_NOT_COMMITTED;
     }
-    clear_last_error();
-    let steadq = unsafe { &*queue };
-    let json = unsafe { std::slice::from_raw_parts(ticket_json, ticket_len) };
-    let ticket = match TransitionTicket::from_json(json) {
-        Ok(t) => t,
-        Err(e) => {
-            set_last_error(&format!("invalid ticket: {e}"));
-            return STEADQ_NOT_COMMITTED;
+    // Copy first: the caller may pass the steadq_last_ticket_json buffer.
+    let json = unsafe { std::slice::from_raw_parts(ticket_json, ticket_len) }.to_vec();
+    let result = std::panic::catch_unwind(|| {
+        let steadq = unsafe { &*queue };
+        let ticket = match TransitionTicket::from_json(&json) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(&format!("invalid ticket: {e}"));
+                return STEADQ_NOT_COMMITTED;
+            }
+        };
+        let Ok(queue) = steadq.inner.lock() else {
+            set_last_error("queue mutex poisoned (previous panic during operation)");
+            return STEADQ_CORRUPTION;
+        };
+        match queue.resolve(&ticket, stabilize != 0) {
+            ResolutionOutcome::SourceObserved
+            | ResolutionOutcome::SourceStabilized
+            | ResolutionOutcome::DestinationObserved
+            | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
+            ResolutionOutcome::BothObserved => STEADQ_CORRUPTION,
+            ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
+            ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
+            ResolutionOutcome::ResolutionFailed(e) => {
+                set_last_error(&format!("{e}"));
+                error_to_code(&e)
+            }
         }
-    };
-    let guard = steadq.inner.lock();
-    let Ok(queue) = guard else {
-        return STEADQ_CORRUPTION;
-    };
-    let outcome = queue.resolve(&ticket, stabilize != 0);
-    match outcome {
-        ResolutionOutcome::SourceObserved
-        | ResolutionOutcome::SourceStabilized
-        | ResolutionOutcome::DestinationObserved
-        | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
-        ResolutionOutcome::BothObserved => STEADQ_CORRUPTION,
-        ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
-        ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
-        ResolutionOutcome::ResolutionFailed(e) => {
-            set_last_error(&format!("{e}"));
-            error_to_code(&e)
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_resolve");
+            STEADQ_IO_FAILURE
         }
     }
 }
@@ -775,6 +861,36 @@ fn leak_error(e: Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_ticket_survives_resolve_and_clears_on_the_next_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let queue = steadq_init(path.as_ptr(), 1);
+        assert!(!queue.is_null());
+
+        store_last_ticket(b"{}".to_vec());
+        let ticket = steadq_last_ticket_json();
+        assert!(!ticket.is_null());
+        let len = unsafe { std::ffi::CStr::from_ptr(ticket) }.to_bytes().len();
+        assert_eq!(
+            steadq_resolve(queue, ticket.cast(), len, 0),
+            STEADQ_NOT_COMMITTED
+        );
+        let error = unsafe { std::ffi::CStr::from_ptr(steadq_last_error()) };
+        assert!(error.to_str().unwrap().starts_with("invalid ticket"));
+        assert_eq!(steadq_last_ticket_json(), ticket);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(ticket) }.to_bytes(),
+            b"{}"
+        );
+
+        let mut lease = std::ptr::null_mut();
+        steadq_lease(queue, 1_000_000_000, &mut lease);
+        assert!(lease.is_null());
+        assert!(steadq_last_ticket_json().is_null());
+        steadq_close(queue);
+    }
 
     #[test]
     fn init_error_mapping_preserves_kind() {

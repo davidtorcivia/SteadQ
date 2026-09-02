@@ -653,6 +653,7 @@ name = "steadq-capi"
 version = "0.1.0"
 dependencies = [
  "steadq-core",
+ "tempfile",
 ]
 
 [[package]]

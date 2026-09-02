@@ -31,61 +31,32 @@ fn from_hex_pair_lower(chunk: &[u8]) -> Option<u8> {
     Some((from_hex_digit_lower(chunk[0])? << 4) | from_hex_digit_lower(chunk[1])?)
 }
 
-pub fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+/// Decode exactly `2 * N` lowercase hex digits.
+fn hex_decode_array<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != 2 * N {
         return None;
     }
-    let mut out = [0u8; 16];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = from_hex_pair_lower(chunk)?;
+    let mut out = [0u8; N];
+    for (byte, chunk) in out.iter_mut().zip(s.as_bytes().chunks(2)) {
+        *byte = from_hex_pair_lower(chunk)?;
     }
     Some(out)
+}
+
+pub fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
+    hex_decode_array(s)
 }
 
 pub fn hex_decode_u64(s: &str) -> Option<u64> {
-    if s.len() != 16 {
-        return None;
-    }
-    let bytes = hex_decode_bytes(s)?;
-    if bytes.len() != 8 {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes);
-    Some(u64::from_be_bytes(buf))
+    hex_decode_array(s).map(u64::from_be_bytes)
 }
 
 pub fn hex_decode_u32(s: &str) -> Option<u32> {
-    if s.len() != 8 {
-        return None;
-    }
-    let mut out = [0u8; 4];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = from_hex_pair_lower(chunk)?;
-    }
-    Some(u32::from_be_bytes(out))
+    hex_decode_array(s).map(u32::from_be_bytes)
 }
 
 pub fn hex_decode_u16(s: &str) -> Option<u16> {
-    if s.len() != 4 {
-        return None;
-    }
-    let mut out = [0u8; 2];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = from_hex_pair_lower(chunk)?;
-    }
-    Some(u16::from_be_bytes(out))
-}
-
-fn hex_decode_bytes(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks(2) {
-        out.push(from_hex_pair_lower(chunk)?);
-    }
-    Some(out)
+    hex_decode_array(s).map(u16::from_be_bytes)
 }
 
 fn hex_u64(v: u64) -> String {
@@ -163,14 +134,7 @@ pub fn shard_hex(shard: u32) -> String {
 }
 
 pub fn shard_from_hex(s: &str) -> Option<u32> {
-    if s.len() != 4 {
-        return None;
-    }
-    let mut out = [0u8; 2];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = from_hex_pair_lower(chunk)?;
-    }
-    Some(u16::from_be_bytes(out) as u32)
+    hex_decode_u16(s).map(u32::from)
 }
 
 // ---------- Shard scan permutation ----------
@@ -547,8 +511,8 @@ pub fn make_leased_name(
     boottime_deadline_ns: u64,
     wall_deadline_ns: u64,
     token: &[u8; 16],
-) -> String {
-    let boot_bytes = boot_id_bytes(boot_id).unwrap_or([0; 16]);
+) -> Option<String> {
+    let boot_bytes = boot_id_bytes(boot_id)?;
     let mut base = common.base_name();
     base.push_str(".o");
     push_hex(&mut base, &boot_bytes);
@@ -564,7 +528,7 @@ pub fn make_leased_name(
             "leased/", boot_id, "/", bucket_hex, "/", shard_hex, "/", &base,
         ],
     );
-    tagged_filename(base, &tag, ".sqj")
+    Some(tagged_filename(base, &tag, ".sqj"))
 }
 
 pub fn make_receipt_name(
@@ -727,69 +691,35 @@ fn assert_ascii(s: &str) -> Result<(), ParseError> {
     }
 }
 
+/// Strip a single ASCII prefix byte. The prefix is ASCII, so the remainder
+/// starts on a char boundary.
+fn strip_tag(part: &str, prefix: u8) -> Result<&str, ParseError> {
+    match part.as_bytes() {
+        [first, rest @ ..] if *first == prefix && !rest.is_empty() => Ok(&part[1..]),
+        _ => Err(ParseError::Malformed),
+    }
+}
+
 /// Strictly parse a tagged hex value with a single-character prefix.
 /// Returns Err on wrong prefix, wrong length, or non-canonical hex.
 fn parse_tagged_hex_u64(part: &str, prefix: u8) -> Result<u64, ParseError> {
-    let bytes = part.as_bytes();
-    if bytes.len() < 2 || bytes[0] != prefix {
-        return Err(ParseError::Malformed);
-    }
-    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
-    if hex_str.len() != 16 {
-        return Err(ParseError::BadHex("u64"));
-    }
-    hex_decode_u64(hex_str).ok_or(ParseError::BadHex("u64"))
+    hex_decode_u64(strip_tag(part, prefix)?).ok_or(ParseError::BadHex("u64"))
 }
 
 fn parse_tagged_hex_u32(part: &str, prefix: u8) -> Result<u32, ParseError> {
-    let bytes = part.as_bytes();
-    if bytes.len() < 2 || bytes[0] != prefix {
-        return Err(ParseError::Malformed);
-    }
-    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
-    if hex_str.len() != 8 {
-        return Err(ParseError::BadHex("u32"));
-    }
-    hex_decode_u32(hex_str).ok_or(ParseError::BadHex("u32"))
+    hex_decode_u32(strip_tag(part, prefix)?).ok_or(ParseError::BadHex("u32"))
 }
 
 fn parse_tagged_hex_u16(part: &str, prefix: u8) -> Result<u16, ParseError> {
-    let bytes = part.as_bytes();
-    if bytes.len() < 2 || bytes[0] != prefix {
-        return Err(ParseError::Malformed);
-    }
-    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
-    if hex_str.len() != 4 {
-        return Err(ParseError::BadHex("u16"));
-    }
-    hex_decode_u16(hex_str).ok_or(ParseError::BadHex("u16"))
+    hex_decode_u16(strip_tag(part, prefix)?).ok_or(ParseError::BadHex("u16"))
 }
 
 fn parse_tagged_hex_16(part: &str, prefix: u8) -> Result<[u8; 16], ParseError> {
-    let bytes = part.as_bytes();
-    if bytes.len() < 2 || bytes[0] != prefix {
-        return Err(ParseError::Malformed);
-    }
-    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
-    hex_decode_16(hex_str).ok_or(ParseError::BadHex("16"))
+    hex_decode_16(strip_tag(part, prefix)?).ok_or(ParseError::BadHex("16"))
 }
 
 fn parse_tag(part: &str) -> Result<[u8; 8], ParseError> {
-    let bytes = part.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'k' {
-        return Err(ParseError::Malformed);
-    }
-    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
-    if hex_str.len() != 16 {
-        return Err(ParseError::BadHex("k"));
-    }
-    let decoded = hex_decode_bytes(hex_str).ok_or(ParseError::BadHex("k"))?;
-    if decoded.len() != 8 {
-        return Err(ParseError::BadHex("k"));
-    }
-    let mut tag = [0u8; 8];
-    tag.copy_from_slice(&decoded);
-    Ok(tag)
+    hex_decode_array(strip_tag(part, b'k')?).ok_or(ParseError::BadHex("k"))
 }
 
 /// Parse common fields from the first four dot-separated parts:
@@ -979,19 +909,50 @@ pub fn parse_quarantine(filename: &str) -> Result<QuarantineName, ParseError> {
 }
 
 pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = from_hex_pair_lower(chunk)?;
-    }
-    Some(out)
+    hex_decode_array(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_width_hex_decoders_accept_exact_lowercase_only() {
+        assert_eq!(shard_from_hex("0000"), Some(0));
+        assert_eq!(shard_from_hex("0001"), Some(1));
+        assert_eq!(shard_from_hex("03ef"), Some(0x03ef));
+        assert_eq!(shard_from_hex("ffff"), Some(0xffff));
+        for bad in ["03EF", "3ef", "003ef", "", "zzzz"] {
+            assert_eq!(shard_from_hex(bad), None, "{bad}");
+        }
+
+        let digest: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let encoded = hex_encode(&digest);
+        assert_eq!(hex_decode_32(&encoded), Some(digest));
+        assert_eq!(hex_decode_32(&encoded.to_uppercase()), None);
+        assert_eq!(hex_decode_32(&encoded[..62]), None);
+        assert_eq!(hex_decode_32(&format!("{encoded}00")), None);
+
+        assert_eq!(hex_decode_u16("0102"), Some(0x0102));
+        assert_eq!(hex_decode_u32("01020304"), Some(0x0102_0304));
+        assert_eq!(
+            hex_decode_u64("0102030405060708"),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(hex_decode_u64("010203040506070"), None);
+    }
+
+    #[test]
+    fn strip_tag_requires_prefix_and_nonempty_remainder() {
+        assert_eq!(strip_tag("kab", b'k').unwrap(), "ab");
+        assert_eq!(strip_tag("kcaf\u{e9}", b'k').unwrap(), "caf\u{e9}");
+        for bad in ["k", "", "xab"] {
+            assert!(
+                matches!(strip_tag(bad, b'k'), Err(ParseError::Malformed)),
+                "{bad:?}"
+            );
+        }
+    }
 
     fn test_queue_id() -> [u8; 16] {
         [0x42; 16]
@@ -1732,8 +1693,20 @@ mod tests {
             3_000_000_000,
             4_000_000_000,
             &token,
-        );
+        )
+        .unwrap();
         let parsed = parse_leased(&name).expect("make_leased_name parse");
+        assert!(make_leased_name(
+            &qid,
+            "not-a-boot-id",
+            bucket,
+            shard,
+            &common,
+            3_000_000_000,
+            4_000_000_000,
+            &token,
+        )
+        .is_none());
         assert_eq!(parsed.common, common);
         assert_eq!(parsed.boottime_deadline_ns, 3_000_000_000);
         assert_eq!(parsed.wall_deadline_ns, 4_000_000_000);

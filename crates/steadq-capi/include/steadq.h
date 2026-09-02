@@ -62,6 +62,17 @@ typedef struct SteadqJobId {
 const char *steadq_last_error(void);
 
 /**
+ * After steadq_lease, steadq_ack, steadq_retry, or steadq_bury returns
+ * STEADQ_INDETERMINATE, the transition ticket as JSON for steadq_resolve.
+ * Returns NULL when the last such call left no ticket, and after an
+ * indeterminate steadq_enqueue, which has no transition ticket. Thread-local;
+ * valid until the next steadq_enqueue, steadq_lease, steadq_ack,
+ * steadq_retry, or steadq_bury on the same thread, so it may be passed
+ * straight into steadq_resolve. Do not free.
+ */
+const char *steadq_last_ticket_json(void);
+
+/**
  * No-op for ABI compatibility: steadq_last_error() returns thread-local
  * storage that does not need to be freed.
  */

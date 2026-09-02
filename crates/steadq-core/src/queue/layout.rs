@@ -205,7 +205,8 @@ impl<'a> Layout<'a> {
             boottime_deadline_ns,
             wall_deadline_ns,
             token,
-        );
+        )
+        .ok_or_else(|| Error::InvalidTicket("boot id is not canonical".into()))?;
         Ok(Target {
             location: Location::Leased {
                 boot_id: boot_id.to_string(),
