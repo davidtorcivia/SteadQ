@@ -89,46 +89,9 @@ impl Queue {
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize, Error> {
-        let source = match self.open_and_validate_current_lease(lease)? {
-            Some(source) => source,
-            None => return Err(Error::QueueCorrupt("lease source not found".into())),
-        };
-        // Verify payload before delivering any bytes.
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
-            if matches!(e, Error::PayloadCorrupt) {
-                if let Err(engine::MoveFailure::OutcomeUnknown {
-                    phase,
-                    source: detail,
-                }) = self.quarantine_corrupt_lease(
-                    source.directory_fd.as_fd(),
-                    &source.name,
-                    source.file_fd.as_fd(),
-                ) {
-                    return Err(Error::QueueCorrupt(format!(
-                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
-                    )));
-                }
-            }
-            return Err(e);
-        }
-        let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
-        let header =
-            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
-        let ext_len = header.extension_header_length as usize;
-        let payload_start = (128 + ext_len) as u64;
-        let payload_len = header.payload_length;
-        if offset >= payload_len {
-            return Ok(0);
-        }
-        let remaining = payload_len
-            .checked_sub(offset)
-            .expect("offset below payload length was checked");
-        let to_read = (buf.len() as u64).min(remaining) as usize;
-        let abs_offset = payload_start + offset;
-        let n = fs::pread(source.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
-            .map_err(Error::from)?;
-        Ok(n)
+        self.open_verified_payload_reader(lease)?
+            .ok_or_else(|| Error::QueueCorrupt("lease source not found".into()))?
+            .read_at(buf, offset)
     }
 
     /// Stream a leased job's payload with O(1) validation/open.
@@ -140,61 +103,21 @@ impl Queue {
         chunk_size: usize,
         mut f: F,
     ) -> Result<(), Error> {
-        let source = match self.open_and_validate_current_lease(lease)? {
-            Some(source) => source,
-            None => return Err(Error::QueueCorrupt("lease source not found".into())),
-        };
-        // Verify payload before streaming any bytes.
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
-            if matches!(e, Error::PayloadCorrupt) {
-                if let Err(engine::MoveFailure::OutcomeUnknown {
-                    phase,
-                    source: detail,
-                }) = self.quarantine_corrupt_lease(
-                    source.directory_fd.as_fd(),
-                    &source.name,
-                    source.file_fd.as_fd(),
-                ) {
-                    return Err(Error::QueueCorrupt(format!(
-                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
-                    )));
-                }
-            }
-            return Err(e);
-        }
-
-        let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
-        let header =
-            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
-
-        let ext_len = header.extension_header_length as usize;
-        let payload_start = (128 + ext_len) as u64;
-        let payload_len = header.payload_length;
-
-        let cap = chunk_size.clamp(4096, 1 << 20);
-        let mut buf = vec![0u8; cap];
+        let reader = self
+            .open_verified_payload_reader(lease)?
+            .ok_or_else(|| Error::QueueCorrupt("lease source not found".into()))?;
+        let mut buf = vec![0u8; chunk_size.clamp(4096, 1 << 20)];
         let mut offset = 0u64;
-        while offset < payload_len {
-            let remaining = payload_len
-                .checked_sub(offset)
-                .expect("offset below payload length was checked");
-            let to_read = (buf.len() as u64).min(remaining) as usize;
-            let n = fs::pread(
-                source.file_fd.as_fd(),
-                &mut buf[..to_read],
-                payload_start + offset,
-            )
-            .map_err(Error::from)?;
+        loop {
+            let n = reader.read_at(&mut buf, offset)?;
             if n == 0 {
-                return Err(Error::QueueCorrupt("unexpected EOF during stream".into()));
+                return Ok(());
             }
             f(&buf[..n])?;
             offset = offset
                 .checked_add(n as u64)
                 .expect("stream offset cannot exceed the verified payload length");
         }
-        Ok(())
     }
 
     /// Open a verified payload reader for a lease. The payload is hashed
@@ -207,32 +130,31 @@ impl Queue {
             Some(source) => source,
             None => return Ok(None),
         };
-        // Verify payload before allowing reads.
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
-            if matches!(e, Error::PayloadCorrupt) {
-                if let Err(engine::MoveFailure::OutcomeUnknown {
-                    phase,
-                    source: detail,
-                }) = self.quarantine_corrupt_lease(
-                    source.directory_fd.as_fd(),
-                    &source.name,
-                    source.file_fd.as_fd(),
-                ) {
-                    return Err(Error::QueueCorrupt(format!(
-                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
-                    )));
+        let verified = match verified::verify_job_on_fd(source.file_fd.as_fd()).map_err(Error::from)
+        {
+            Ok(verified) => verified,
+            Err(e) => {
+                if matches!(e, Error::PayloadCorrupt) {
+                    if let Err(engine::MoveFailure::OutcomeUnknown {
+                        phase,
+                        source: detail,
+                    }) = self.quarantine_corrupt_lease(
+                        source.directory_fd.as_fd(),
+                        &source.name,
+                        source.file_fd.as_fd(),
+                    ) {
+                        return Err(Error::QueueCorrupt(format!(
+                            "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
+                        )));
+                    }
                 }
+                return Err(e);
             }
-            return Err(e);
-        }
-        let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0).map_err(Error::from)?;
-        let header =
-            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
-        let ext_len = header.extension_header_length as usize;
+        };
+        let header = verified.header();
         Ok(Some(VerifiedPayloadReader {
             file_fd: source.file_fd,
-            payload_start: (128 + ext_len) as u64,
+            payload_start: 128 + u64::from(header.extension_header_length),
             payload_len: header.payload_length,
         }))
     }

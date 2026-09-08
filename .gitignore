@@ -1,6 +1,7 @@
 # Internal docs
 SteadQ_1_Agent_Ready_Final.md
 SteadQ_Elite_Codebase_Master_Plan.md
+SteadQ_Handoff_Next_Agent.md
 
 # Rust
 /target/
@@ -20,6 +21,7 @@ Thumbs.db
 
 # Plans
 .agents/
+.pi/
 
 # Internal scripts
 merge_pr.sh

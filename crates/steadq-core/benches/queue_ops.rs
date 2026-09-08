@@ -107,6 +107,40 @@ fn bench_enqueue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fsck(c: &mut Criterion) {
+    c.bench_function("fsck/4096", |b| {
+        let tmp = benchmark_tempdir();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                deferred_dir_sync: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..4096 {
+            assert!(matches!(
+                queue.enqueue(EnqueueInput {
+                    maximum_attempts: 3,
+                    content_type: "x".into(),
+                    payload: vec![0; 64],
+                    ..Default::default()
+                }),
+                EnqueueOutcome::Deferred(_)
+            ));
+        }
+        queue.sync().unwrap();
+        b.iter(|| {
+            let report = queue.fsck(&steadq_core::FsckOptions::default());
+            assert_eq!(report.total_objects, 4096);
+            assert!(report.findings.is_empty());
+            black_box(report);
+        });
+    });
+}
+
 fn bench_lease_empty(c: &mut Criterion) {
     let mut group = c.benchmark_group("lease_empty");
     for shard_count in [16u32, 64, 256].iter() {
@@ -512,6 +546,7 @@ fn bench_batch_deferred(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_fsck,
     bench_enqueue,
     bench_lease_empty,
     bench_lease_hit,

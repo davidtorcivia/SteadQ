@@ -60,7 +60,12 @@ fn classify_init_error(e: std::io::Error) -> Error {
     match e.kind() {
         std::io::ErrorKind::Unsupported => Error::UnsupportedFilesystem,
         std::io::ErrorKind::PermissionDenied => Error::PermissionDenied,
-        std::io::ErrorKind::AlreadyExists => Error::InvalidInput(e.to_string()),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            Error::ResourceExhausted
+        }
+        std::io::ErrorKind::AlreadyExists
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData => Error::InvalidInput(e.to_string()),
         std::io::ErrorKind::WouldBlock => Error::MaintenanceBusy,
         _ => Error::IoFailure(e.to_string()),
     }
@@ -894,6 +899,25 @@ mod tests {
 
     #[test]
     fn init_error_mapping_preserves_kind() {
+        for kind in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            assert_eq!(
+                classify_init_error(std::io::Error::from(kind)),
+                Error::ResourceExhausted
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            assert!(matches!(
+                classify_init_error(std::io::Error::from(kind)),
+                Error::InvalidInput(_)
+            ));
+        }
         assert!(matches!(
             classify_init_error(std::io::Error::new(std::io::ErrorKind::Unsupported, "fs")),
             Error::UnsupportedFilesystem

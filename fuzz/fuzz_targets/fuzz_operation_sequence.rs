@@ -7,8 +7,8 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use steadq_core::{Queue, CreateOptions, EnqueueInput, OpenOptions};
 use std::collections::HashMap;
+use steadq_core::{CreateOptions, EnqueueInput, OpenOptions, Queue};
 
 fuzz_target!(|data: &[u8]| {
     let tmp = match tempfile::tempdir() {
@@ -39,7 +39,8 @@ fuzz_target!(|data: &[u8]| {
         match op {
             0 => {
                 // Enqueue
-                let payload = vec![byte.wrapping_add(lease_counter as u8); (byte as usize % 64).max(1)];
+                let payload =
+                    vec![byte.wrapping_add(lease_counter as u8); (byte as usize % 64).max(1)];
                 let _ = queue.enqueue(EnqueueInput {
                     maximum_attempts: (byte % 3 + 1) as u32,
                     content_type: "application/octet-stream".into(),
@@ -61,7 +62,9 @@ fuzz_target!(|data: &[u8]| {
                         steadq_core::AckOutcome::Acked | steadq_core::AckOutcome::AlreadyAcked => {
                             leases.remove(&key);
                         }
-                        _ => { leases.remove(&key); }
+                        _ => {
+                            leases.remove(&key);
+                        }
                     }
                 }
             }
@@ -72,7 +75,9 @@ fuzz_target!(|data: &[u8]| {
                         steadq_core::TransitionOutcome::Committed => {
                             leases.remove(&key);
                         }
-                        _ => { leases.remove(&key); }
+                        _ => {
+                            leases.remove(&key);
+                        }
                     }
                 }
             }
@@ -83,7 +88,9 @@ fuzz_target!(|data: &[u8]| {
                         steadq_core::TransitionOutcome::Committed => {
                             leases.remove(&key);
                         }
-                        _ => { leases.remove(&key); }
+                        _ => {
+                            leases.remove(&key);
+                        }
                     }
                 }
             }

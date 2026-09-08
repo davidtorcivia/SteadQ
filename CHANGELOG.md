@@ -34,6 +34,13 @@
 
 ### Fixes
 
+- Job verification rejects invalid envelopes before hashing payloads. Full receipt verification checks path identity, payload limits, and expected evidence before payload reads. The full verifier reuses envelope verification, with file-size checks before extension reads so truncated extensions remain corruption errors. Tests verify early rejection performs no payload reads and valid-size corrupt payloads are still rejected.
+- Streaming enqueue enforces the payload limit while reading, consumes at most one excess byte, retries interrupted reads, and removes named temporary files after stream failures. Oversize input fails before publication without poisoning the queue.
+- CLI and C initialization classify full disks and exhausted quotas as resource exhaustion; C initialization also preserves invalid-input errors. Claims preserve resource exhaustion before directory creation or rename and leave the ready job available for retry.
+- `steadq work` stops its payload feeder when the direct child exits, even if a descendant retains stdin. Nonblocking writes keep cancellation bounded; write errors other than a broken pipe fail delivery. Child completion wakes the worker immediately while renewal continues on timed waits.
+- Verified payload readers report corruption on premature EOF after verification. Chunked and streaming lease reads share that reader, including its corruption handling, and use the authenticated header rather than rereading it after verification.
+- `fsck` streams directory entries instead of allocating a whole-directory listing. Unexpected directories below shard level report an incomplete scan with Error severity, including in repair mode. Regression tests cover stream read errors, disappearing entries, and repair across directory buffers.
+
 - `steadq fsck` reports a directory it cannot open or list as an Error-severity `directory_scan_incomplete` finding instead of silently skipping the subtree and reporting the queue clean; one depth-driven walker replaces the separate state and leased walkers. A bucket or shard that a concurrent retention pass removed between the listing and the open is skipped without a finding. An object file above its shard level is verified and fails closed as before; a `.rct` inside a legacy `leased/` shard, previously a warning, is now verified the same way
 - `list_quarantine`, `remove_quarantine`, and `export_quarantine` are fd-relative with `O_NOFOLLOW` like the rest of the crate; a symlink planted under `quarantine/` is listed but never followed, so remove unlinks the link and export fails
 - Recovery quarantines a delayed or receipt object whose filename does not parse, the policy the lease reaper already applied; promotion previously skipped such names silently every pass and retention only recorded them
@@ -72,6 +79,9 @@
 
 ### Performance
 
+- Waiting directly for child completion removes the worker's 50 ms polling delay. Three-run median for 50 one-byte jobs running `true`, with one fresh worker process per job, improved from 2.749174 s to 0.237821 s on the same ZFS host with a debug build. Timing excludes initialization and enqueueing. Reproduce with `cargo build -p steadq-cli && python3 crates/steadq-cli/benches/work.py target/debug/steadq`; this measures CLI dispatch, not core queue throughput.
+- The new `fsck/4096` Criterion benchmark measured 30.647 ms before directory streaming and 28.671 ms after on the same host, with 1 s warm-up, 3 s measurement, and 10 samples. The difference was not statistically significant (p = 0.28); the change removes whole-directory allocation without claiming a scan speedup.
+
 - Re-measured completed-job throughput on the README Intel ext4 NVMe after same-directory lease: strict 2,679/s, deferred sync-every-job 3,463/s, deferred batch-10 3,229/s, deferred batch-50 3,453/s. Concurrent 64 B is 2,816/5,633/8,177 jobs/s at 1/4/8 threads. A warm job that does not advance the watermark issues 6 `fsync`; lease still dest-syncs and source-syncs the ready shard.
 
 ### Core
@@ -94,7 +104,9 @@
 
 ### Testing
 
-- 706 tests: unit, fault injection, differential, and formal model checking
+- 760 tests: unit, fault injection, differential, and formal model checking
+- The verifier follow-up passed 759 tests with one ignored, Clippy, formatting, and generated-artifact checks. Read-count regressions verify early rejection; manually removing payload hashing makes the payload tests fail. Its three generated mutations were unviable because verified witness types deliberately have no `Default` implementation.
+- This fix pass passed the workspace format, Clippy, protocol/generated-artifact, and C-header checks, with 758 tests passing and one ignored. Diff-scoped core mutation testing caught all 16 viable mutations; two additional mutations did not compile. AddressSanitizer smoke runs completed 1,000 operation sequences, 1,000 queue-corruption inputs, and 2,000 resolver inputs; leak detection was disabled because the sandbox blocks LeakSanitizer's process inspection.
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request

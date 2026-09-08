@@ -20,6 +20,7 @@ steadq-fs-linux = { path = "../steadq-fs-linux" }
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

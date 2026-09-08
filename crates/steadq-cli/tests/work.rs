@@ -123,3 +123,60 @@ fn work_once_on_empty_queue_exits_zero() {
         out_stderr(&out)
     );
 }
+
+#[test]
+fn work_once_feeds_payload_larger_than_pipe_capacity() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_queue(tmp.path());
+    let payload = "payload\n".repeat(32 * 1024);
+    put_payload(tmp.path(), &payload);
+    let out = work(tmp.path(), &["--once"], &["cat"]);
+    assert!(out.status.success(), "work failed: {}", out_stderr(&out));
+    assert_eq!(out.stdout, payload.as_bytes());
+    assert!(lease_is_empty(tmp.path()));
+}
+
+#[test]
+fn work_once_does_not_wait_for_descendant_holding_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_queue(tmp.path());
+    put_payload(tmp.path(), &"x".repeat(1024 * 1024));
+    let pid_file = tmp.path().join("descendant.pid");
+    let mut worker = steadq()
+        .arg("work")
+        .arg(tmp.path())
+        .args(["--once", "--", "sh", "-c"])
+        .arg("sleep 10 <&0 & echo $! > \"$1\"")
+        .arg("worker")
+        .arg(&pid_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = worker.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if status.is_none() {
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+    }
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(
+        status.is_some(),
+        "worker waited for descendant holding stdin"
+    );
+    assert!(status.unwrap().success());
+    assert!(lease_is_empty(tmp.path()));
+}

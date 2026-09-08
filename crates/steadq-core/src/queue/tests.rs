@@ -3619,7 +3619,7 @@ fn verify_lease_payload_detects_corruption() {
 // ===== streaming payload read =====
 #[test]
 fn verified_payload_reader_reads_sequential_and_random_access() {
-    let (_tmp, mut queue) = create_test_queue();
+    let (tmp, mut queue) = create_test_queue();
     let payload: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
     queue.enqueue(EnqueueInput {
         maximum_attempts: 3,
@@ -3664,6 +3664,18 @@ fn verified_payload_reader_reads_sequential_and_random_access() {
 
     // Read past end returns 0.
     assert_eq!(reader.read_at(&mut tail, 100_000).unwrap(), 0);
+    assert_eq!(reader.read_at(&mut [], 0).unwrap(), 0);
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp.path().join(&lease.exact_source_path))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(matches!(
+        reader.read_at(&mut tail, 0),
+        Err(Error::QueueCorrupt(_))
+    ));
 }
 
 #[test]
@@ -5865,6 +5877,8 @@ fn p0_01_stream_zero_and_boundary_payloads_verify() {
         let mut out = Vec::new();
         queue
             .stream_lease_payload(&lease, 8192, |chunk| {
+                assert!(!chunk.is_empty());
+                assert!(out.len() + chunk.len() <= len);
                 out.extend_from_slice(chunk);
                 Ok(())
             })
@@ -7612,4 +7626,112 @@ fn ack_read_failure_before_rename_does_not_poison() {
         saw_read_failure,
         "the final pread of the ack did not fail as an unpoisoned read error"
     );
+}
+
+#[test]
+fn streaming_enqueue_bounds_reads_and_retries_interrupted() {
+    struct InterruptedOnce {
+        interrupted: bool,
+        payload: io::Cursor<Vec<u8>>,
+    }
+    impl io::Read for InterruptedOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            io::Read::read(&mut self.payload, buffer)
+        }
+    }
+
+    for named_fallback in [false, true] {
+        for length in [0, 1024, 2048] {
+            let tmp = TempDir::new().unwrap();
+            Queue::init(
+                tmp.path(),
+                &CreateOptions {
+                    max_payload_length: 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut queue = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if named_fallback {
+                queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+            }
+            let mut reader = InterruptedOnce {
+                interrupted: false,
+                payload: io::Cursor::new(vec![42; length]),
+            };
+            let result = queue.enqueue_streaming(
+                3,
+                "x".into(),
+                Default::default(),
+                None,
+                None,
+                None,
+                &mut reader,
+            );
+            if length > 1024 {
+                assert!(
+                    matches!(
+                        result,
+                        EnqueueOutcome::NotCommitted(_, Error::InvalidInput(_))
+                    ),
+                    "{result:?}"
+                );
+                assert_eq!(reader.payload.position(), 1025);
+                assert!(matches!(
+                    queue.lease(0, 30_000_000_000),
+                    LeaseOutcome::Empty
+                ));
+            } else {
+                assert!(matches!(result, EnqueueOutcome::Committed(_)), "{result:?}");
+                let LeaseOutcome::Leased(lease) = queue.lease(0, 30_000_000_000) else {
+                    panic!("streamed payload was not delivered");
+                };
+                assert_eq!(lease.payload_length, length as u64);
+            }
+            assert!(!queue.is_poisoned());
+        }
+    }
+}
+
+#[test]
+fn claim_preserves_resource_exhaustion_before_rename() {
+    for errno in [libc::ENOSPC, libc::EDQUOT] {
+        for fault in ["mkdirat", "renameat2_noreplace"] {
+            let (tmp, mut queue) = create_test_queue();
+            let EnqueueOutcome::Committed(ticket) = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"payload".to_vec(),
+                ..Default::default()
+            }) else {
+                panic!("enqueue failed");
+            };
+            queue.known_dirs.borrow_mut().clear();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, errno);
+            let result = queue.lease(0, 30_000_000_000);
+            fs::fault::reset();
+            assert!(
+                matches!(result, LeaseOutcome::NotCommitted(Error::ResourceExhausted)),
+                "{fault}: {result:?}"
+            );
+            assert!(tmp.path().join(ticket.expected_relative_path).exists());
+            assert!(!queue.is_poisoned());
+            assert!(matches!(
+                queue.lease(0, 30_000_000_000),
+                LeaseOutcome::Leased(_)
+            ));
+        }
+    }
 }

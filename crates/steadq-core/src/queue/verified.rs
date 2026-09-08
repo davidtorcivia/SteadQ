@@ -310,7 +310,7 @@ pub(crate) fn verify_receipt_on_fd(
         }
         VerifiedReceiptKind::Compact
     } else {
-        let job = verify_job_on_fd(fd)?;
+        let job = verify_envelope_on_fd(fd)?;
         if !full_path_fields_match(&job.header, &name) {
             return Err(VerificationError::Corrupt(
                 "full receipt header does not match its path".into(),
@@ -328,6 +328,7 @@ pub(crate) fn verify_receipt_on_fd(
                 ));
             }
         }
+        verify_payload(fd, &job.header, job.extension.len())?;
         VerifiedReceiptKind::Full(job)
     };
 
@@ -343,26 +344,9 @@ pub(crate) fn verify_receipt_on_fd(
 /// Verify the envelope and payload on an already-open fd. The fd must remain
 /// open across any subsequent operation to prevent TOCTOU swap.
 pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
-    let owned = fd
-        .try_clone_to_owned()
-        .map_err(|e| VerificationError::Io(e.to_string()))?;
-    let header = read_and_verify_header(fd)?;
-    let stat = verify_size(fd, &header, header.extension_header_length as usize)?;
-    verify_payload(fd, &header, header.extension_header_length as usize)?;
-    let ext = read_extension(fd, header.extension_header_length as usize)?;
-    if !steadq_format::verify_envelope_digest(&header, &ext) {
-        return Err(VerificationError::Corrupt(
-            "envelope digest mismatch".into(),
-        ));
-    }
-    Ok(VerifiedJob {
-        fd: owned,
-        header,
-        extension: ext,
-        device: stat.st_dev,
-        inode: stat.st_ino,
-        size: file_size(&stat)?,
-    })
+    let job = verify_envelope_on_fd(fd)?;
+    verify_payload(fd, &job.header, job.extension.len())?;
+    Ok(job)
 }
 
 /// Light envelope-only verification (no payload hash). Used for inspection paths
@@ -372,13 +356,13 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
         .try_clone_to_owned()
         .map_err(|e| VerificationError::Io(e.to_string()))?;
     let header = read_and_verify_header(fd)?;
+    let stat = verify_size(fd, &header, header.extension_header_length as usize)?;
     let ext = read_extension(fd, header.extension_header_length as usize)?;
     if !steadq_format::verify_envelope_digest(&header, &ext) {
         return Err(VerificationError::Corrupt(
             "envelope digest mismatch".into(),
         ));
     }
-    let stat = verify_size(fd, &header, ext.len())?;
     Ok(VerifiedJob {
         fd: owned,
         header,
@@ -638,7 +622,11 @@ mod tests {
         file.write_at(b"test", 128).unwrap();
         drop(file);
 
-        let fd = std::fs::File::open(dir.path().join("job.sqj")).unwrap();
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("job.sqj"))
+            .unwrap();
         let verified = verify_job_on_fd(fd.as_fd()).unwrap();
         let stat = fs::fstat(fd.as_fd()).unwrap();
         assert_eq!(verified.device(), stat.st_dev);
@@ -658,6 +646,43 @@ mod tests {
         let witness_stat = fs::fstat(verified.as_fd()).unwrap();
         assert_eq!(witness_stat.st_dev, stat.st_dev);
         assert_eq!(witness_stat.st_ino, stat.st_ino);
+        fd.write_at(&[buf[96] ^ 1], 96).unwrap();
+        fs::fault::reset();
+        fs::fault::inject("pread", u64::MAX);
+        let result = verify_job_on_fd(fd.as_fd());
+        let reads = fs::fault::call_count("pread");
+        fs::fault::reset();
+        assert!(
+            matches!(result, Err(VerificationError::Corrupt(message)) if message == "envelope digest mismatch")
+        );
+        assert_eq!(reads, 1, "invalid envelopes must fail before payload reads");
+    }
+
+    #[test]
+    fn truncated_extension_is_corruption_in_both_verifiers() {
+        let file = tempfile::tempfile().unwrap();
+        let extension = [0xa0];
+        let mut header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
+            extension_header_length: 1,
+            payload_length: 0,
+            flags: 0,
+            digest_algorithm: steadq_format::DIGEST_ALGORITHM_SHA256,
+            job_id: [0; 16],
+            maximum_attempts: 1,
+            created_at_unix_ns: 0,
+            payload_digest: steadq_format::payload_digest(&[]),
+            envelope_digest: [0; 32],
+        };
+        header.envelope_digest = steadq_format::envelope_digest(&header, &extension).unwrap();
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&header.encode(&extension).unwrap(), 0)
+            .unwrap();
+        for verify in [verify_job_on_fd, verify_envelope_on_fd] {
+            assert!(
+                matches!(verify(file.as_fd()), Err(VerificationError::Corrupt(message)) if message.starts_with("file size mismatch"))
+            );
+        }
     }
 
     #[test]
@@ -824,26 +849,55 @@ mod tests {
         bytes.extend_from_slice(payload);
         let path = dir.path().join("legacy-full.rct");
         std::fs::write(&path, bytes).unwrap();
-        let file = std::fs::File::open(path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
 
-        let verified = verify_receipt_on_fd(
-            file.as_fd(),
-            ReceiptContext {
-                queue_id: &queue_id,
-                shard_count,
-                terminal_bucket_width_ns: width,
-                max_payload_length: 1024,
-                bucket: &bucket,
-                shard: &shard,
-                filename: &filename,
-            },
-            Some(&expected),
-        )
-        .unwrap();
+        let context = ReceiptContext {
+            queue_id: &queue_id,
+            shard_count,
+            terminal_bucket_width_ns: width,
+            max_payload_length: 1024,
+            bucket: &bucket,
+            shard: &shard,
+            filename: &filename,
+        };
+        let verified = verify_receipt_on_fd(file.as_fd(), context, Some(&expected)).unwrap();
 
         assert!(matches!(
             verified.kind,
             VerifiedReceiptKind::Full(ref job) if job.header.format_minor == 0
+        ));
+        use std::os::unix::fs::FileExt;
+        for corrupt_payload in [false, true] {
+            if corrupt_payload {
+                file.write_at(b"X", 128).unwrap();
+            }
+            fs::fault::reset();
+            fs::fault::inject("pread", u64::MAX);
+            let result = verify_receipt_on_fd(
+                file.as_fd(),
+                ReceiptContext {
+                    max_payload_length: 4,
+                    ..context
+                },
+                Some(&expected),
+            );
+            let reads = fs::fault::call_count("pread");
+            fs::fault::reset();
+            assert!(
+                matches!(result, Err(VerificationError::Corrupt(message)) if message == "full receipt payload length exceeds queue limit")
+            );
+            assert_eq!(
+                reads, 2,
+                "oversized receipts must fail before payload reads"
+            );
+        }
+        assert!(matches!(
+            verify_receipt_on_fd(file.as_fd(), context, Some(&expected)),
+            Err(VerificationError::PayloadCorrupt)
         ));
     }
 

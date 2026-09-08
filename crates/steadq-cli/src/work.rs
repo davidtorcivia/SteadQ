@@ -4,9 +4,12 @@
 // the job re-runs (at-least-once).
 
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use steadq_core::{
     AckOutcome, LeaseInfo, LeaseOutcome, OpenOptions, Queue, RenewOutcome, TransitionOutcome,
@@ -124,17 +127,35 @@ fn run_one(
         }
     };
 
-    let stdin = child.stdin.take();
-    let feeder = std::thread::spawn(move || feed(reader, stdin));
-    let status = babysit(queue, &mut lease, &mut child, lease_duration_ns);
-    // true when the payload was fully delivered (or the child stopped
-    // reading); false on a read failure, which must not ack.
-    let fed = feeder.join().unwrap_or(false);
+    let stdin = child.stdin.take().expect("piped stdin");
+    let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        eprintln!(
+            "configure stdin failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        return requeue(queue, &lease).max(6);
+    }
+    let stopped = AtomicBool::new(false);
+    let (status, fed) = std::thread::scope(|scope| {
+        let feeder = scope.spawn(|| feed(reader, stdin, &stopped));
+        let status = babysit(queue, &mut lease, &mut child, lease_duration_ns);
+        if status.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        stopped.store(true, Ordering::Relaxed);
+        (status, feeder.join().unwrap_or(false))
+    });
 
     match status {
         Ok(status) if status.success() && fed => finish(queue, &lease),
         Ok(status) if status.success() => {
-            eprintln!("payload read failed; job requeued");
+            eprintln!("payload delivery failed; job requeued");
             requeue(queue, &lease).max(1)
         }
         Ok(status) => {
@@ -148,25 +169,47 @@ fn run_one(
     }
 }
 
-/// Stream the verified payload into the child's stdin. Returns true when
-/// the whole payload was delivered or the child stopped reading (EPIPE
-/// after an early exit); false on a read failure, which leaves the payload
-/// truncated and must not be acked.
-fn feed(reader: VerifiedPayloadReader, stdin: Option<std::process::ChildStdin>) -> bool {
-    let Some(mut stdin) = stdin else { return true };
+/// Stop feeding when the direct child exits, even if a descendant retains stdin.
+fn feed(
+    reader: VerifiedPayloadReader,
+    mut stdin: std::process::ChildStdin,
+    stopped: &AtomicBool,
+) -> bool {
     let mut buf = vec![0u8; CHUNK];
     let mut offset = 0u64;
     loop {
-        match reader.read_at(&mut buf, offset) {
+        let n = match reader.read_at(&mut buf, offset) {
             Ok(0) => return true,
-            Ok(n) => {
-                if stdin.write_all(&buf[..n]).is_err() {
-                    return true;
-                }
-                offset += n as u64;
-            }
+            Ok(n) => n,
             Err(_) => return false,
+        };
+        let mut written = 0;
+        while written < n {
+            if stopped.load(Ordering::Relaxed) {
+                return true;
+            }
+            match stdin.write(&buf[written..n]) {
+                Ok(0) => return false,
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return true,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd {
+                        fd: stdin.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let result = unsafe { libc::poll(&mut fd, 1, POLL.as_millis() as i32) };
+                    if result < 0
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
         }
+        offset += n as u64;
     }
 }
 
@@ -180,17 +223,26 @@ fn babysit(
     lease_duration_ns: u64,
 ) -> std::io::Result<ExitStatus> {
     let renew_every = Duration::from_nanos(lease_duration_ns / 2);
-    let mut next_renew = Instant::now() + renew_every;
-    let mut renewing = true;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        if renewing && Instant::now() >= next_renew {
+    std::thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        scope.spawn(move || {
+            let _ = sender.send(child.wait());
+        });
+        let mut renewing = true;
+        loop {
+            match receiver.recv_timeout(renew_every) {
+                Ok(status) => return status,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("child wait thread disconnected"));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if !renewing {
+                continue;
+            }
             match queue.renew(lease, lease_duration_ns) {
                 RenewOutcome::Renewed(fresh) | RenewOutcome::Deferred(fresh) => {
                     *lease = fresh;
-                    next_renew = Instant::now() + renew_every;
                 }
                 RenewOutcome::LeaseLost => {
                     eprintln!("lease lost; letting the job finish without renewal");
@@ -198,7 +250,6 @@ fn babysit(
                 }
                 RenewOutcome::NotCommitted(e) => {
                     eprintln!("renew failed: {e}; retrying next interval");
-                    next_renew = Instant::now() + renew_every;
                 }
                 RenewOutcome::OutcomeUnknown(ticket) => {
                     eprintln!(
@@ -209,8 +260,7 @@ fn babysit(
                 }
             }
         }
-        std::thread::sleep(POLL);
-    }
+    })
 }
 
 /// Acknowledge a finished job. Exit 0 on ack; the ack's own outcome decides

@@ -93,13 +93,18 @@ impl VerifiedPayloadReader {
     /// Read payload bytes at the given offset into buf.
     /// Returns the number of bytes read (0 at EOF).
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
-        if offset >= self.payload_len {
+        if offset >= self.payload_len || buf.is_empty() {
             return Ok(0);
         }
         let to_read = (buf.len() as u64).min(self.payload_len - offset) as usize;
         let abs_offset = self.payload_start + offset;
         let n = fs::pread(self.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
             .map_err(Error::from)?;
+        if n == 0 {
+            return Err(Error::QueueCorrupt(
+                "unexpected EOF during payload read".into(),
+            ));
+        }
         Ok(n)
     }
 

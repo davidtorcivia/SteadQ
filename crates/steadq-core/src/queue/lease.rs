@@ -277,9 +277,10 @@ impl Queue {
                 };
                 let leased_dir = lease_target.directory();
                 if let Err(e) = self.ensure_dir_with_dirty(&leased_dir, _dirty.as_deref_mut()) {
-                    // Propagate real errors, don't mask as scan miss
+                    if matches!(Error::from(e), Error::ResourceExhausted) {
+                        return LeaseOutcome::NotCommitted(Error::ResourceExhausted);
+                    }
                     scan_had_error = true;
-                    let _ = e;
                     continue;
                 }
 
@@ -487,10 +488,14 @@ impl Queue {
                             claim_ticket.with_phase(ticket_phase_for_move_outcome_unknown(phase)),
                         );
                     }
-                    Err(
-                        engine::MoveFailure::AlreadyExists
-                        | engine::MoveFailure::NotCommitted { .. },
-                    ) => {
+                    Err(engine::MoveFailure::NotCommitted { source, .. }) => {
+                        if matches!(Error::from(source), Error::ResourceExhausted) {
+                            return LeaseOutcome::NotCommitted(Error::ResourceExhausted);
+                        }
+                        scan_had_error = true;
+                        continue;
+                    }
+                    Err(engine::MoveFailure::AlreadyExists) => {
                         scan_had_error = true;
                         continue;
                     }

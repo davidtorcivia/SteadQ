@@ -817,14 +817,7 @@ impl Queue {
         match fs::open_tmpfile(dest_fd.as_fd()) {
             Ok(tmp_fd) => {
                 let (payload_len, payload_digest) =
-                    Self::stream_payload_to_fd(tmp_fd.as_fd(), ext_bytes, reader)?;
-
-                // Validate payload size.
-                if payload_len > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
-                    return Err(PublishError::NotCommitted(Error::InvalidInput(
-                        "payload exceeds limit".into(),
-                    )));
-                }
+                    self.stream_payload_to_fd(tmp_fd.as_fd(), ext_bytes, reader)?;
 
                 // Construct and pwrite the real header.
                 let mut header = FixedHeader {
@@ -923,6 +916,7 @@ impl Queue {
     /// Stream payload to a temp fd: write placeholder header, extension, then
     /// payload chunks while hashing. Returns (payload_length, payload_digest).
     fn stream_payload_to_fd(
+        &self,
         fd: BorrowedFd<'_>,
         ext_bytes: &[u8],
         reader: &mut dyn std::io::Read,
@@ -934,19 +928,26 @@ impl Queue {
 
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
+        let limit = self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH);
         let mut buf = vec![0u8; 65536];
         loop {
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+            let to_read = (buf.len() as u64).min(limit - total + 1) as usize;
+            let n = match reader.read(&mut buf[..to_read]) {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(PublishError::NotCommitted(Error::from(error))),
+            };
             if n == 0 {
                 break;
             }
+            total += n as u64;
+            if total > limit {
+                return Err(PublishError::NotCommitted(Error::InvalidInput(
+                    "payload exceeds limit".into(),
+                )));
+            }
             hasher.update(&buf[..n]);
             fs::write_all(fd, &buf[..n]).map_err(PublishError::classify_write)?;
-            total = total.checked_add(n as u64).ok_or_else(|| {
-                PublishError::NotCommitted(Error::InvalidInput("payload length overflow".into()))
-            })?;
         }
         Ok((total, hasher.finalize().into()))
     }
@@ -1061,14 +1062,13 @@ impl Queue {
         // Write placeholder header first, then extension, then payload.
         // After streaming, pwrite real header.
         let (payload_len, payload_digest) =
-            Self::stream_payload_to_fd(tmp_file.as_fd(), ext_bytes, reader)?;
-
-        if payload_len > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
-            let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
-            return Err(PublishError::NotCommitted(Error::InvalidInput(
-                "payload exceeds limit".into(),
-            )));
-        }
+            match self.stream_payload_to_fd(tmp_file.as_fd(), ext_bytes, reader) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
+                    return Err(error);
+                }
+            };
 
         let mut header = FixedHeader {
             format_minor: FORMAT_MINOR,

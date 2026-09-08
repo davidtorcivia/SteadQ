@@ -48,6 +48,9 @@ fn exit_io(error: &std::io::Error) -> ExitCode {
     exit(match error.kind() {
         std::io::ErrorKind::Unsupported => EXIT_UNSUPPORTED,
         std::io::ErrorKind::PermissionDenied => EXIT_PERMISSION,
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            EXIT_RESOURCE_EXHAUSTED
+        }
         std::io::ErrorKind::AlreadyExists
         | std::io::ErrorKind::InvalidInput
         | std::io::ErrorKind::InvalidData
@@ -1687,6 +1690,15 @@ mod tests {
 
     #[test]
     fn exit_codes_follow_spec_table() {
+        for kind in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            assert_eq!(
+                exit_io(&std::io::Error::from(kind)),
+                exit(EXIT_RESOURCE_EXHAUSTED)
+            );
+        }
         assert_eq!(
             exit_core(&Error::InvalidInput("x".into())),
             exit(EXIT_ORDINARY)

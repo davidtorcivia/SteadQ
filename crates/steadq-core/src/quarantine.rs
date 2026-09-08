@@ -271,15 +271,23 @@ impl Queue {
         opts: &FsckOptions,
         report: &mut FsckReport,
     ) {
-        let entries = match fs::read_dir_entries(dir_fd) {
+        let mut entries = match fs::DirectoryStream::open(dir_fd) {
             Ok(entries) => entries,
             Err(error) => {
                 fsck_scan_incomplete(parent_path, &error, report);
                 return;
             }
         };
-        for raw_entry in &entries {
-            let Some(name) = fsck_protocol_name(parent_path, raw_entry, report) else {
+        loop {
+            let raw_entry = match entries.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    fsck_scan_incomplete(parent_path, &error, report);
+                    return;
+                }
+            };
+            let Some(name) = fsck_protocol_name(parent_path, &raw_entry, report) else {
                 continue;
             };
             let path = format!("{parent_path}/{name}");
@@ -288,6 +296,22 @@ impl Queue {
                     report.total_objects += 1;
                     self.fsck_file(dir_fd, state_name, &path, name, opts, report);
                 } else {
+                    match fs::fstatat(dir_fd, name) {
+                        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                            fsck_scan_incomplete(
+                                &path,
+                                &std::io::Error::other("unexpected directory below shard level"),
+                                report,
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            fsck_scan_incomplete(&path, &error, report);
+                            continue;
+                        }
+                    }
                     report.findings.push(CorruptionFinding {
                         relative_path: path,
                         finding_type: "unexpected_entry".into(),
@@ -1301,6 +1325,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fsck_reports_unscanned_directories_below_shards() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let nested = tmp.path().join("ready/0000/nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("hidden.sqj"), b"corrupt").unwrap();
+        let queue = open_test_queue(tmp.path());
+        for mode in [FsckMode::Check, FsckMode::Repair] {
+            let report = queue.fsck(&FsckOptions {
+                mode,
+                ..Default::default()
+            });
+            assert!(report.findings.iter().any(|finding| {
+                finding.relative_path == "ready/0000/nested"
+                    && finding.finding_type == "directory_scan_incomplete"
+                    && finding.severity == FindingSeverity::Error
+            }));
+            assert!(nested.join("hidden.sqj").exists());
+        }
+    }
+
+    #[test]
+    fn fsck_preserves_unknown_entry_stat_errors() {
+        for errno in [libc::ENOENT, libc::EIO] {
+            let tmp = TempDir::new().unwrap();
+            init_test_queue(tmp.path());
+            std::fs::write(tmp.path().join("ready/0000/unknown"), b"x").unwrap();
+            let queue = open_test_queue(tmp.path());
+            fs::fault::reset();
+            fs::fault::inject_errno("fstatat", 1, errno);
+            let report = queue.fsck(&FsckOptions::default());
+            fs::fault::reset();
+            if errno == libc::ENOENT {
+                assert!(report.findings.is_empty(), "{:?}", report.findings);
+            } else {
+                assert_eq!(report.findings.len(), 1);
+                let finding = &report.findings[0];
+                assert_eq!(finding.relative_path, "ready/0000/unknown");
+                assert_eq!(finding.finding_type, "directory_scan_incomplete");
+                assert_eq!(finding.severity, FindingSeverity::Error);
+            }
+        }
+    }
+
+    #[test]
+    fn fsck_repair_streams_across_directory_buffers() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let shard = tmp.path().join("ready/0000");
+        for i in 0..512 {
+            std::fs::write(shard.join(format!("{i:0200}.sqj")), b"corrupt").unwrap();
+        }
+        let queue = open_test_queue(tmp.path());
+        let report = queue.fsck(&FsckOptions {
+            mode: FsckMode::Repair,
+            ..Default::default()
+        });
+        assert_eq!(report.total_objects, 512);
+        assert_eq!(report.quarantined.len(), 512);
+        assert_eq!(std::fs::read_dir(shard).unwrap().count(), 0);
+    }
+
+    #[test]
     fn fsck_walks_the_legacy_leased_tree_three_levels_deep() {
         let tmp = TempDir::new().unwrap();
         init_test_queue(tmp.path());
@@ -1366,6 +1453,8 @@ mod tests {
         for (fault, count, path) in [
             ("open_directory", 1, "ready"),
             ("open_directory", 3, "ready/"),
+            ("directory_stream_next", 1, "ready"),
+            ("directory_stream_next", 2, "ready/"),
         ] {
             let tmp = TempDir::new().unwrap();
             init_test_queue(tmp.path());
