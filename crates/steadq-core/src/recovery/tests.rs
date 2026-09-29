@@ -3281,7 +3281,7 @@ fn recovery_quarantines_malformed_leased_filename() {
         stats.errors
     );
     assert!(queue
-        .list_quarantine()
+        .list_quarantine().unwrap()
         .iter()
         .any(|entry| entry.reason == crate::QuarantineReason::FilenameParseFailed as u16));
     assert!(!dir.join("not-a-leased-name.sqj").exists());
@@ -4260,7 +4260,7 @@ fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
         .any(|error| error.operation == "receipt_compact_invalid"));
     assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
     assert!(!receipt.exists());
-    let quarantined = queue.list_quarantine();
+    let quarantined = queue.list_quarantine().unwrap();
     assert_eq!(quarantined.len(), 1);
     assert_eq!(
         quarantined[0].reason,
@@ -4871,7 +4871,7 @@ fn promote_quarantines_a_malformed_delayed_name() {
         stats.errors
     );
     assert!(!stray.exists());
-    assert_eq!(queue.list_quarantine().len(), 1);
+    assert_eq!(queue.list_quarantine().unwrap().len(), 1);
 }
 
 #[test]
@@ -4893,7 +4893,7 @@ fn receipt_retention_quarantines_a_malformed_receipt_name() {
         stats.errors
     );
     assert!(!stray.exists());
-    assert_eq!(queue.list_quarantine().len(), 1);
+    assert_eq!(queue.list_quarantine().unwrap().len(), 1);
 }
 
 fn reap_expired_with_scan_budget(
