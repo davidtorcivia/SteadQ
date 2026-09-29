@@ -83,7 +83,7 @@ impl Queue {
     fn lease_once_with_dirty(
         &mut self,
         lease_duration_ns: u64,
-        mut _dirty: Option<&mut engine::DirtySet>,
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> LeaseOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return LeaseOutcome::NotCommitted(e);
@@ -276,7 +276,7 @@ impl Queue {
                     }
                 };
                 let leased_dir = lease_target.directory();
-                if let Err(e) = self.ensure_dir_with_dirty(&leased_dir, _dirty.as_deref_mut()) {
+                if let Err(e) = self.ensure_dir_with_dirty(&leased_dir, dirty.as_deref_mut()) {
                     if matches!(Error::from(e), Error::ResourceExhausted) {
                         return LeaseOutcome::NotCommitted(Error::ResourceExhausted);
                     }
@@ -306,6 +306,21 @@ impl Queue {
                     Ok(None) => continue,
                     Err(Error::IoFailure(_)) => {
                         scan_had_error = true;
+                        continue;
+                    }
+                    // A corrupt object is never delivered. Move it aside as
+                    // recovery would and keep scanning for a deliverable job.
+                    Err(Error::QueueCorrupt(_)) => {
+                        if self
+                            .publish_quarantine_object(
+                                shard_fd.as_fd(),
+                                entry,
+                                QuarantineReason::EnvelopeCorrupt,
+                            )
+                            .is_err()
+                        {
+                            scan_had_error = true;
+                        }
                         continue;
                     }
                     Err(error) => return LeaseOutcome::NotCommitted(error),
@@ -340,7 +355,7 @@ impl Queue {
                     }
                 }
 
-                let move_result = if _dirty.is_some() {
+                let move_result = if dirty.is_some() {
                     let result = engine::move_witnessed_noreplace_deferred(
                         shard_fd.as_fd(),
                         entry,
@@ -367,7 +382,7 @@ impl Queue {
                         },
                     );
                     if result.is_ok() {
-                        if let Some(d) = _dirty.as_deref_mut() {
+                        if let Some(d) = dirty.as_deref_mut() {
                             if d.record(shard_fd.as_fd())
                                 .and_then(|()| d.record(leased_dir_fd.as_fd()))
                                 .is_err()

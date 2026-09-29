@@ -1996,30 +1996,6 @@ fn claim_source_evidence_detects_in_place_header_change() {
 }
 
 #[test]
-fn lease_reports_ready_header_corruption_without_flattening() {
-    let (tmp, mut queue) = create_test_queue();
-    let enqueue = match queue.enqueue(EnqueueInput {
-        maximum_attempts: 3,
-        content_type: "text/plain".to_string(),
-        payload: b"corrupt claim".to_vec(),
-        ..Default::default()
-    }) {
-        EnqueueOutcome::Committed(ticket) => ticket,
-        outcome => panic!("expected committed enqueue, got {outcome:?}"),
-    };
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(tmp.path().join(enqueue.expected_relative_path))
-        .unwrap();
-    file.write_at(&[0xff], 0).unwrap();
-
-    assert!(matches!(
-        queue.lease(0, 30_000_000_000),
-        LeaseOutcome::NotCommitted(Error::QueueCorrupt(_))
-    ));
-}
-
-#[test]
 fn enqueue_delayed() {
     let (_tmp, mut queue) = create_test_queue();
     let future = fs::clock_realtime_ns().unwrap() + 60_000_000_000; // 60s in future
@@ -8251,4 +8227,46 @@ fn named_streaming_publication_removes_its_temp_when_nothing_committed() {
         );
         assert_eq!(temp_names(&tmp, &queue), Vec::<PathBuf>::new(), "{fault}");
     }
+}
+
+fn corrupt_ready_job(tmp: &TempDir, queue: &mut Queue) -> PathBuf {
+    let (dir, name) = first_ready_job(tmp, queue);
+    let path = tmp.path().join(dir).join(name);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // Flip a byte of the envelope digest, the last field of the fixed header.
+    file.write_at(&[0xA5], 127).unwrap();
+    path
+}
+
+fn quarantine_count(tmp: &TempDir) -> usize {
+    std::fs::read_dir(tmp.path().join("quarantine"))
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn lease_quarantines_an_envelope_corrupt_ready_object_and_keeps_scanning() {
+    let (tmp, mut queue) = create_test_queue();
+    let corrupt = corrupt_ready_job(&tmp, &mut queue);
+    let outcome = queue.lease(0, 30_000_000_000);
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert!(!corrupt.exists());
+    assert_eq!(quarantine_count(&tmp), 1);
+    assert!(!queue.is_poisoned());
+}
+
+#[test]
+fn lease_reports_a_failed_quarantine_as_a_scan_error() {
+    let (tmp, mut queue) = create_test_queue();
+    let corrupt = corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject("renameat2_noreplace", 1);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, LeaseOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
+    assert!(corrupt.exists());
+    assert_eq!(quarantine_count(&tmp), 0);
 }
