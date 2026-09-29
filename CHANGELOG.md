@@ -9,6 +9,10 @@
 - Renewals defer their directory barrier under `deferred_dir_sync`, returning `RenewOutcome::Deferred` with current lease info; `sync()` flushes accumulated barriers for workers renewing many leases, an ack makes the renewal durable through its own barriers, and a crash before sync simply expires the lease (at-least-once). `steadq work` opens with deferred sync so each renewal is a rename with no fsync
 - The bounded lease wait wakes on ready-shard inotify events (`IN_CREATE` for linkat publication, `IN_MOVED_TO` for rename publication and delayed promotion); the scan remains the sole source of truth, the backoff schedule is unchanged, and any watch failure degrades the handle permanently to plain sleeps. Idle dispatch latency on the measurement host drops from the 10 ms backoff ceiling to a 377 µs median
 - `steadq stats --prometheus` emits per-state `steadq_<state>_objects` and `steadq_<state>_oldest_age_seconds` gauges; plain and `--json` stats outputs gain oldest-object age. The oldest age is the global minimum across subtrees, and an unreadable state directory exits with the io code instead of reporting zero objects
+- `steadq_renew(queue, lease, duration_ns)` in the C ABI extends a lease and updates the handle in place; lease lost is `STEADQ_NOT_COMMITTED` with "lease lost", and an indeterminate renewal leaves its ticket in `steadq_last_ticket_json`. The header documents return codes, the lease-lost case, and the ticket contract for every transition instead of "See steadq.h"
+- `steadq ack`, `retry`, and `bury` take `--ticket-out PATH` like `lease`, so an exit 2 leaves a ticket for `steadq resolve`; `steadq work` prints the ticket JSON on stderr for any indeterminate lease, renew, ack, or retry. `put` has no transition ticket to save and still prints the job id and expected path
+- `steadq work` passes `STEADQ_JOB_ID` and `STEADQ_ATTEMPT` to the child. SIGTERM or SIGINT stops leasing, forwards SIGTERM to running children, requeues or acks each on its exit, and exits 0; a second signal exits at once
+- `steadq bench --allow-nonempty` is required to bench a queue that holds ready, leased, or delayed jobs
 
 ### Documentation
 
@@ -76,6 +80,19 @@
 - Claim of a corrupt payload that cannot be quarantined is OutcomeUnknown, not NotCommitted
 - `renew` returns NotCommitted instead of panicking when lease-bucket arithmetic is exhausted
 - Recovery quarantines malformed leased filenames instead of skipping them
+- `steadq bench` no longer leases and acks jobs already in the target queue: it refuses a queue with ready, leased, or delayed jobs and exits 1 unless `--allow-nonempty` is given
+- `steadq work` checks the command on PATH before the first lease and exits 127 if it is missing or not executable, instead of requeueing every job until its attempts ran out. A spawn failure after that requeues the one job, which consumes one of its attempts, and exits the worker with 127
+- `steadq work` sets `PR_SET_PDEATHSIG` to SIGKILL in the child, so killing the worker no longer leaves the command running while its lease expires and the job runs again elsewhere
+- `steadq work` keeps polling on transient lease errors (maintenance busy, I/O failure, resource exhaustion, invalid clock) instead of exiting the worker; it still exits on corruption, a poisoned handle, permission, unsupported filesystem or format, and invalid input
+- `steadq work` retries a failed renewal every min(T/8, 1 s) instead of waiting another T/2, which reached expiry, so one transient renew error no longer loses the lease. `--once` reports a child killed by signal N as 128+N instead of 1
+- `steadq lease` without `--handle-file` prints the handle JSON on stdout (summary lines move to stderr) instead of consuming an attempt with no way to ack or retry it
+- `steadq stats` counts a live lease, which keeps its file in `ready/<shard>/` under a leased name, as leased instead of ready; the legacy `leased/` tree still counts. A directory or entry removed mid-walk by recovery is absent instead of failing stats with exit 6
+- `steadq admin compact-receipts` repeats recovery passes while the budget runs out (up to 1000) and exits 6 on recovery errors or an unfinished pass instead of 0 after one pass; its help says it runs full recovery
+- `steadq bury --reason` accepts 0-4 or the registry names and exits 1 listing them for anything else, instead of burying with reason unspecified
+- Lease handles record the canonical queue root, and `ack`, `retry`, and `bury` reject a handle issued for a different root (a copied queue keeps its queue id and leased files). An unparsable or truncated handle file exits 1 with "invalid handle file" instead of 6
+- `steadq doctor` exits 64 when the filesystem is not supported instead of 6; `steadq verify` prints record fields on stdout like `format-dump`; the global `--json` help says it applies to `stats` and `doctor` only; `inspect` and `stats` open through `open_or_exit`
+- C `steadq_lease` on an empty queue and `steadq_lease_open_reader` on a lease whose file is gone set `steadq_last_error` ("queue empty", "lease no longer current") instead of leaving it NULL. `steadq_bury` rejects a reason outside 0-4 with `STEADQ_NOT_COMMITTED` instead of truncating it to 16 bits and burying as unspecified. `steadq_init` and `steadq_open` accept non-UTF-8 paths, and a failed `steadq_init` keeps the system error text after the error class
+
 
 ### Performance
 
@@ -97,7 +114,7 @@
 ### C ABI
 
 - Opaque queue, lease, and payload reader handles
-- Full lifecycle: init, open, enqueue, lease, verify, ack, retry, bury, recover, resolve
+- Full lifecycle: init, open, enqueue, lease, renew, verify, ack, retry, bury, recover, resolve
 - Payload streaming via verified reader
 - Ticket-based resolution of indeterminate operations
 - Generated header via cbindgen with CI drift check
