@@ -171,3 +171,20 @@ fn count_recursive(path: &std::path::Path) -> usize {
         })
         .unwrap_or(0)
 }
+
+#[test]
+fn dead_admin_reports_a_missing_job_as_ordinary_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_queue(tmp.path());
+    let root = tmp.path().to_string_lossy().into_owned();
+    let job_id = "00".repeat(16);
+    let output = tmp.path().join("out.bin").to_string_lossy().into_owned();
+    for args in [
+        vec!["admin", "dead-remove", &root, &job_id],
+        vec!["admin", "dead-export", &root, &job_id, &output],
+    ] {
+        let out = steadq().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+    }
+}

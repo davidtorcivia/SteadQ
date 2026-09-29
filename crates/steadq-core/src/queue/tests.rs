@@ -2551,7 +2551,7 @@ fn retry_with_policy_works() {
     let policy = steadq_math::RetryPolicy::new(1000, 300_000, false, None).unwrap();
     let result = queue.retry_with_policy(&lease, &policy);
     assert!(matches!(result, TransitionOutcome::Committed));
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "delayed");
 }
@@ -2569,7 +2569,7 @@ fn inspect_finds_ready_job() {
         _ => panic!("enqueue failed"),
     };
 
-    let snapshots = queue.inspect(&ticket.job_id);
+    let snapshots = queue.inspect(&ticket.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "ready");
     assert_eq!(snapshots[0].generation, 0);
@@ -2589,7 +2589,7 @@ fn inspect_finds_leased_job() {
         _ => panic!("lease failed"),
     };
 
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "leased");
 }
@@ -2621,7 +2621,7 @@ fn duplicate_ack_returns_already_acked() {
 fn inspect_returns_empty_for_unknown() {
     let (_tmp, queue) = create_test_queue();
     let unknown_id = [0xFF; 16];
-    let snapshots = queue.inspect(&unknown_id);
+    let snapshots = queue.inspect(&unknown_id).unwrap();
     assert!(snapshots.is_empty());
 }
 #[test]
@@ -2866,7 +2866,7 @@ fn enqueue_survives_reopen() {
         },
     )
     .unwrap();
-    let snapshots = queue2.inspect(&ticket.job_id);
+    let snapshots = queue2.inspect(&ticket.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "ready");
 }
@@ -4368,6 +4368,7 @@ fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
         .commit_or_panic();
     let dead_snapshot = dead_queue
         .inspect(&dead_lease.job_id)
+        .unwrap()
         .into_iter()
         .find(|snapshot| snapshot.state == "dead")
         .unwrap();
@@ -4397,6 +4398,7 @@ fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
     ));
     let receipt_snapshot = receipt_queue
         .inspect(&receipt_lease.job_id)
+        .unwrap()
         .into_iter()
         .find(|snapshot| snapshot.state == "receipt")
         .unwrap();
@@ -6149,17 +6151,18 @@ fn export_dead_copies_file_content_through_core() {
     queue.bury(&lease, DeadReason::AdministrativeBury);
 
     let output = tmp.path().join("exported.bin");
-    let n = queue.export_dead(&lease.job_id, &output).unwrap();
+    let n = queue.export_dead(&lease.job_id, &output).unwrap().unwrap();
     assert!(n > b"dead job payload".len() as u64);
     let data = std::fs::read(&output).unwrap();
     assert!(data.ends_with(b"dead job payload"));
 }
 
 #[test]
-fn export_dead_returns_error_for_missing_job() {
-    let (_tmp, queue) = create_test_queue();
-    let result = queue.export_dead(&[0xFF; 16], std::path::Path::new("/tmp/nonexistent"));
-    assert!(result.is_err());
+fn export_dead_reports_a_missing_job_as_none() {
+    let (tmp, queue) = create_test_queue();
+    let output = tmp.path().join("nonexistent");
+    assert_eq!(queue.export_dead(&[0xFF; 16], &output), Ok(None));
+    assert!(!output.exists());
 }
 
 #[test]
@@ -6182,7 +6185,7 @@ fn remove_dead_deletes_file_through_core() {
     );
 
     // Job should be in dead.
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert!(snapshots.iter().any(|s| s.state == "dead"));
 
     // Remove it.
@@ -6190,11 +6193,11 @@ fn remove_dead_deletes_file_through_core() {
     assert!(removed);
 
     // Job should be gone.
-    let snapshots2 = queue.inspect(&lease.job_id);
+    let snapshots2 = queue.inspect(&lease.job_id).unwrap();
     assert!(snapshots2.is_empty());
 
-    // Remove again returns error (not found by inspect).
-    assert!(queue.remove_dead(&lease.job_id).is_err());
+    // Removing it again finds nothing.
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(false));
 
     drop(tmp);
 }
@@ -6435,7 +6438,7 @@ fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
     };
     let wall_floor = queue.authenticated_wall_floor().unwrap();
     let before = queue.check_duplicate_ack_bounded(&lease, wall_floor);
-    assert!(!before, "no receipt yet, duplicate check must be false");
+    assert_eq!(before, Ok(false), "no receipt yet");
     queue.verify_lease_payload(&lease).unwrap();
     let ack = queue.ack(&lease);
     assert!(
@@ -6443,7 +6446,7 @@ fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
         "ack must succeed, got {ack:?}"
     );
     let after = queue.check_duplicate_ack_bounded(&lease, wall_floor);
-    assert!(after, "after ack, duplicate check must be true");
+    assert_eq!(after, Ok(true), "after ack");
 }
 
 #[test]
@@ -6512,7 +6515,7 @@ fn oracle_driven_closed_loop() {
                 if let EnqueueOutcome::Committed(ticket) = outcome {
                     oracle.insert(ticket.job_id, State::Ready);
                     // Reconcile: inspect must see a ready object for this id.
-                    let snaps = queue.inspect(&ticket.job_id);
+                    let snaps = queue.inspect(&ticket.job_id).unwrap();
                     assert!(
                         snaps.iter().any(|s| s.state == "ready"),
                         "oracle Ready not reflected by inspect for {}",
@@ -6525,7 +6528,7 @@ fn oracle_driven_closed_loop() {
                     let id = l.job_id;
                     oracle.insert(id, State::Leased);
                     leases.insert(id, l);
-                    let snaps = queue.inspect(&id);
+                    let snaps = queue.inspect(&id).unwrap();
                     assert!(
                         snaps.iter().any(|s| s.state == "leased"),
                         "oracle Leased not reflected by inspect"
@@ -6544,7 +6547,7 @@ fn oracle_driven_closed_loop() {
                         match queue.ack(&lease) {
                             AckOutcome::Acked | AckOutcome::AlreadyAcked => {
                                 oracle.insert(job_id, State::Acked);
-                                let snaps = queue.inspect(&job_id);
+                                let snaps = queue.inspect(&job_id).unwrap();
                                 assert!(
                                     snaps.iter().any(|s| s.state == "receipt")
                                         || snaps.is_empty()
@@ -6571,7 +6574,7 @@ fn oracle_driven_closed_loop() {
                         }
                     } else if let TransitionOutcome::Committed = queue.retry_now(&l) {
                         leases.remove(&id);
-                        let snaps = queue.inspect(&id);
+                        let snaps = queue.inspect(&id).unwrap();
                         // retry_now moves to ready, or to dead when
                         // attempts are exhausted.
                         if snaps.iter().any(|s| s.state == "ready") {
@@ -6604,7 +6607,7 @@ fn oracle_driven_closed_loop() {
     for (id, state) in &oracle {
         match state {
             State::Ready => {
-                let snaps = queue.inspect(id);
+                let snaps = queue.inspect(id).unwrap();
                 // May have been leased later without oracle update if we only
                 // track transitions we apply; re-check live state.
                 let live_ready = snaps.iter().any(|s| s.state == "ready");
@@ -6616,7 +6619,7 @@ fn oracle_driven_closed_loop() {
                 );
             }
             State::Leased => {
-                let snaps = queue.inspect(id);
+                let snaps = queue.inspect(id).unwrap();
                 assert!(
                     snaps.iter().any(|s| s.state == "leased")
                         || snaps.iter().any(|s| s.state == "ready")
@@ -7562,6 +7565,7 @@ fn list_dead_returns_authenticated_dead_objects_only() {
     ));
     let expected: Vec<_> = queue
         .inspect(&lease.job_id)
+        .unwrap()
         .into_iter()
         .filter(|s| s.state == "dead")
         .collect();
@@ -8093,4 +8097,117 @@ fn export_dead_refuses_an_existing_output_and_a_fifo_source() {
     std::fs::remove_file(&output).unwrap();
     assert!(queue.export_dead(&lease.job_id, &output).is_err());
     assert!(!output.exists());
+}
+
+/// Count `func` calls made by `op`, with a fault armed so counting is on.
+fn count_calls<T>(func: &str, op: impl FnOnce() -> T) -> (T, u64) {
+    fs::fault::reset();
+    fs::fault::inject("clock_monotonic_ns", u64::MAX);
+    let result = op();
+    let calls = fs::fault::call_count(func);
+    fs::fault::reset();
+    (result, calls)
+}
+
+#[test]
+fn inspect_reports_directory_errors_and_treats_missing_ones_as_empty() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+
+    fs::fault::reset();
+    fs::fault::inject("open_directory", 1);
+    let result = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(result, Err(Error::IoFailure(_))), "{result:?}");
+
+    std::fs::remove_dir(tmp.path().join("delayed")).unwrap();
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].state, "dead");
+}
+
+#[test]
+fn dead_admin_io_failure_is_not_reported_as_corruption_or_absence() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let (_, calls) = count_calls("open_directory", || queue.inspect(&lease.job_id).unwrap());
+    for target in 1..=calls {
+        fs::fault::reset();
+        fs::fault::inject("open_directory", target);
+        let removed = queue.remove_dead(&lease.job_id);
+        fs::fault::reset();
+        fs::fault::inject("open_directory", target);
+        let exported = queue.export_dead(&lease.job_id, &tmp.path().join("out"));
+        fs::fault::reset();
+        assert!(
+            matches!(removed, Err(Error::IoFailure(_))),
+            "{target}: {removed:?}"
+        );
+        assert!(
+            matches!(exported, Err(Error::IoFailure(_))),
+            "{target}: {exported:?}"
+        );
+    }
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(true));
+}
+
+#[test]
+fn inspect_and_remove_dead_ignore_an_unauthenticated_dead_name() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let dead = find_file_with_suffix(&tmp.path().join("dead"), ".sqj").unwrap();
+    let shard_dir = dead.parent().unwrap();
+    let shard = shard_dir.file_name().unwrap().to_owned();
+    // The name tag binds the bucket, so the same name under another bucket
+    // does not authenticate.
+    let forged_dir = shard_dir
+        .parent()
+        .unwrap()
+        .with_file_name("ffffffffffffffff")
+        .join(shard);
+    std::fs::create_dir_all(&forged_dir).unwrap();
+    let forged = forged_dir.join(dead.file_name().unwrap());
+    std::fs::rename(&dead, &forged).unwrap();
+
+    assert_eq!(queue.inspect(&lease.job_id), Ok(Vec::new()));
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(false));
+    assert!(forged.exists());
+}
+
+#[test]
+fn inspect_reports_a_receipt_read_failure() {
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let (snapshots, calls) = count_calls("fstat", || queue.inspect(&lease.job_id).unwrap());
+    assert!(snapshots.iter().any(|s| s.state == "receipt"));
+    fs::fault::reset();
+    fs::fault::inject("fstat", calls);
+    let result = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(result, Err(Error::IoFailure(_))), "{result:?}");
+}
+
+#[test]
+fn ack_of_a_vanished_source_reports_receipt_probe_io_failure() {
+    let setup = || {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        std::fs::remove_file(tmp.path().join(&lease.exact_source_path)).unwrap();
+        (tmp, queue, lease)
+    };
+    let (_tmp, mut queue, lease) = setup();
+    let (outcome, calls) = count_calls("openat", || queue.ack(&lease));
+    assert_eq!(outcome, AckOutcome::LeaseLost);
+
+    let (_tmp, mut queue, lease) = setup();
+    fs::fault::reset();
+    fs::fault::inject("openat", calls);
+    let outcome = queue.ack(&lease);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, AckOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
 }

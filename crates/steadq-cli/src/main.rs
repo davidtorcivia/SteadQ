@@ -583,10 +583,6 @@ fn cmd_dead_remove(path: PathBuf, job_id: String) -> ExitCode {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
-        Err(steadq_core::Error::QueueCorrupt(_)) => {
-            eprintln!("not found");
-            exit(EXIT_ORDINARY)
-        }
         Err(e) => {
             eprintln!("remove failed: {e}");
             exit_core(&e)
@@ -604,11 +600,11 @@ fn cmd_dead_export(path: PathBuf, job_id: String, output: PathBuf) -> ExitCode {
         Err(code) => return code,
     };
     match queue.export_dead(&job_id_bytes, &output) {
-        Ok(n) => {
+        Ok(Some(n)) => {
             eprintln!("exported {n} bytes");
             exit(EXIT_SUCCESS)
         }
-        Err(steadq_core::Error::QueueCorrupt(_)) => {
+        Ok(None) => {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
         }
@@ -628,11 +624,14 @@ fn cmd_dead_inspect(path: PathBuf, job_id: String) -> ExitCode {
         Ok(q) => q,
         Err(code) => return code,
     };
-    for s in queue
-        .inspect(&job_id_bytes)
-        .iter()
-        .filter(|s| s.state == "dead")
-    {
+    let snapshots = match queue.inspect(&job_id_bytes) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            eprintln!("inspect failed: {e}");
+            return exit_core(&e);
+        }
+    };
+    for s in snapshots.iter().filter(|s| s.state == "dead") {
         println!(
             "gen={} attempt={}/{} {}",
             s.generation, s.attempt, s.maximum_attempts, s.relative_path
@@ -1059,7 +1058,13 @@ fn cmd_inspect(path: PathBuf, job_id: String) -> ExitCode {
         Ok(q) => q,
         Err(code) => return code,
     };
-    let snapshots = queue.inspect(&job_id_bytes);
+    let snapshots = match queue.inspect(&job_id_bytes) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            eprintln!("inspect failed: {e}");
+            return exit_core(&e);
+        }
+    };
     if snapshots.is_empty() {
         eprintln!("not found");
         return exit(EXIT_ORDINARY);
