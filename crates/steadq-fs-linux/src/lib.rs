@@ -57,7 +57,8 @@ struct OpenHow {
 /// Fault injection control for deterministic failure testing.
 ///
 /// State is thread-local so parallel tests do not interfere with each other.
-/// Idle threads pay only a TLS lookup that finds an empty map.
+/// Idle threads pay only a TLS lookup that finds tracking off. Arming a fault
+/// or calling `track()` turns call counting on until `reset()`.
 pub mod fault {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -72,6 +73,7 @@ pub mod fault {
     }
 
     struct State {
+        tracking: bool,
         faults: HashMap<String, Fault>,
         counts: HashMap<String, u64>,
         fd_identities: HashMap<String, Vec<(u64, u64)>>,
@@ -85,6 +87,7 @@ pub mod fault {
     impl State {
         fn new() -> Self {
             State {
+                tracking: false,
                 faults: HashMap::new(),
                 counts: HashMap::new(),
                 fd_identities: HashMap::new(),
@@ -105,6 +108,7 @@ pub mod fault {
     pub fn reset() {
         STATE.with(|s| {
             let mut s = s.borrow_mut();
+            s.tracking = false;
             s.faults.clear();
             s.counts.clear();
             s.fd_identities.clear();
@@ -169,6 +173,11 @@ pub mod fault {
         });
     }
 
+    /// Count calls and record fd identities without arming a fault, until `reset()`.
+    pub fn track() {
+        STATE.with(|s| s.borrow_mut().tracking = true);
+    }
+
     /// Fail the Nth (1-indexed) call to `func_name` with EIO.
     pub fn inject(func_name: &str, at_count: u64) {
         inject_errno(func_name, at_count, libc::EIO);
@@ -178,7 +187,9 @@ pub mod fault {
     pub fn inject_errno(func_name: &str, at_count: u64, errno: i32) {
         assert!(at_count >= 1, "fault inject count is 1-indexed");
         STATE.with(|s| {
-            s.borrow_mut().faults.insert(
+            let mut s = s.borrow_mut();
+            s.tracking = true;
+            s.faults.insert(
                 func_name.to_string(),
                 Fault {
                     current: 0,
@@ -189,7 +200,8 @@ pub mod fault {
         });
     }
 
-    /// Number of times `func_name` has been checked since the last reset.
+    /// Number of times `func_name` has been checked since tracking began
+    /// (the first `inject*` or `track()` after the last `reset()`).
     pub fn call_count(func_name: &str) -> u64 {
         STATE.with(|s| *s.borrow().counts.get(func_name).unwrap_or(&0))
     }
@@ -208,7 +220,7 @@ pub mod fault {
 
     pub(crate) fn record_fd_identity(func_name: &str, fd: RawFd) -> io::Result<()> {
         STATE.with(|state| {
-            if state.borrow().faults.is_empty() {
+            if !state.borrow().tracking {
                 return Ok(());
             }
 
@@ -235,7 +247,7 @@ pub mod fault {
     pub fn check(func_name: &str) -> Option<io::Error> {
         STATE.with(|s| {
             let mut s = s.borrow_mut();
-            if s.faults.is_empty() {
+            if !s.tracking {
                 return None;
             }
             *s.counts.entry(func_name.to_string()).or_insert(0) += 1;
@@ -627,7 +639,7 @@ pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
 }
 
 /// Get filesystem stats using OsStrExt for byte-safe paths.
-pub fn statfs(path: &Path) -> io::Result<libc::statfs> {
+pub(crate) fn statfs(path: &Path) -> io::Result<libc::statfs> {
     let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
     // SAFETY: Linux `statfs` contains only integer fields and may be zero-initialized.
     let mut statbuf: libc::statfs = unsafe { std::mem::zeroed() };
@@ -701,71 +713,37 @@ pub fn clock_monotonic_ns() -> io::Result<u64> {
     Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
 
-/// Generate random bytes from the OS crypto source.
-/// Loops until the entire buffer is filled. Handles short reads, EINTR,
-/// and EAGAIN. Returns an error (not zero data) on any failure.
-fn is_eagain(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EAGAIN)
-}
-
 fn is_interrupted(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::Interrupted
 }
 
-pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
+/// Generate a random 128-bit value from the OS crypto source.
+pub fn random_128bit() -> io::Result<[u8; 16]> {
     fault_check!("get_random");
-    if bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let mut buf = vec![0u8; bytes];
-    let mut filled = 0usize;
+    let mut out = [0u8; 16];
     loop {
-        // SAFETY: the remaining slice is writable for its reported length.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_getrandom,
-                buf[filled..].as_mut_ptr(),
-                bytes - filled,
-                0,
-            )
-        };
+        // SAFETY: `out` is writable for its length. getrandom never returns
+        // short for requests of 256 bytes or less.
+        let rc = unsafe { libc::syscall(libc::SYS_getrandom, out.as_mut_ptr(), out.len(), 0) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if is_interrupted(&e) {
                 continue;
             }
-            // Defensive: EAGAIN does not occur with flags=0.
-            if is_eagain(&e) {
-                continue;
-            }
             return Err(e);
         }
-        let n = rc as usize;
-        if n == 0 {
-            // A zero-byte return is anomalous; treat as an error.
+        if rc as usize != out.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "getrandom returned zero bytes",
+                "getrandom returned a short read",
             ));
         }
-        filled += n;
-        if filled >= bytes {
-            break;
-        }
+        return Ok(out);
     }
-    Ok(buf)
-}
-
-/// Generate a random 128-bit value.
-pub fn random_128bit() -> io::Result<[u8; 16]> {
-    let bytes = get_random(16)?;
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }
 
 /// pwrite to a file descriptor at a given offset.
-pub fn pwrite(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn pwrite(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<usize> {
     fault_check!("pwrite");
     // SAFETY: `buf` is readable for its length and `fd` remains live for the call.
     let rc = unsafe {
@@ -844,6 +822,12 @@ pub fn writev_all(fd: BorrowedFd<'_>, bufs: &[&[u8]]) -> io::Result<()> {
                 continue;
             }
             return Err(error);
+        }
+        if rc == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "writev returned zero bytes (no progress)",
+            ));
         }
 
         let mut written = rc as usize;
@@ -1063,13 +1047,6 @@ pub struct DirectoryEnumeration {
 }
 
 #[derive(Debug)]
-pub enum DirectoryEnumerationError {
-    Cancelled,
-    CancellationCheck(io::Error),
-    Io(io::Error),
-}
-
-#[derive(Debug)]
 pub enum DirectoryEnumerationProgressError {
     Cancelled(DirectoryEnumerationProgress),
     CancellationCheck {
@@ -1080,39 +1057,6 @@ pub enum DirectoryEnumerationProgressError {
         error: io::Error,
         progress: DirectoryEnumerationProgress,
     },
-}
-
-impl std::fmt::Display for DirectoryEnumerationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cancelled => write!(formatter, "directory enumeration cancelled"),
-            Self::CancellationCheck(error) => {
-                write!(formatter, "directory cancellation check failed: {error}")
-            }
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for DirectoryEnumerationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Cancelled => None,
-            Self::CancellationCheck(error) | Self::Io(error) => Some(error),
-        }
-    }
-}
-
-impl DirectoryEnumerationError {
-    fn into_io_error(self) -> io::Error {
-        match self {
-            Self::Cancelled => io::Error::new(
-                io::ErrorKind::Interrupted,
-                "directory enumeration cancelled unexpectedly",
-            ),
-            Self::CancellationCheck(error) | Self::Io(error) => error,
-        }
-    }
 }
 
 impl std::fmt::Display for DirectoryEnumerationProgressError {
@@ -1145,13 +1089,13 @@ impl DirectoryEnumerationProgressError {
         }
     }
 
-    fn into_legacy(self) -> DirectoryEnumerationError {
+    fn into_io_error(self) -> io::Error {
         match self {
-            Self::Cancelled(_) => DirectoryEnumerationError::Cancelled,
-            Self::CancellationCheck { error, .. } => {
-                DirectoryEnumerationError::CancellationCheck(error)
-            }
-            Self::Io { error, .. } => DirectoryEnumerationError::Io(error),
+            Self::Cancelled(_) => io::Error::new(
+                io::ErrorKind::Interrupted,
+                "directory enumeration cancelled unexpectedly",
+            ),
+            Self::CancellationCheck { error, .. } | Self::Io { error, .. } => error,
         }
     }
 }
@@ -1299,8 +1243,7 @@ where
 
 fn read_dir_entries_impl(dir_fd: OwnedFd) -> io::Result<Vec<DirEntryName>> {
     read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || Ok(false))
-        .map_err(DirectoryEnumerationProgressError::into_legacy)
-        .map_err(DirectoryEnumerationError::into_io_error)
+        .map_err(DirectoryEnumerationProgressError::into_io_error)
         .map(|enumeration| enumeration.entries)
 }
 
@@ -1342,33 +1285,6 @@ pub fn read_dir_entries(dir_fd: BorrowedFd<'_>) -> io::Result<Vec<DirEntryName>>
     read_dir_entries_impl(reopen_directory(dir_fd)?)
 }
 
-/// Read byte-preserving directory entries without consuming the caller's fd.
-/// The function returns an error rather than materializing more than the
-/// configured entry or aggregate-name-byte bound.
-pub fn read_dir_entries_bounded(
-    dir_fd: BorrowedFd<'_>,
-    max_entries: usize,
-    max_name_bytes: usize,
-) -> io::Result<Vec<DirEntryName>> {
-    read_dir_entries_bounded_until(dir_fd, max_entries, max_name_bytes, || Ok(false))
-        .map_err(DirectoryEnumerationError::into_io_error)
-}
-
-/// Read bounded byte-preserving directory entries with cooperative cancellation.
-pub fn read_dir_entries_bounded_until<F>(
-    dir_fd: BorrowedFd<'_>,
-    max_entries: usize,
-    max_name_bytes: usize,
-    should_stop: F,
-) -> Result<Vec<DirEntryName>, DirectoryEnumerationError>
-where
-    F: FnMut() -> io::Result<bool>,
-{
-    read_dir_entries_bounded_until_with_progress(dir_fd, max_entries, max_name_bytes, should_stop)
-        .map(|enumeration| enumeration.entries)
-        .map_err(DirectoryEnumerationProgressError::into_legacy)
-}
-
 /// Read bounded byte-preserving entries and retain exact partial progress.
 pub fn read_dir_entries_bounded_until_with_progress<F>(
     dir_fd: BorrowedFd<'_>,
@@ -1396,37 +1312,6 @@ pub fn fchmodat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()>
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Change file mode on an open fd.
-pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
-    // SAFETY: `fd` remains live for the synchronous syscall.
-    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Stabilization sync: sync a verified destination and its parent directories.
-/// Non-mutating: only performs fsync, no rename or write.
-pub fn stabilize(fd: BorrowedFd<'_>) -> io::Result<()> {
-    fsync(fd)
-}
-
-/// Stabilize a directory by its fd.
-pub fn stabilize_dir(fd: BorrowedFd<'_>) -> io::Result<()> {
-    fsync_dir_fd(fd)
-}
-
-/// Check if an error indicates the source is gone (ENOENT).
-pub fn is_source_gone(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ENOENT)
-}
-
-/// Check if an error indicates a collision (EEXIST).
-pub fn is_collision(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::EEXIST)
 }
 
 /// Probe unnamed-file publication modes. Returns which mode is available.
@@ -1484,7 +1369,13 @@ pub fn probe_rename_noreplace(dir_fd: BorrowedFd<'_>) -> io::Result<bool> {
     let n2 = name2.trim_end_matches('\0');
 
     let f1 = create_exclusive(dir_fd, n1, 0o600)?;
-    let f2 = create_exclusive(dir_fd, n2, 0o600)?;
+    let f2 = match create_exclusive(dir_fd, n2, 0o600) {
+        Ok(fd) => fd,
+        Err(error) => {
+            let _ = unlinkat(dir_fd, n1);
+            return Err(error);
+        }
+    };
     drop(f1);
     drop(f2);
 
@@ -1504,11 +1395,6 @@ pub fn probe_dir_fsync(dir_fd: BorrowedFd<'_>) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
-}
-
-/// Check if a path is absolute (starts with '/').
-pub fn is_absolute_path(s: &str) -> bool {
-    s.starts_with('/')
 }
 
 /// Validate a relative path component for safety:
@@ -1661,13 +1547,6 @@ mod tests {
     }
 
     #[test]
-    fn is_eagain_classifies_errno() {
-        assert!(is_eagain(&io::Error::from_raw_os_error(libc::EAGAIN)));
-        assert!(!is_eagain(&io::Error::from_raw_os_error(libc::EIO)));
-        assert!(!is_eagain(&io::Error::new(io::ErrorKind::Interrupted, "x")));
-    }
-
-    #[test]
     fn is_interrupted_classifies_kind() {
         assert!(is_interrupted(&io::Error::new(
             io::ErrorKind::Interrupted,
@@ -1690,6 +1569,44 @@ mod tests {
         // Any other errno means the kernel lacks RENAME_NOREPLACE.
         fault::inject_errno("renameat2_noreplace", 1, libc::ENOSYS);
         assert!(!probe_rename_noreplace(fd.as_fd()).unwrap());
+        fault::reset();
+    }
+
+    #[test]
+    fn probe_rename_noreplace_unlinks_first_probe_when_second_create_fails() {
+        let dir = test_dir("rnprobe-leak");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+
+        fault::inject_errno("openat", 2, libc::EIO);
+        let error = probe_rename_noreplace(fd.as_fd()).unwrap_err();
+        fault::reset();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fault_track_counts_without_arming() {
+        let dir = test_dir("track");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        fault::reset();
+        fault::track();
+        fsync(fd.as_fd()).unwrap();
+        assert_eq!(fault::call_count("fsync"), 1);
+        fault::reset();
+        fsync(fd.as_fd()).unwrap();
+        assert_eq!(fault::call_count("fsync"), 0);
+    }
+
+    #[test]
+    fn fault_counting_continues_after_the_fault_fires() {
+        let dir = test_dir("count-after-fire");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        fault::reset();
+        fault::inject("fsync", 1);
+        assert!(fsync(fd.as_fd()).is_err());
+        fsync(fd.as_fd()).unwrap();
+        assert_eq!(fault::call_count("fsync"), 2);
         fault::reset();
     }
 
@@ -1807,20 +1724,6 @@ mod tests {
             let r = random_128bit().unwrap();
             assert_ne!(r, [0u8; 16], "random_128bit returned all zeros");
         }
-    }
-
-    #[test]
-    fn get_random_fills_buffer() {
-        let buf = get_random(256).unwrap();
-        assert_eq!(buf.len(), 256);
-        // Extremely unlikely that 256 random bytes are all zero
-        assert!(buf.iter().any(|&b| b != 0));
-    }
-
-    #[test]
-    fn get_random_zero_returns_empty() {
-        let buf = get_random(0).unwrap();
-        assert!(buf.is_empty());
     }
 
     #[test]
@@ -2074,6 +1977,18 @@ mod tests {
         assert_eq!(name.as_ascii_str(), None);
     }
 
+    fn read_dir_entries_bounded(
+        dir_fd: BorrowedFd<'_>,
+        max_entries: usize,
+        max_name_bytes: usize,
+    ) -> io::Result<Vec<DirEntryName>> {
+        read_dir_entries_bounded_until_with_progress(dir_fd, max_entries, max_name_bytes, || {
+            Ok(false)
+        })
+        .map(|enumeration| enumeration.entries)
+        .map_err(DirectoryEnumerationProgressError::into_io_error)
+    }
+
     #[test]
     fn bounded_directory_read_applies_thread_local_permutation() {
         let directory = test_dir("permuted-directory-read");
@@ -2170,25 +2085,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellable_directory_api_preserves_error_shape() {
-        let directory = test_dir("bounded-directory-legacy-result");
-        let dir_path = directory.path();
-        std::fs::write(dir_path.join("alpha"), b"a").unwrap();
-        let dir = std::fs::File::open(dir_path).unwrap();
-
-        let entries =
-            read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(false))
-                .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].as_bytes(), b"alpha");
-
-        let error =
-            read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(true))
-                .unwrap_err();
-        assert!(matches!(error, DirectoryEnumerationError::Cancelled));
-    }
-
-    #[test]
     fn cancelled_directory_read_reports_partial_progress() {
         let directory = test_dir("bounded-directory-partial-progress");
         let dir_path = directory.path();
@@ -2249,13 +2145,19 @@ mod tests {
     fn directory_enumeration_error_preserves_category_and_source() {
         use std::error::Error as _;
 
-        let cancelled = DirectoryEnumerationError::Cancelled;
+        let progress = DirectoryEnumerationProgress {
+            entries_read: 2,
+            name_bytes_read: 7,
+        };
+        let cancelled = DirectoryEnumerationProgressError::Cancelled(progress);
         assert_eq!(cancelled.to_string(), "directory enumeration cancelled");
         assert!(cancelled.source().is_none());
+        assert_eq!(cancelled.into_io_error().kind(), io::ErrorKind::Interrupted);
 
-        let check = DirectoryEnumerationError::CancellationCheck(io::Error::from_raw_os_error(
-            libc::ETIMEDOUT,
-        ));
+        let check = DirectoryEnumerationProgressError::CancellationCheck {
+            error: io::Error::from_raw_os_error(libc::ETIMEDOUT),
+            progress,
+        };
         assert!(check
             .to_string()
             .starts_with("directory cancellation check failed:"));
@@ -2266,20 +2168,8 @@ mod tests {
                 .and_then(io::Error::raw_os_error),
             Some(libc::ETIMEDOUT)
         );
+        assert_eq!(check.into_io_error().raw_os_error(), Some(libc::ETIMEDOUT));
 
-        let io_error = DirectoryEnumerationError::Io(io::Error::from_raw_os_error(libc::EIO));
-        assert_eq!(
-            io_error
-                .source()
-                .and_then(|source| source.downcast_ref::<io::Error>())
-                .and_then(io::Error::raw_os_error),
-            Some(libc::EIO)
-        );
-
-        let progress = DirectoryEnumerationProgress {
-            entries_read: 2,
-            name_bytes_read: 7,
-        };
         let progress_error = DirectoryEnumerationProgressError::Io {
             error: io::Error::from_raw_os_error(libc::EIO),
             progress,
@@ -2296,6 +2186,10 @@ mod tests {
             Some(libc::EIO)
         );
         assert_eq!(progress_error.progress(), progress);
+        assert_eq!(
+            progress_error.into_io_error().raw_os_error(),
+            Some(libc::EIO)
+        );
     }
 
     #[test]
@@ -2341,7 +2235,7 @@ mod tests {
         let directory = test_dir("borrowed-file-owner");
         let dir = open_dir_absolute(directory.path()).unwrap();
         let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
-        fchmod(file.as_fd(), 0o700).unwrap();
+        fchmodat(dir.as_fd(), "data", 0o700).unwrap();
         assert_eq!(fstat(file.as_fd()).unwrap().st_mode & 0o777, 0o700);
         write_all(file.as_fd(), b"data").unwrap();
         // SAFETY: `file` owns this descriptor for the duration of the call.
@@ -2506,7 +2400,7 @@ mod tests {
         let dir = test_dir("idle");
         let fd = open_dir_absolute(dir.path()).unwrap();
         fsync(fd.as_fd()).unwrap();
-        // Idle threads do not count checks when no faults are armed.
+        // Idle threads do not count checks when nothing is armed or tracked.
         assert_eq!(fault::call_count("fsync"), 0);
     }
 

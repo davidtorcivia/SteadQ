@@ -1499,6 +1499,7 @@ mod tests {
         let source_stat = fs::fstatat(source_fd.as_fd(), "source.raw").unwrap();
 
         fs::fault::reset();
+        fs::fault::track();
         let failure = move_witnessed_noreplace_with(
             source_fd.as_fd(),
             "source.raw",

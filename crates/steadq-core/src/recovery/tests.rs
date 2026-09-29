@@ -864,6 +864,7 @@ fn recovery_rejects_invalid_budget_before_filesystem_work() {
         },
     ] {
         fs::fault::reset();
+        fs::fault::track();
         let report = queue.recover_with_scan_budget(&WorkBudget::default(), &scan_budget);
 
         assert!(report.stats.phase_blocked);
