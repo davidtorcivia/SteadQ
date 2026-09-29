@@ -294,6 +294,22 @@ fn compaction_temporary_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A receipt that fails verification as corrupt can never pass it later, so
+/// it is quarantined; an I/O failure may be transient and is only recorded.
+fn receipt_quarantine_reason(
+    error: &crate::queue::verified::VerificationError,
+) -> Option<crate::QuarantineReason> {
+    match error {
+        crate::queue::verified::VerificationError::Io(_) => None,
+        crate::queue::verified::VerificationError::Corrupt(_) => {
+            Some(crate::QuarantineReason::EnvelopeCorrupt)
+        }
+        crate::queue::verified::VerificationError::PayloadCorrupt => {
+            Some(crate::QuarantineReason::PayloadCorrupt)
+        }
+    }
+}
+
 fn recovery_lock_exists(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists
 }

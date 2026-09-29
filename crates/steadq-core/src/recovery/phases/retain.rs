@@ -497,6 +497,7 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
+                    let previous_entry_cursor = self.recovery_cursor.compact_receipts.clone();
                     self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
                         bucket_entry.as_bytes(),
                         shard_entry.as_bytes(),
@@ -560,12 +561,23 @@ impl Queue {
                     ) {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            Self::record_error(
-                                stats,
-                                "receipt_compact_invalid",
-                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
-                                &error.to_string(),
-                            );
+                            let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                            Self::record_error(stats, "receipt_compact_invalid", &relative_path, &error.to_string());
+                            if let Some(reason) = receipt_quarantine_reason(&error) {
+                                if !self.quarantine_recovery_object(
+                                    RecoveryQuarantineCandidate {
+                                        source_directory_fd: shard_fd.as_fd(),
+                                        filename: entry,
+                                        relative_path: &relative_path,
+                                        reason,
+                                    },
+                                    stats,
+                                    budget,
+                                ) {
+                                    self.recovery_cursor.compact_receipts = previous_entry_cursor;
+                                    return;
+                                }
+                            }
                             continue;
                         }
                     };
@@ -1046,12 +1058,23 @@ impl Queue {
                     ) {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            Self::record_error(
-                                stats,
-                                "receipt_delete_invalid",
-                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
-                                &error.to_string(),
-                            );
+                            let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                            Self::record_error(stats, "receipt_delete_invalid", &relative_path, &error.to_string());
+                            if let Some(reason) = receipt_quarantine_reason(&error) {
+                                if !self.quarantine_recovery_object(
+                                    RecoveryQuarantineCandidate {
+                                        source_directory_fd: shard_fd.as_fd(),
+                                        filename: entry,
+                                        relative_path: &relative_path,
+                                        reason,
+                                    },
+                                    stats,
+                                    budget,
+                                ) {
+                                    self.recovery_cursor.delete_receipts = previous_entry_cursor;
+                                    return;
+                                }
+                            }
                             continue;
                         }
                     };

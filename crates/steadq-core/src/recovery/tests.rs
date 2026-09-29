@@ -3113,13 +3113,16 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
         max_duration_ms: 5_000,
     };
 
+    // The malformed receipt sorts first and its quarantine spends the one
+    // operation; the valid receipt is compacted on the next pass.
     let first = queue.recover(&budget);
-    assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+    assert_eq!(first.receipts_compacted, 0, "errors: {:?}", first.errors);
+    assert_eq!(first.quarantined.len(), 1, "errors: {:?}", first.errors);
     assert!(first
         .errors
         .iter()
         .any(|error| error.operation == "receipt_compact_invalid"));
-    assert!(queue.recovery_cursor.compact_receipts.is_none());
+    assert!(!malformed.exists());
     drop(queue);
 
     let mut reopened = Queue::open(
@@ -3132,9 +3135,8 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
     .unwrap();
     let second = reopened.recover(&budget);
 
-    assert_eq!(second.receipts_compacted, 0, "errors: {:?}", second.errors);
+    assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
     assert_eq!(std::fs::metadata(receipt).unwrap().len(), 128);
-    assert!(malformed.exists());
 }
 
 #[test]
@@ -4244,26 +4246,26 @@ fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
         .iter()
         .any(|snapshot| snapshot.state == "receipt"));
 
-    let stats = queue.recover(&WorkBudget::default());
-    assert_eq!(stats.receipts_compacted, 0);
-    assert!(stats
-        .errors
-        .iter()
-        .any(|error| error.operation == "receipt_compact_invalid"));
-    assert!(std::fs::metadata(&receipt).unwrap().len() > 128);
-
     let report = queue.fsck(&crate::FsckOptions::default());
     assert!(report
         .findings
         .iter()
         .any(|finding| finding.finding_type == "receipt_verification_failed"));
 
-    let repair = queue.fsck(&crate::FsckOptions {
-        mode: crate::FsckMode::Repair,
-        depth: crate::FsckDepth::Structural,
-    });
-    assert_eq!(repair.quarantined.len(), 1);
+    let stats = queue.recover(&WorkBudget::default());
+    assert_eq!(stats.receipts_compacted, 0);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "receipt_compact_invalid"));
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
     assert!(!receipt.exists());
+    let quarantined = queue.list_quarantine();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        quarantined[0].reason,
+        crate::QuarantineReason::PayloadCorrupt as u16
+    );
 }
 
 #[test]
@@ -5283,5 +5285,111 @@ fn promotion_directory_removal_preserves_phase() {
             outcome_unknown,
         );
         assert!(tmp.path().join("delayed/0000000000000000").exists());
+    }
+}
+
+#[test]
+fn receipt_quarantine_reason_skips_only_io_failures() {
+    use crate::queue::verified::VerificationError;
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::Io("eio".into())),
+        None
+    );
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::Corrupt("bad".into())),
+        Some(crate::QuarantineReason::EnvelopeCorrupt)
+    );
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::PayloadCorrupt),
+        Some(crate::QuarantineReason::PayloadCorrupt)
+    );
+}
+
+/// Acks two jobs, corrupts the payload of the receipt that sorts first, and
+/// returns (corrupt, valid).
+fn two_receipts_first_corrupt(tmp: &TempDir, queue: &mut Queue) -> (PathBuf, PathBuf) {
+    enqueue_and_ack(queue);
+    enqueue_and_ack(queue);
+    let mut receipts = Vec::new();
+    find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+    receipts.sort();
+    assert_eq!(receipts.len(), 2);
+    let mut bytes = std::fs::read(&receipts[0]).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&receipts[0], &bytes).unwrap();
+    (receipts[0].clone(), receipts[1].clone())
+}
+
+fn expire_receipts(tmp: &TempDir, queue: &Queue, receipt: &Path) -> WallFloor {
+    let receipt_bucket = receipt
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(steadq_names::bucket_from_hex)
+        .unwrap();
+    let expiration_floor = (receipt_bucket + 2) * queue.format.terminal_bucket_width_ns();
+    write_wall_watermark(
+        tmp,
+        steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns())
+            .unwrap(),
+    );
+    queue.authenticated_wall_floor().unwrap()
+}
+
+#[test]
+fn receipt_compaction_quarantines_a_corrupt_receipt_and_continues() {
+    let (tmp, mut queue) = create_test_queue();
+    let (corrupt, valid) = two_receipts_first_corrupt(&tmp, &mut queue);
+    let stats = compact_receipts_with_budget(&mut queue);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.receipts_compacted, 1, "errors: {:?}", stats.errors);
+    assert!(!corrupt.exists());
+    assert_eq!(std::fs::metadata(valid).unwrap().len(), 128);
+}
+
+#[test]
+fn receipt_deletion_quarantines_a_corrupt_receipt_and_continues() {
+    let (tmp, mut queue) = create_test_queue();
+    let (corrupt, valid) = two_receipts_first_corrupt(&tmp, &mut queue);
+    let wall_floor = expire_receipts(&tmp, &queue, &valid);
+    let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.receipts_expired, 1, "errors: {:?}", stats.errors);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "receipt_delete_invalid"));
+    assert!(!corrupt.exists());
+    assert!(!valid.exists());
+}
+
+#[test]
+fn receipt_verification_io_failure_is_recorded_without_quarantine() {
+    for compact in [true, false] {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let wall_floor = expire_receipts(&tmp, &queue, &receipt);
+        fs::fault::reset();
+        fs::fault::inject_errno("fstat", 1, libc::EIO);
+        let stats = if compact {
+            compact_receipts_with_budget(&mut queue)
+        } else {
+            delete_receipts_with_budget(&mut queue, wall_floor)
+        };
+        fs::fault::reset();
+        let operation = if compact {
+            "receipt_compact_invalid"
+        } else {
+            "receipt_delete_invalid"
+        };
+        assert!(
+            stats.errors.iter().any(|error| error.operation == operation),
+            "errors: {:?}",
+            stats.errors
+        );
+        assert!(stats.quarantined.is_empty());
+        assert!(receipt.exists());
     }
 }
