@@ -310,6 +310,19 @@ fn receipt_quarantine_reason(
     }
 }
 
+fn recovery_cursor_temporary_name(name: &str) -> bool {
+    let Some(random_hex) = name
+        .strip_prefix(".recovery-cursor.")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    random_hex.len() == 32
+        && random_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn recovery_lock_exists(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists
 }
@@ -532,6 +545,43 @@ impl Queue {
         Ok(lock_fd)
     }
 
+    /// Remove cursor temporary files a crashed pass left behind. Only a pass
+    /// holding recovery.lock writes them, so every one found under the lock
+    /// is orphaned. Failures are recorded and do not stop recovery.
+    fn sweep_cursor_temporary_files(&self, stats: &mut RecoveryStats) {
+        let names = fs::open_directory(self.root_fd(), "control").and_then(|control_fd| {
+            let mut stream = fs::DirectoryStream::open(control_fd.as_fd())?;
+            let mut names = Vec::new();
+            while let Some(entry) = stream.next_entry()? {
+                if let Some(name) = entry
+                    .as_ascii_str()
+                    .filter(|name| recovery_cursor_temporary_name(name))
+                {
+                    names.push(name.to_string());
+                }
+            }
+            Ok((control_fd, names))
+        });
+        let (control_fd, names) = match names {
+            Ok(found) => found,
+            Err(error) => {
+                Self::record_error(stats, "recovery_cursor_sweep", "control", &error.to_string());
+                return;
+            }
+        };
+        for name in names {
+            match unlink_verified(control_fd.as_fd(), &name) {
+                Ok(()) | Err(UnlinkFailure::SourceMissing) => {}
+                Err(failure) => Self::record_unlink_failure(
+                    stats,
+                    "recovery_cursor_sweep",
+                    &format!("control/{name}"),
+                    failure,
+                ),
+            }
+        }
+    }
+
     fn persist_recovery_cursor(&self) -> Result<(), Error> {
         let record = RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.to_string(),
@@ -679,6 +729,7 @@ impl Queue {
                 };
             }
         };
+        self.sweep_cursor_temporary_files(&mut stats);
         self.recovery_cursor = match load_recovery_cursor(self.root_fd(), self.format.queue_id()) {
             Ok(cursor) => cursor,
             Err(error) => {

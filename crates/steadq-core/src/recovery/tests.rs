@@ -4033,6 +4033,62 @@ fn compaction_temporary_name_is_strict() {
 }
 
 #[test]
+fn recovery_cursor_temporary_name_is_strict() {
+    assert!(recovery_cursor_temporary_name(
+        ".recovery-cursor.0123456789abcdef0123456789abcdef.tmp"
+    ));
+    for invalid in [
+        ".recovery-cursor.0123456789abcdef0123456789abcde.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdef0.tmp",
+        ".recovery-cursor.0123456789ABCDEF0123456789ABCDEF.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdeg.tmp",
+        "recovery-cursor.0123456789abcdef0123456789abcdef.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdef.json",
+        "recovery-cursor.json",
+    ] {
+        assert!(!recovery_cursor_temporary_name(invalid), "{invalid}");
+    }
+}
+
+#[test]
+fn recovery_sweeps_orphaned_cursor_temporary_files() {
+    let (tmp, mut queue) = create_test_queue();
+    let control = tmp.path().join("control");
+    let orphan = control.join(".recovery-cursor.0123456789abcdef0123456789abcdef.tmp");
+    let unrelated = control.join(".recovery-cursor.unrelated.tmp");
+    std::fs::write(&orphan, b"{}").unwrap();
+    std::fs::write(&unrelated, b"{}").unwrap();
+    let stats = queue.recover(&WorkBudget::default());
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert!(!orphan.exists());
+    assert!(unrelated.exists());
+    assert!(control.join(RECOVERY_CURSOR_FILE).exists());
+}
+
+#[test]
+fn recovery_cursor_sweep_failures_are_recorded_and_recovery_continues() {
+    for (fault, count, operation, orphan_remains) in [
+        ("open_directory", 2, "recovery_cursor_sweep", true),
+        ("unlinkat", 1, "recovery_cursor_sweep_not_committed", true),
+        ("fsync_dir_fd", 1, "recovery_cursor_sweep_outcome_unknown", false),
+    ] {
+        let (tmp, mut queue) = create_test_queue();
+        let orphan = tmp
+            .path()
+            .join("control/.recovery-cursor.0123456789abcdef0123456789abcdef.tmp");
+        std::fs::write(&orphan, b"{}").unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, count, libc::EIO);
+        let stats = queue.recover(&WorkBudget::default());
+        fs::fault::reset();
+        assert_eq!(stats.errors.len(), 1, "{fault}: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, operation);
+        assert_eq!(orphan.exists(), orphan_remains, "{fault}");
+        assert!(tmp.path().join("control").join(RECOVERY_CURSOR_FILE).exists());
+    }
+}
+
+#[test]
 fn recovery_compaction_fault_matrix_preserves_receipt_and_replays() {
     for (fault, count, errno, expected_operation, expected_phase, replaced) in [
         (
