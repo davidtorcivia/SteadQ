@@ -492,13 +492,10 @@ impl Queue {
         if let Some(bucket) = sharded_bucket_parent(relative, self.format.shard_count()) {
             return self.ensure_sharded_bucket_with_dirty(bucket, dirty);
         }
-        let mut path = String::with_capacity(relative.len());
+        let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = None::<OwnedFd>;
-        for comp in relative.split('/').filter(|s| !s.is_empty()) {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path.push_str(comp);
+        for (depth, comp) in components.iter().enumerate() {
+            let path = components[..=depth].join("/");
             let parent = current
                 .as_ref()
                 .map_or(self.root_fd.as_fd(), |directory| directory.as_fd());
@@ -508,7 +505,7 @@ impl Queue {
             }
             let child = fs::open_directory(parent, comp)?;
             if !known {
-                self.sync_parent_of(parent, [path.clone()], dirty.as_deref_mut())?;
+                self.sync_parent_of(parent, [path], dirty.as_deref_mut())?;
             }
             current = Some(child);
         }
