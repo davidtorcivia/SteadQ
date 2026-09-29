@@ -83,8 +83,7 @@ pub(super) struct LeasedSourceWitness {
 /// A reader for a verified lease payload that does not re-hash on each read.
 ///
 /// The payload is verified once at construction. Subsequent `read_at` calls
-/// perform direct pread on the held fd, avoiding the O(n^2) cost of calling
-/// `read_lease_payload_chunk` repeatedly.
+/// perform direct pread on the held fd without re-hashing.
 pub struct VerifiedPayloadReader {
     file_fd: OwnedFd,
     payload_start: u64,

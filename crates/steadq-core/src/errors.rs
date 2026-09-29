@@ -8,8 +8,6 @@ use crate::state_machine::{
 /// Error categories for all operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error("not committed: {0}")]
-    NotCommitted(String),
     #[error("resource exhausted")]
     ResourceExhausted,
     #[error("state exhausted")]
@@ -73,14 +71,6 @@ impl std::fmt::Display for PoisonReason {
             Self::InternalInvariantViolation => "internal invariant violation",
         })
     }
-}
-
-/// Operation result for mutations. Every mutating operation returns one of these.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperationResult {
-    Committed,
-    NotCommitted(Error),
-    OutcomeUnknown(TransitionTicket),
 }
 
 /// Enqueue outcomes.

@@ -10,6 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 
+#[cfg(test)]
 use crate::errors::Error;
 
 /// Explicit dirty-directory tracking. Records the exact directory FDs that
@@ -327,6 +328,7 @@ impl MoveFailure {
     pub fn is_outcome_unknown(&self) -> bool {
         matches!(self, Self::OutcomeUnknown { .. })
     }
+    #[cfg(test)]
     pub fn is_not_committed(&self) -> bool {
         matches!(self, Self::NotCommitted { .. })
     }
@@ -894,6 +896,7 @@ pub(super) fn publish_tmpfile_noreplace_deferred_with_mode(
 
 /// Convert a MoveFailure into the public Error / poison decision.
 /// The caller decides poison; this helper maps phases to Error variants.
+#[cfg(test)]
 pub fn map_move_failure(f: MoveFailure) -> Error {
     match f {
         MoveFailure::AlreadyExists => Error::QueueCorrupt("destination already exists".into()),
@@ -904,12 +907,15 @@ pub fn map_move_failure(f: MoveFailure) -> Error {
 }
 
 // helpers for mutant killing
+#[cfg(test)]
 pub fn is_already_exists(f: &MoveFailure) -> bool {
     matches!(f, MoveFailure::AlreadyExists)
 }
+#[cfg(test)]
 pub fn is_source_missing(f: &MoveFailure) -> bool {
     matches!(f, MoveFailure::SourceMissing)
 }
+#[cfg(test)]
 pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
     matches!(
         phase,
@@ -919,6 +925,7 @@ pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
             | MovePhase::SourceFsync
     )
 }
+#[cfg(test)]
 pub fn is_not_committed_phase(phase: MovePhase) -> bool {
     matches!(
         phase,

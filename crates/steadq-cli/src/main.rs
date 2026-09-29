@@ -34,7 +34,6 @@ pub(crate) fn core_exit_code(error: &Error) -> u8 {
         Error::IoFailure(_) | Error::InvalidClock => EXIT_IO_FAILURE,
         Error::InvalidInput(_)
         | Error::InvalidTicket(_)
-        | Error::NotCommitted(_)
         | Error::MaintenanceBusy
         | Error::IdentityCollision => EXIT_ORDINARY,
     }

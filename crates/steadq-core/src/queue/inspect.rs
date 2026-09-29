@@ -83,7 +83,8 @@ impl Queue {
     /// Read a chunk of a leased job's payload at the given offset.
     /// Returns the number of bytes read (0 at EOF).
     /// Validates source identity before reading.
-    pub fn read_lease_payload_chunk(
+    #[cfg(test)]
+    pub(crate) fn read_lease_payload_chunk(
         &self,
         lease: &LeaseInfo,
         buf: &mut [u8],

@@ -87,7 +87,6 @@ fn error_to_code(e: &Error) -> c_int {
         Error::InvalidClock => STEADQ_IO_FAILURE,
         Error::MaintenanceBusy => STEADQ_NOT_COMMITTED,
         Error::QueuePoisoned(_) => STEADQ_CORRUPTION,
-        Error::NotCommitted(_) => STEADQ_NOT_COMMITTED,
         Error::IdentityCollision => STEADQ_NOT_COMMITTED,
         Error::InvalidInput(_) | Error::InvalidTicket(_) => STEADQ_NOT_COMMITTED,
     }
