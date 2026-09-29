@@ -109,9 +109,9 @@ fn read_recovery_directory(
 /// Stream a directory of any size and keep only the names `keep` accepts.
 ///
 /// Every entry read is charged to the scan budget, so memory is bounded by
-/// the kept names. The directory must finish inside one pass's remaining
-/// entry, name-byte, and time budget; a caller resuming at directory
-/// granularity otherwise never gets past it.
+/// the kept names. A caller resuming at directory granularity must skip a
+/// directory that does not finish inside a whole pass's budget, or it never
+/// gets past it.
 fn stream_recovery_directory(
     dir_fd: BorrowedFd<'_>,
     deadline_mono: u64,

@@ -535,7 +535,8 @@ impl Queue {
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
-        let first_shard = self.recovery_cursor.reap_colocated_shard.unwrap_or(0);
+        let resumed_shard = self.recovery_cursor.reap_colocated_shard;
+        let first_shard = resumed_shard.unwrap_or(0);
         for shard in first_shard..self.format.shard_count() {
             // Every early return below resumes at this shard.
             self.recovery_cursor.reap_colocated_shard = Some(shard);
@@ -565,6 +566,18 @@ impl Queue {
                 },
             ) {
                 Ok(entries) => entries,
+                // A shard that exhausts the pass it was resumed in would
+                // stall every later pass, so it is skipped for this cycle.
+                Err(RecoveryDirectoryError::BudgetExhausted) if resumed_shard == Some(shard) => {
+                    stats.scan_skips += 1;
+                    Self::block_phase(
+                        stats,
+                        "reap_entry_read",
+                        &ready_dir,
+                        "ready shard does not fit in one recovery pass's scan and time budget",
+                    );
+                    continue;
+                }
                 Err(error) => {
                     stats.scan_skips += 1;
                     if Self::record_directory_error(stats, "reap_entry_read", &ready_dir, &error) {

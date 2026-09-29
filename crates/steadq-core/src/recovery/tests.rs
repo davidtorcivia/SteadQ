@@ -5149,21 +5149,36 @@ fn colocated_reap_streams_a_ready_shard_past_the_bounded_read_size() {
 }
 
 #[test]
-fn colocated_reap_resumes_a_shard_that_outgrows_the_pass() {
-    let (tmp, mut queue) = lease_one_per_shard(1);
-    enqueue_for_shard(&mut queue, &tmp, 0, None, b"backlog");
+fn colocated_reap_skips_a_shard_that_outgrows_a_whole_pass() {
+    let (tmp, mut queue) = lease_one_per_shard(2);
+    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-a");
+    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-b");
+    // Shard 0 holds one entry and fits; shard 1 holds three and does not.
     let small = RecoveryScanBudget {
         max_directories_read: 2,
-        max_entries_read: 1,
+        max_entries_read: 3,
         max_name_bytes_read: u64::MAX,
     };
     queue.recovery_cursor.reap_colocated_shard = Some(0);
-    let stats = reap_expired_with_scan_budget(&mut queue, &small);
-    assert_eq!(stats.leases_reaped, 0, "errors: {:?}", stats.errors);
-    assert!(stats.budget_exhausted);
-    assert!(!stats.phase_blocked);
-    assert_eq!(stats.scan_skips, 1);
-    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+    let first = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    assert!(!first.phase_blocked);
+    assert_eq!(first.scan_skips, 1);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+
+    // Resumed with a fresh budget, shard 1 still does not fit, so the phase
+    // moves on instead of stalling every later pass.
+    let second = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(second.leases_reaped, 0, "errors: {:?}", second.errors);
+    assert!(!second.budget_exhausted);
+    assert!(second.phase_blocked);
+    assert_eq!(second.scan_skips, 1);
+    assert!(second
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0001"));
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
 }
 
 #[test]
