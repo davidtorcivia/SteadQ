@@ -5,7 +5,9 @@ mod consumer;
 mod cursors;
 pub mod engine;
 mod inspect;
-pub(crate) use inspect::{copy_file_to_path, raw_read_open_flags};
+pub(crate) use inspect::{
+    copy_file_to_path, open_regular_read, raw_read_open_flags, regular_open_error,
+};
 pub mod layout;
 mod lease;
 mod options;
@@ -167,6 +169,15 @@ pub(super) fn is_singly_linked_regular(mode: libc::mode_t, link_count: libc::nli
 pub(super) fn stat_matches_witness(stat: &libc::stat, device: u64, inode: u64) -> bool {
     is_singly_linked_regular(stat.st_mode, stat.st_nlink)
         && identity_matches(stat.st_dev, stat.st_ino, device, inode)
+}
+
+/// Lock files are never opened through a symlink and never inherited by a
+/// child process, which would keep holding the OFD lock after this handle.
+pub(crate) fn lock_open_flags(access: i32) -> i32 {
+    access
+        .checked_add(libc::O_CLOEXEC)
+        .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .expect("Linux open flags fit i32")
 }
 
 pub(super) fn resolver_file_open_flags() -> i32 {
@@ -375,7 +386,12 @@ impl Queue {
         let lock_fd =
             fs::create_exclusive(control_fd.as_fd(), "maintenance.lock", 0o600).or_else(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
-                    fs::openat(control_fd.as_fd(), "maintenance.lock", libc::O_RDWR, 0o600)
+                    fs::openat(
+                        control_fd.as_fd(),
+                        "maintenance.lock",
+                        lock_open_flags(libc::O_RDWR),
+                        0o600,
+                    )
                 } else {
                     Err(e)
                 }
@@ -438,7 +454,12 @@ impl Queue {
         for lock_file in ["maintenance.lock", "wall-watermark.lock", "recovery.lock"] {
             let fd = fs::create_exclusive(control_fd.as_fd(), lock_file, 0o600).or_else(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
-                    fs::openat(control_fd.as_fd(), lock_file, 0o2, 0o600)
+                    fs::openat(
+                        control_fd.as_fd(),
+                        lock_file,
+                        lock_open_flags(libc::O_RDWR),
+                        0o600,
+                    )
                 } else {
                     Err(e)
                 }
@@ -550,8 +571,8 @@ impl Queue {
 
         // Read FORMAT through descriptor-relative open, not pathname.
         // If FORMAT is absent, check whether an initialization was interrupted.
-        let format_fd = match fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0) {
-            Ok(fd) => fd,
+        let format_fd = match open_regular_read(root_fd.as_fd(), "FORMAT") {
+            Ok((fd, _)) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 if fs::fstatat(root_fd.as_fd(), ".initializing").is_ok() {
                     return Err(Error::QueueCorrupt(
@@ -561,20 +582,20 @@ impl Queue {
                 }
                 return Err(Error::QueueCorrupt("FORMAT file is missing".into()));
             }
-            Err(e) => return Err(Error::from(e)),
+            Err(e) => return Err(regular_open_error(e)),
         };
-        let mut format_bytes = Vec::new();
-        {
-            let mut buf = [0u8; 4096];
-            loop {
-                match fs::read(format_fd.as_fd(), &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => format_bytes.extend_from_slice(&buf[..n]),
-                    Err(e) => return Err(Error::from(e)),
-                }
+        // One byte past the record is enough for decode to reject the size.
+        let mut format_buf = [0u8; steadq_format::FORMAT_SIZE + 1];
+        let mut format_len = 0;
+        while format_len < format_buf.len() {
+            match fs::read(format_fd.as_fd(), &mut format_buf[format_len..]) {
+                Ok(0) => break,
+                Ok(n) => format_len += n,
+                Err(e) => return Err(Error::from(e)),
             }
         }
-        let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
+        let format_bytes = &format_buf[..format_len];
+        let format_rec = FormatRecord::decode(format_bytes).map_err(|e| match e {
             steadq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
         })?;
@@ -631,8 +652,13 @@ impl Queue {
         let worker_nonce = fs::random_128bit().map_err(Error::from)?;
 
         // Acquire shared maintenance lock
-        let maint_fd = fs::openat(root_fd.as_fd(), "control/maintenance.lock", 0o0, 0o600)
-            .map_err(Error::from)?;
+        let maint_fd = fs::openat(
+            root_fd.as_fd(),
+            "control/maintenance.lock",
+            lock_open_flags(libc::O_RDONLY),
+            0,
+        )
+        .map_err(Error::from)?;
         let locked = fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(Error::from)?;
         if !locked {
             return Err(Error::MaintenanceBusy);

@@ -7899,3 +7899,198 @@ fn claim_preserves_resource_exhaustion_before_rename() {
         }
     }
 }
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c_path` is NUL-terminated and outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+}
+
+fn fd_is_cloexec(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: F_GETFD reads descriptor flags of a live descriptor.
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFD) };
+    assert!(flags >= 0);
+    flags & libc::FD_CLOEXEC != 0
+}
+
+#[test]
+fn lock_files_open_close_on_exec_without_following_symlinks() {
+    for access in [libc::O_RDONLY, libc::O_RDWR] {
+        assert_eq!(
+            lock_open_flags(access),
+            access | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+    }
+    let (_tmp, queue) = create_test_queue();
+    assert!(fd_is_cloexec(
+        queue._maint_lock_fd.as_ref().unwrap().as_fd()
+    ));
+}
+
+#[test]
+fn raw_reads_never_block_follow_or_leak() {
+    assert_eq!(
+        raw_read_open_flags(),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+    );
+}
+
+fn first_ready_job(tmp: &TempDir, queue: &mut Queue) -> (String, String) {
+    let ticket = match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: b"payload".to_vec(),
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(ticket) => ticket,
+        other => panic!("enqueue failed: {other:?}"),
+    };
+    assert!(tmp.path().join(&ticket.expected_relative_path).exists());
+    let (dir, name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+    (dir.to_string(), name.to_string())
+}
+
+fn validate_ready(queue: &Queue, dir: &str, name: &str) -> Result<FixedHeader, Error> {
+    let dir_fd = open_relative(queue.root_fd(), dir).unwrap();
+    let shard = dir.rsplit_once('/').unwrap().1.to_string();
+    queue.validate_active_object(
+        dir_fd.as_fd(),
+        name,
+        &crate::ActivePathContext::Ready { shard },
+    )
+}
+
+#[test]
+fn truncated_active_object_is_corrupt_not_io() {
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(&dir).join(&name);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(100)
+        .unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert!(matches!(
+        verified::verify_envelope_on_fd(file.as_fd()),
+        Err(verified::VerificationError::Corrupt(_))
+    ));
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::QueueCorrupt(_))
+    ));
+}
+
+#[test]
+fn active_object_fifo_or_symlink_is_corrupt_without_blocking() {
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(&dir).join(&name);
+    let saved = tmp.path().join("saved.sqj");
+    std::fs::rename(&path, &saved).unwrap();
+
+    std::os::unix::fs::symlink(&saved, &path).unwrap();
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::QueueCorrupt(_))
+    ));
+    std::fs::remove_file(&path).unwrap();
+
+    mkfifo(&path);
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::QueueCorrupt(_))
+    ));
+    std::fs::remove_file(&path).unwrap();
+
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::IoFailure(_))
+    ));
+}
+
+#[test]
+fn open_rejects_oversize_symlinked_or_fifo_format() {
+    let open = |tmp: &TempDir| {
+        Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+    };
+    let (tmp, queue) = create_test_queue();
+    drop(queue);
+    let format = tmp.path().join("FORMAT");
+    let original = std::fs::read(&format).unwrap();
+
+    std::fs::remove_file(&format).unwrap();
+    let mut oversize = original.clone();
+    oversize.push(0);
+    std::fs::write(&format, &oversize).unwrap();
+    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+
+    std::fs::remove_file(&format).unwrap();
+    std::fs::write(tmp.path().join("FORMAT.real"), &original).unwrap();
+    std::os::unix::fs::symlink("FORMAT.real", &format).unwrap();
+    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+
+    std::fs::remove_file(&format).unwrap();
+    mkfifo(&format);
+    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+
+    std::fs::remove_file(&format).unwrap();
+    std::fs::write(&format, &original).unwrap();
+    open(&tmp).unwrap();
+}
+
+#[test]
+fn open_rejects_a_fifo_recovery_cursor_without_blocking() {
+    let (tmp, queue) = create_test_queue();
+    drop(queue);
+    mkfifo(&tmp.path().join("control/recovery-cursor.json"));
+    let result = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(result, Err(Error::QueueCorrupt(_))));
+}
+
+fn bury_one(queue: &mut Queue) -> LeaseInfo {
+    queue.enqueue(EnqueueInput {
+        maximum_attempts: 1,
+        content_type: "x".to_string(),
+        payload: b"dead job payload".to_vec(),
+        ..Default::default()
+    });
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(l) => l,
+        o => panic!("lease failed: {o:?}"),
+    };
+    queue
+        .bury(&lease, DeadReason::AdministrativeBury)
+        .commit_or_panic();
+    lease
+}
+
+#[test]
+fn export_dead_refuses_an_existing_output_and_a_fifo_source() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let output = tmp.path().join("exported.bin");
+    std::fs::write(&output, b"keep").unwrap();
+    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+
+    let dead = find_file_with_suffix(&tmp.path().join("dead"), ".sqj").unwrap();
+    std::fs::remove_file(&dead).unwrap();
+    mkfifo(&dead);
+    std::fs::remove_file(&output).unwrap();
+    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert!(!output.exists());
+}

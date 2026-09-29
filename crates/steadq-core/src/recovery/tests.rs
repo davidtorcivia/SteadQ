@@ -2511,7 +2511,7 @@ fn recovery_cursor_record_boundary_table() {
     assert_eq!(RECOVERY_CURSOR_MAX_BYTES, 16_384);
     assert_eq!(
         RECOVERY_CURSOR_OPEN_FLAGS,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
     );
     assert_eq!(
         RECOVERY_LOCK_OPEN_FLAGS,

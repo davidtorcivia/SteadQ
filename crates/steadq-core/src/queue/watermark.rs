@@ -216,7 +216,7 @@ impl Queue {
         let lock_fd = fs::openat(
             control_fd.as_fd(),
             "wall-watermark.lock",
-            libc::O_RDWR,
+            lock_open_flags(libc::O_RDWR),
             0o600,
         )
         .map_err(Error::from)?;

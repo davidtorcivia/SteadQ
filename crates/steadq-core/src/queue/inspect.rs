@@ -521,13 +521,7 @@ impl Queue {
         name: &str,
         ctx: &ActivePathContext,
     ) -> Result<FixedHeader, Error> {
-        // Stat with NOFOLLOW
-        let stat = fs::fstatat(dir_fd, name).map_err(Error::from)?;
-
-        // Regular file
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(Error::QueueCorrupt(format!("{name}: not a regular file")));
-        }
+        let (file_fd, stat) = open_regular_read(dir_fd, name).map_err(regular_open_error)?;
 
         // Link count
         if stat.st_nlink != 1 {
@@ -538,9 +532,6 @@ impl Queue {
         }
 
         // Use central verifier for header, extension, envelope, and size.
-        // stat has already been collected for mode and nlink; verify_envelope_on_fd
-        // will re-stat the fd for size, which is fine since the fd is held open.
-        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0).map_err(Error::from)?;
         let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
         let header = verified.header();
 
@@ -778,19 +769,70 @@ fn open_child_dir(parent: BorrowedFd<'_>, name: &str) -> Result<Option<OwnedFd>,
     }
 }
 
-/// Read-only open of an object by name, never through a symlink.
+/// Read-only open of an object by name: never through a symlink, never
+/// blocking on a FIFO, never inherited by a child process.
 pub(crate) fn raw_read_open_flags() -> i32 {
-    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
 }
 
-/// Copy the whole file behind `file_fd` to a new file at `output` and sync
-/// it. Returns the bytes written.
+/// Open `name` under `dir_fd` for reading and require a regular file. A
+/// symlink or any other file type is `InvalidData`; see `regular_open_error`.
+pub(crate) fn open_regular_read(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+) -> std::io::Result<(OwnedFd, libc::stat)> {
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{name}: not a regular file"),
+        )
+    };
+    let fd = fs::openat(dir_fd, name, raw_read_open_flags(), 0).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            not_regular()
+        } else {
+            error
+        }
+    })?;
+    let stat = fs::fstat(fd.as_fd())?;
+    if !is_regular(&stat) {
+        return Err(not_regular());
+    }
+    Ok((fd, stat))
+}
+
+/// A file that is not regular is corruption; anything else is I/O.
+pub(crate) fn regular_open_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        Error::QueueCorrupt(error.to_string())
+    } else {
+        Error::from(error)
+    }
+}
+
+fn is_regular(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+/// Copy the regular file behind `file_fd` to `output`, which must not
+/// exist yet, and sync it. Returns the bytes written.
 pub(crate) fn copy_file_to_path(
     file_fd: BorrowedFd<'_>,
     output: &std::path::Path,
 ) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !is_regular(&fs::fstat(file_fd)?) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "export source is not a regular file",
+        ));
+    }
     let mut source = std::fs::File::from(file_fd.try_clone_to_owned()?);
-    let mut out = std::fs::File::create(output)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(output)?;
     let written = std::io::copy(&mut source, &mut out)?;
     out.sync_all()?;
     Ok(written)
