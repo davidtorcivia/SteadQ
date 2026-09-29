@@ -798,13 +798,8 @@ impl Queue {
 
         // Verify name tag using path-derived context.
         let path_parts: Vec<&str> = full_path.split('/').collect();
-        let tag_ok = self.fsck_verify_name_tag(
-            state_name,
-            &path_parts,
-            &common,
-            parsed_tag,
-            queue_id,
-        );
+        let tag_ok =
+            self.fsck_verify_name_tag(state_name, &path_parts, &common, parsed_tag, queue_id);
         if !tag_ok {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -1483,7 +1478,8 @@ mod tests {
 
     #[test]
     fn fsck_ignores_an_object_moved_during_the_scan() {
-        for (fault, count, finding_type) in [("fstatat", 1, "stat_failed"), ("openat", 1, "open_failed")]
+        for (fault, count, finding_type) in
+            [("fstatat", 1, "stat_failed"), ("openat", 1, "open_failed")]
         {
             for errno in [libc::ENOENT, libc::EIO] {
                 let tmp = TempDir::new().unwrap();
@@ -1531,8 +1527,16 @@ mod tests {
             fs::fault::inject_errno(fault, count, libc::EIO);
             let removed = queue.remove_quarantine(&[0x42; 16]);
             fs::fault::reset();
-            assert_eq!(listed.unwrap_err().raw_os_error(), Some(libc::EIO), "{fault}");
-            assert_eq!(removed.unwrap_err().raw_os_error(), Some(libc::EIO), "{fault}");
+            assert_eq!(
+                listed.unwrap_err().raw_os_error(),
+                Some(libc::EIO),
+                "{fault}"
+            );
+            assert_eq!(
+                removed.unwrap_err().raw_os_error(),
+                Some(libc::EIO),
+                "{fault}"
+            );
             assert!(tmp.path().join("quarantine").join(&name).exists());
         }
     }

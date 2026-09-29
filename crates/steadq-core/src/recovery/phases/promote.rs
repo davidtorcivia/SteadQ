@@ -368,7 +368,8 @@ impl Queue {
                     }
                 }
 
-                if !bucket_is_drained || !all_observed_children_absent(absent_entries, entries.len())
+                if !bucket_is_drained
+                    || !all_observed_children_absent(absent_entries, entries.len())
                 {
                     continue;
                 }
@@ -393,7 +394,8 @@ impl Queue {
                 }
             }
 
-            if !bucket_is_drained || !all_observed_children_absent(absent_shards, shard_dirs.len()) {
+            if !bucket_is_drained || !all_observed_children_absent(absent_shards, shard_dirs.len())
+            {
                 continue;
             }
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {

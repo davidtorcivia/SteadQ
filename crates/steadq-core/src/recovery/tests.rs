@@ -1469,11 +1469,10 @@ fn readdir_permutations_preserve_promotion_budget_boundaries() {
     drop(queue);
     assert!(delayed.iter().all(|path| path.exists()));
 
-    for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+    for (pass, &(rotation, reversed)) in RECOVERY_READ_PERMUTATIONS.iter().enumerate() {
         let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
         // Removing a drained shard or bucket spends the one operation too.
         for attempt in 0.. {
-            let (rotation, reversed) = RECOVERY_READ_PERMUTATIONS[pass];
             fs::fault::permute_readdir(rotation, reversed);
             let scan_budget = RecoveryScanBudget::default();
             let mut scan_stats = RecoveryScanStats::default();
@@ -3281,7 +3280,8 @@ fn recovery_quarantines_malformed_leased_filename() {
         stats.errors
     );
     assert!(queue
-        .list_quarantine().unwrap()
+        .list_quarantine()
+        .unwrap()
         .iter()
         .any(|entry| entry.reason == crate::QuarantineReason::FilenameParseFailed as u16));
     assert!(!dir.join("not-a-leased-name.sqj").exists());
@@ -4070,7 +4070,12 @@ fn recovery_cursor_sweep_failures_are_recorded_and_recovery_continues() {
     for (fault, count, operation, orphan_remains) in [
         ("open_directory", 2, "recovery_cursor_sweep", true),
         ("unlinkat", 1, "recovery_cursor_sweep_not_committed", true),
-        ("fsync_dir_fd", 1, "recovery_cursor_sweep_outcome_unknown", false),
+        (
+            "fsync_dir_fd",
+            1,
+            "recovery_cursor_sweep_outcome_unknown",
+            false,
+        ),
     ] {
         let (tmp, mut queue) = create_test_queue();
         let orphan = tmp
@@ -4084,7 +4089,11 @@ fn recovery_cursor_sweep_failures_are_recorded_and_recovery_continues() {
         assert_eq!(stats.errors.len(), 1, "{fault}: {:?}", stats.errors);
         assert_eq!(stats.errors[0].operation, operation);
         assert_eq!(orphan.exists(), orphan_remains, "{fault}");
-        assert!(tmp.path().join("control").join(RECOVERY_CURSOR_FILE).exists());
+        assert!(tmp
+            .path()
+            .join("control")
+            .join(RECOVERY_CURSOR_FILE)
+            .exists());
     }
 }
 
@@ -5027,9 +5036,10 @@ fn stream_with(
     RecoveryScanStats,
 ) {
     let mut stats = RecoveryScanStats::default();
-    let result = stream_recovery_directory(dir.as_fd(), deadline_mono, budget, &mut stats, |name| {
-        name.as_bytes().len() == 2
-    });
+    let result =
+        stream_recovery_directory(dir.as_fd(), deadline_mono, budget, &mut stats, |name| {
+            name.as_bytes().len() == 2
+        });
     (result, stats)
 }
 
@@ -5086,11 +5096,17 @@ fn streamed_directory_refuses_without_read_or_time_budget() {
         max_name_bytes_read: u64::MAX,
     };
     let (result, stats) = stream_with(&dir, &no_reads, u64::MAX);
-    assert!(matches!(result, Err(RecoveryDirectoryError::BudgetExhausted)));
+    assert!(matches!(
+        result,
+        Err(RecoveryDirectoryError::BudgetExhausted)
+    ));
     assert_eq!(stats, RecoveryScanStats::default());
 
     let (result, stats) = stream_with(&dir, &RecoveryScanBudget::default(), 0);
-    assert!(matches!(result, Err(RecoveryDirectoryError::BudgetExhausted)));
+    assert!(matches!(
+        result,
+        Err(RecoveryDirectoryError::BudgetExhausted)
+    ));
     assert_eq!(stats.directories_read, 1);
     assert_eq!(stats.entries_read, 0);
 }
@@ -5441,7 +5457,10 @@ fn receipt_verification_io_failure_is_recorded_without_quarantine() {
             "receipt_delete_invalid"
         };
         assert!(
-            stats.errors.iter().any(|error| error.operation == operation),
+            stats
+                .errors
+                .iter()
+                .any(|error| error.operation == operation),
             "errors: {:?}",
             stats.errors
         );

@@ -565,7 +565,12 @@ impl Queue {
         let (control_fd, names) = match names {
             Ok(found) => found,
             Err(error) => {
-                Self::record_error(stats, "recovery_cursor_sweep", "control", &error.to_string());
+                Self::record_error(
+                    stats,
+                    "recovery_cursor_sweep",
+                    "control",
+                    &error.to_string(),
+                );
                 return;
             }
         };

@@ -561,8 +561,14 @@ impl Queue {
                     ) {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
-                            Self::record_error(stats, "receipt_compact_invalid", &relative_path, &error.to_string());
+                            let relative_path =
+                                format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                            Self::record_error(
+                                stats,
+                                "receipt_compact_invalid",
+                                &relative_path,
+                                &error.to_string(),
+                            );
                             if let Some(reason) = receipt_quarantine_reason(&error) {
                                 if !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {
@@ -1058,8 +1064,14 @@ impl Queue {
                     ) {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
-                            Self::record_error(stats, "receipt_delete_invalid", &relative_path, &error.to_string());
+                            let relative_path =
+                                format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                            Self::record_error(
+                                stats,
+                                "receipt_delete_invalid",
+                                &relative_path,
+                                &error.to_string(),
+                            );
                             if let Some(reason) = receipt_quarantine_reason(&error) {
                                 if !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {

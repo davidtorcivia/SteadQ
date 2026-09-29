@@ -421,7 +421,12 @@ impl Queue {
                         if let Err(e) =
                             self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
                         {
-                            Self::record_error(stats, "reap_validate", &relative_path, &format!("{e}"));
+                            Self::record_error(
+                                stats,
+                                "reap_validate",
+                                &relative_path,
+                                &format!("{e}"),
+                            );
                             // Quarantine corrupt objects
                             if matches!(e, Error::QueueCorrupt(_))
                                 && !self.quarantine_recovery_object(
@@ -495,12 +500,8 @@ impl Queue {
                             }
                         } else {
                             stats.operations_attempted += 1;
-                            match self.reap_to_ready(
-                                shard_fd.as_fd(),
-                                shard,
-                                entry,
-                                &parsed.common,
-                            ) {
+                            match self.reap_to_ready(shard_fd.as_fd(), shard, entry, &parsed.common)
+                            {
                                 Ok(()) => stats.leases_reaped += 1,
                                 Err(failure) => Self::record_move_failure(
                                     stats,
