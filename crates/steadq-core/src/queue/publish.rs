@@ -208,25 +208,14 @@ impl Queue {
             Ok(p) => p,
             Err((ticket, err)) => return EnqueueOutcome::NotCommitted(ticket, err),
         };
-        let result = if let Some(d) = dirty {
-            self.write_and_publish_with_dirty(
-                &prepared.dest_dir,
-                &prepared.filename,
-                &prepared.header,
-                &prepared.ext_bytes,
-                &prepared.payload,
-                Some(d),
-            )
-        } else {
-            self.write_and_publish_with_dirty(
-                &prepared.dest_dir,
-                &prepared.filename,
-                &prepared.header,
-                &prepared.ext_bytes,
-                &prepared.payload,
-                None,
-            )
-        };
+        let result = self.write_and_publish_with_dirty(
+            &prepared.dest_dir,
+            &prepared.filename,
+            &prepared.header,
+            &prepared.ext_bytes,
+            &prepared.payload,
+            dirty,
+        );
         match result {
             Ok(()) => {
                 if let Some(shard) = prepared.ready_shard_hint {
@@ -277,17 +266,11 @@ impl Queue {
     /// dirty directories that were recorded, deduplicated by device and inode.
     pub fn sync(&self) -> io::Result<()> {
         if self.deferred_dir_sync {
-            let result = {
-                let dirty = self.dirty.borrow();
-                if dirty.is_empty() {
-                    return Ok(());
-                }
-                dirty.sync_all()
-            };
-            if result.is_ok() {
-                self.dirty.borrow_mut().clear();
+            let mut dirty = self.dirty.borrow_mut();
+            if dirty.is_empty() {
+                return Ok(());
             }
-            return result;
+            return self.sync_dirty(&mut dirty);
         }
         for dir in [
             "ready",
@@ -324,13 +307,8 @@ impl Queue {
         mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<(), PublishError> {
         // Ensure destination directory exists
-        if let Some(d) = dirty.as_deref_mut() {
-            self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        } else {
-            self.ensure_dir(dest_dir_relative)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        }
+        self.ensure_dir_with_dirty(dest_dir_relative, dirty.as_deref_mut())
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
         let dest_fd = self
             .open_or_cache_dir(dest_dir_relative)
@@ -427,13 +405,8 @@ impl Queue {
     ) -> Result<(), PublishError> {
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_dir = format!("tmp/{}/{}", self.boot_id, shard_part);
-        if let Some(d) = dirty.as_deref_mut() {
-            self.ensure_dir_with_dirty(&tmp_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        } else {
-            self.ensure_dir(&tmp_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        }
+        self.ensure_dir_with_dirty(&tmp_dir, dirty.as_deref_mut())
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_dir)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let boottime =
@@ -513,47 +486,85 @@ impl Queue {
         }
     }
 
-    /// Create a directory path recursively, syncing parents.
+    /// Create a directory path recursively with every parent entry synced.
+    /// Always strict: callers of this form finish with a strict move.
     pub(crate) fn ensure_dir(&self, relative: &str) -> io::Result<()> {
-        if self.known_dirs.borrow().contains(relative) {
-            return Ok(());
-        }
-        if self.deferred_dir_sync {
-            let mut dirty = self.dirty.borrow_mut();
-            return self.ensure_dir_with_dirty(relative, Some(&mut dirty));
-        }
         self.ensure_dir_with_dirty(relative, None)
     }
 
+    /// Create a directory path recursively. Each directory this handle has
+    /// not yet seen gets its parent synced, or recorded in `dirty`, whether
+    /// this call created it or found it: another process may have created
+    /// it and crashed before its own barrier. A directory counts as known
+    /// only once that barrier completed.
     pub(crate) fn ensure_dir_with_dirty(
         &self,
         relative: &str,
         mut dirty: Option<&mut engine::DirtySet>,
     ) -> io::Result<()> {
-        if self.known_dirs.borrow().contains(relative) {
+        if self.dir_is_known(relative, dirty.as_deref()) {
             return Ok(());
         }
         if let Some(bucket) = sharded_bucket_parent(relative, self.format.shard_count()) {
             return self.ensure_sharded_bucket_with_dirty(bucket, dirty);
         }
-        let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+        let mut path = String::with_capacity(relative.len());
         let mut current = None::<OwnedFd>;
-
-        for comp in components {
+        for comp in relative.split('/').filter(|s| !s.is_empty()) {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(comp);
             let parent = current
                 .as_ref()
                 .map_or(self.root_fd.as_fd(), |directory| directory.as_fd());
-            let was_created = fs::mkdirat_eexist_ok(parent, comp, 0o700)?;
+            let known = self.dir_is_known(&path, dirty.as_deref());
+            if !known {
+                fs::mkdirat_eexist_ok(parent, comp, 0o700)?;
+            }
             let child = fs::open_directory(parent, comp)?;
-            if was_created {
-                match &mut dirty {
-                    Some(set) => set.record(parent)?,
-                    None => fs::fsync_dir_fd(parent)?,
-                }
+            if !known {
+                self.sync_parent_of(parent, [path.clone()], dirty.as_deref_mut())?;
             }
             current = Some(child);
         }
-        self.known_dirs.borrow_mut().insert(relative.to_string());
+        Ok(())
+    }
+
+    fn dir_is_known(&self, relative: &str, dirty: Option<&engine::DirtySet>) -> bool {
+        self.known_dirs.borrow().contains(relative)
+            || dirty.is_some_and(|set| set.pending_dirs.contains(relative))
+    }
+
+    /// Sync `parent` now and mark `children` known, or record `parent` in
+    /// `dirty` and leave `children` pending until that set syncs.
+    fn sync_parent_of(
+        &self,
+        parent: BorrowedFd<'_>,
+        children: impl IntoIterator<Item = String>,
+        dirty: Option<&mut engine::DirtySet>,
+    ) -> io::Result<()> {
+        match dirty {
+            Some(set) => {
+                set.record(parent)?;
+                set.pending_dirs.extend(children);
+            }
+            None => {
+                fs::fsync_dir_fd(parent)?;
+                self.known_dirs.borrow_mut().extend(children);
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a dirty set's barrier, then mark its pending directories known.
+    /// A failed barrier keeps the set intact for a later attempt.
+    pub(super) fn sync_dirty(&self, dirty: &mut engine::DirtySet) -> io::Result<()> {
+        dirty.sync_all()?;
+        self.known_dirs
+            .borrow_mut()
+            .extend(dirty.pending_dirs.drain());
+        dirty.clear();
         Ok(())
     }
 
@@ -568,15 +579,11 @@ impl Queue {
         for shard in 0..shard_count {
             fs::mkdirat_eexist_ok(bucket_fd.as_fd(), &shard_hex(shard), 0o700)?;
         }
-        match dirty {
-            Some(set) => set.record(bucket_fd.as_fd())?,
-            None => fs::fsync_dir_fd(bucket_fd.as_fd())?,
-        }
-        let mut known = self.known_dirs.borrow_mut();
-        for shard in 0..shard_count {
-            known.insert(format!("{bucket}/{}", shard_hex(shard)));
-        }
-        Ok(())
+        self.sync_parent_of(
+            bucket_fd.as_fd(),
+            (0..shard_count).map(|shard| format!("{bucket}/{}", shard_hex(shard))),
+            dirty,
+        )
     }
 
     /// Enqueue a job from a streaming payload source. The payload is written
@@ -790,13 +797,8 @@ impl Queue {
         reader: &mut dyn std::io::Read,
         mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<[u8; 32], PublishError> {
-        if let Some(d) = dirty.as_deref_mut() {
-            self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        } else {
-            self.ensure_dir(dest_dir_relative)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        }
+        self.ensure_dir_with_dirty(dest_dir_relative, dirty.as_deref_mut())
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
 
@@ -971,13 +973,8 @@ impl Queue {
         let tmp_dir = format!("tmp/{}", self.boot_id);
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
-        if let Some(d) = dirty.as_deref_mut() {
-            self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        } else {
-            self.ensure_dir(&tmp_shard_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        }
+        self.ensure_dir_with_dirty(&tmp_shard_dir, dirty.as_deref_mut())
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let boottime =
@@ -1041,13 +1038,8 @@ impl Queue {
         let tmp_dir = format!("tmp/{}", self.boot_id);
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
-        if let Some(d) = dirty.as_deref_mut() {
-            self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        } else {
-            self.ensure_dir(&tmp_shard_dir)
-                .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        }
+        self.ensure_dir_with_dirty(&tmp_shard_dir, dirty.as_deref_mut())
+            .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
         let boottime =

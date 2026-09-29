@@ -854,25 +854,189 @@ fn dirtyset_record_deduplicates_and_sync_all_fsyncs() {
     assert!(dirty.is_empty());
 }
 
+fn dir_identity(path: &Path) -> (u64, u64) {
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+fn delayed_input(payload: &[u8]) -> EnqueueInput {
+    EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".into(),
+        initial_not_before: Some(fs::clock_realtime_ns().unwrap() + 3_600_000_000_000),
+        payload: payload.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// Run `op` with every fsync_dir_fd recorded, and return what it synced.
+fn synced_dirs<T>(op: impl FnOnce() -> T) -> (T, Vec<(u64, u64)>) {
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    let result = op();
+    let synced = fs::fault::fd_identities("fsync_dir_fd");
+    fs::fault::reset();
+    (result, synced)
+}
+
+fn committed_path(tmp: &TempDir, outcome: EnqueueOutcome) -> PathBuf {
+    match outcome {
+        EnqueueOutcome::Committed(ticket) | EnqueueOutcome::Deferred(ticket) => {
+            tmp.path().join(ticket.expected_relative_path)
+        }
+        other => panic!("enqueue failed: {other:?}"),
+    }
+}
+
 #[test]
-fn dirty_ensure_skips_known_directory_without_recording_parent() {
-    let (_tmp, queue) = create_test_queue();
-    let mut initial_dirty = engine::DirtySet::new();
-    queue
-        .ensure_dir_with_dirty("ready/0000", Some(&mut initial_dirty))
-        .unwrap();
-    initial_dirty.sync_all().unwrap();
+fn strict_enqueue_syncs_bucket_entries_left_pending_by_a_dropped_batch() {
+    let (tmp, mut queue) = create_test_queue();
+    {
+        let mut batch = queue.batch();
+        assert!(matches!(
+            batch.enqueue(delayed_input(b"dropped")),
+            BatchEnqueueOutcome::Pending(_)
+        ));
+    }
+    let (outcome, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"strict")));
+    let job = committed_path(&tmp, outcome);
+    let bucket = job.parent().unwrap().parent().unwrap();
+    assert!(synced.contains(&dir_identity(bucket)));
+    assert!(synced.contains(&dir_identity(&tmp.path().join("delayed"))));
+}
 
-    fs::fault::reset();
-    fs::fault::inject_errno("mkdirat", 1, libc::EIO);
-    let mut next_dirty = engine::DirtySet::new();
-    let result = queue.ensure_dir_with_dirty("ready/0000", Some(&mut next_dirty));
-    let mkdir_calls = fs::fault::call_count("mkdirat");
-    fs::fault::reset();
+#[test]
+fn batch_commit_marks_its_directories_durable() {
+    let (tmp, mut queue) = create_test_queue();
+    let mut batch = queue.batch();
+    assert!(matches!(
+        batch.enqueue(delayed_input(b"batched")),
+        BatchEnqueueOutcome::Pending(_)
+    ));
+    batch.commit().unwrap();
+    let (outcome, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"strict")));
+    let job = committed_path(&tmp, outcome);
+    let bucket = job.parent().unwrap().parent().unwrap();
+    assert!(!synced.contains(&dir_identity(bucket)));
+    assert!(!synced.contains(&dir_identity(&tmp.path().join("delayed"))));
+}
 
-    assert!(result.is_ok());
-    assert_eq!(mkdir_calls, 0);
-    assert!(next_dirty.is_empty());
+#[test]
+fn first_sighting_of_an_existing_bucket_syncs_its_parent_once() {
+    let (tmp, mut queue) = create_test_queue();
+    let mut other = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Another handle created the bucket; this handle cannot know whether
+    // that creator reached its barrier.
+    committed_path(&tmp, other.enqueue(delayed_input(b"other")));
+    let delayed = dir_identity(&tmp.path().join("delayed"));
+
+    let (first, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"first")));
+    committed_path(&tmp, first);
+    assert!(synced.contains(&delayed));
+
+    let (second, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"second")));
+    let job = committed_path(&tmp, second);
+    assert!(!synced.contains(&delayed));
+    assert!(!synced.contains(&dir_identity(job.parent().unwrap().parent().unwrap())));
+}
+
+#[test]
+fn deferred_directories_become_known_only_after_sync() {
+    let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let job = committed_path(&tmp, queue.enqueue(delayed_input(b"deferred")));
+    let shard = job.parent().unwrap();
+    let relative = shard
+        .strip_prefix(tmp.path())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Pending: a strict caller must still sync the bucket.
+    let (result, synced) = synced_dirs(|| queue.ensure_dir_with_dirty(&relative, None));
+    result.unwrap();
+    assert!(synced.contains(&dir_identity(shard.parent().unwrap())));
+
+    let job = committed_path(&tmp, queue.enqueue(delayed_input(b"second")));
+    queue.sync().unwrap();
+    assert!(queue.dirty.borrow().is_empty());
+    let relative = format!(
+        "{}/{}",
+        relative.rsplit_once('/').unwrap().0,
+        job.parent().unwrap().file_name().unwrap().to_str().unwrap()
+    );
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    fs::fault::inject("mkdirat", u64::MAX);
+    let result = queue.ensure_dir_with_dirty(&relative, None);
+    let calls = (
+        fs::fault::call_count("mkdirat"),
+        fs::fault::call_count("fsync_dir_fd"),
+    );
+    fs::fault::reset();
+    result.unwrap();
+    assert_eq!(calls, (0, 0));
+}
+
+#[test]
+fn dead_letter_move_in_deferred_mode_syncs_its_directories_now() {
+    let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let job = committed_path(
+        &tmp,
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }),
+    );
+    queue.sync().unwrap();
+    let relative = job.strip_prefix(tmp.path()).unwrap().to_str().unwrap();
+    let (ready_dir, ready_name) = relative.rsplit_once('/').unwrap();
+    let parsed = steadq_names::parse_ready(ready_name).unwrap();
+    let wall_floor = queue.wall_floor_for_mutation().unwrap();
+
+    let (result, synced) = synced_dirs(|| {
+        queue.move_to_dead(
+            ready_dir,
+            ready_name,
+            &parsed.common,
+            DeadReason::AttemptsExhausted,
+            wall_floor,
+        )
+    });
+    result.unwrap();
+    assert!(synced.contains(&dir_identity(&tmp.path().join("dead"))));
+    assert!(queue.dirty.borrow().is_empty());
 }
 
 #[test]

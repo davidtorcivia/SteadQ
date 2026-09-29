@@ -600,16 +600,7 @@ impl Queue {
             classify_filesystem_type(fs::fs_type_magic(root), opts.allow_unsupported_fs)?;
 
         // Require all state directories to exist and be on the same device.
-        for state_dir in &[
-            "control",
-            "ready",
-            "leased",
-            "delayed",
-            "receipts",
-            "dead",
-            "quarantine",
-            "tmp",
-        ] {
+        for state_dir in STATE_DIRECTORIES {
             match fs::fstatat(root_fd.as_fd(), state_dir) {
                 Ok(stat) => {
                     if stat.st_dev != root_stat.st_dev {
@@ -649,6 +640,7 @@ impl Queue {
         let recovery_cursor =
             crate::recovery::load_recovery_cursor(root_fd.as_fd(), format_rec.queue_id())?;
         let publication_mode = filesystem_type.and_then(preferred_publication_mode);
+        let known_dirs = init_synced_directories(&format_rec);
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -664,7 +656,7 @@ impl Queue {
             recovery_cursor,
             cached_wall_floor: None,
             cached_watermark_fd: std::cell::RefCell::new(None),
-            known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
+            known_dirs: std::cell::RefCell::new(known_dirs),
             cached_dest_fd: None,
             publication_mode,
             deferred_dir_sync: opts.deferred_dir_sync,
@@ -722,6 +714,27 @@ impl Queue {
             &self.boot_id,
         )
     }
+}
+
+const STATE_DIRECTORIES: [&str; 8] = [
+    "control",
+    "ready",
+    "leased",
+    "delayed",
+    "receipts",
+    "dead",
+    "quarantine",
+    "tmp",
+];
+
+/// Directories init creates and syncs before it publishes FORMAT, so an
+/// opened queue already holds durable entries for them.
+fn init_synced_directories(format: &FormatRecord) -> std::collections::HashSet<String> {
+    STATE_DIRECTORIES
+        .iter()
+        .map(|dir| (*dir).to_string())
+        .chain((0..format.shard_count()).map(|shard| format!("ready/{}", shard_hex(shard))))
+        .collect()
 }
 
 /// Open a relative path from a directory fd.

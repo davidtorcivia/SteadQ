@@ -19,27 +19,32 @@ use crate::errors::Error;
 #[derive(Debug, Default)]
 pub struct DirtySet {
     dirs: HashMap<(u64, u64), OwnedFd>,
+    /// Directories whose parent entry is only durable once this set syncs.
+    /// The queue marks them known after a successful barrier; dropping the
+    /// set unsynced forgets them.
+    pub(super) pending_dirs: std::collections::HashSet<String>,
 }
 
 impl DirtySet {
     pub fn new() -> Self {
-        Self {
-            dirs: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn is_empty(&self) -> bool {
         self.dirs.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.dirs.len()
     }
 
     pub fn clear(&mut self) {
         self.dirs.clear();
+        self.pending_dirs.clear();
     }
 
+    #[cfg(test)]
     pub fn extend(&mut self, other: Self) {
         for (k, v) in other.dirs {
             self.dirs.entry(k).or_insert(v);
