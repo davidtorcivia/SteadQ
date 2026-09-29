@@ -8211,3 +8211,44 @@ fn ack_of_a_vanished_source_reports_receipt_probe_io_failure() {
         "{outcome:?}"
     );
 }
+
+fn temp_names(tmp: &TempDir, queue: &Queue) -> Vec<PathBuf> {
+    let mut names = Vec::new();
+    let boot = tmp.path().join("tmp").join(&queue.boot_id);
+    for shard in std::fs::read_dir(boot).into_iter().flatten().flatten() {
+        names.extend(
+            std::fs::read_dir(shard.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path()),
+        );
+    }
+    names
+}
+
+#[test]
+fn named_streaming_publication_removes_its_temp_when_nothing_committed() {
+    for (fault, count) in [("renameat2_noreplace", 1), ("pwrite", 1)] {
+        let (tmp, mut queue) = create_test_queue();
+        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+        fs::fault::reset();
+        fs::fault::inject(fault, count);
+        let outcome = queue.enqueue_streaming(
+            3,
+            "x".into(),
+            Default::default(),
+            None,
+            None,
+            None,
+            std::io::Cursor::new(b"streamed named"),
+        );
+        let reached = fs::fault::call_count(fault);
+        fs::fault::reset();
+        assert_eq!(reached, count, "{fault}");
+        assert!(
+            matches!(outcome, EnqueueOutcome::NotCommitted(..)),
+            "{fault}: {outcome:?}"
+        );
+        assert_eq!(temp_names(&tmp, &queue), Vec::<PathBuf>::new(), "{fault}");
+    }
+}

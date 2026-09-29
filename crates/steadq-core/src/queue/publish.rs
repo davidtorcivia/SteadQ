@@ -415,23 +415,7 @@ impl Queue {
         let temp_name = temp_filename(boottime, &random);
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
-        struct TempGuard<'a, 'fd> {
-            dir_fd: BorrowedFd<'fd>,
-            name: &'a str,
-            armed: bool,
-        }
-        impl Drop for TempGuard<'_, '_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let _ = fs::unlinkat(self.dir_fd, self.name);
-                }
-            }
-        }
-        let mut temp_guard = TempGuard {
-            dir_fd: tmp_dir_fd.as_fd(),
-            name: &temp_name,
-            armed: true,
-        };
+        let mut temp_guard = TempGuard::new(tmp_dir_fd.as_fd(), &temp_name);
         let header_bytes = header
             .encode(ext_bytes)
             .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
@@ -984,6 +968,7 @@ impl Queue {
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let temp_guard = TempGuard::new(tmp_dir_fd.as_fd(), &temp_name);
 
         // Write the real header to the named temp.
         let header_bytes = header
@@ -1011,9 +996,8 @@ impl Queue {
 
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
         self.finish_named_stream_publish(
-            tmp_dir_fd.as_fd(),
+            temp_guard,
             dest_fd,
-            &temp_name,
             dest_name,
             engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
             header.envelope_digest,
@@ -1049,18 +1033,13 @@ impl Queue {
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::from(e)))?;
+        let temp_guard = TempGuard::new(tmp_dir_fd.as_fd(), &temp_name);
 
         // Stream payload to named temp while hashing.
         // Write placeholder header first, then extension, then payload.
         // After streaming, pwrite real header.
         let (payload_len, payload_digest) =
-            match self.stream_payload_to_fd(tmp_file.as_fd(), ext_bytes, reader) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
-                    return Err(error);
-                }
-            };
+            self.stream_payload_to_fd(tmp_file.as_fd(), ext_bytes, reader)?;
 
         let mut header = FixedHeader {
             format_minor: FORMAT_MINOR,
@@ -1086,9 +1065,8 @@ impl Queue {
 
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
         self.finish_named_stream_publish(
-            tmp_dir_fd.as_fd(),
+            temp_guard,
             dest_fd,
-            &temp_name,
             dest_name,
             engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
             env_dig,
@@ -1096,60 +1074,82 @@ impl Queue {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Rename the named temp into place. The guard unlinks the temp when
+    /// the rename did not happen; once it happened or may have, the temp
+    /// name is left alone.
     fn finish_named_stream_publish(
         &self,
-        tmp_dir_fd: BorrowedFd<'_>,
+        mut temp: TempGuard<'_, '_>,
         dest_fd: BorrowedFd<'_>,
-        temp_name: &str,
         dest_name: &str,
         identity: engine::MoveIdentity,
         envelope_digest: [u8; 32],
         dirty: Option<&mut engine::DirtySet>,
     ) -> Result<[u8; 32], PublishError> {
-        if let Some(d) = dirty {
-            match engine::move_witnessed_noreplace_deferred(
+        let tmp_dir_fd = temp.dir_fd;
+        let result = match dirty {
+            Some(d) => engine::move_witnessed_noreplace_deferred(
                 tmp_dir_fd,
-                temp_name,
+                temp.name,
                 dest_fd,
                 dest_name,
                 identity,
                 |_moved| Ok(()),
-            ) {
-                Ok(_) => {
-                    d.record(tmp_dir_fd)
-                        .map_err(|e| PublishError::OutcomeUnknownPublished {
-                            envelope_digest,
-                            error: Error::from(e),
-                        })?;
-                    d.record(dest_fd)
-                        .map_err(|e| PublishError::OutcomeUnknownPublished {
-                            envelope_digest,
-                            error: Error::from(e),
-                        })?;
-                    Ok(envelope_digest)
-                }
-                Err(failure) => {
-                    if failure.is_outcome_unknown() {
-                        let _ = fs::unlinkat(tmp_dir_fd, temp_name);
-                    }
-                    Err(PublishError::from_move_failure(failure)
-                        .with_published_digest(envelope_digest))
-                }
+            )
+            .map(|_| Some(d)),
+            None => engine::move_witnessed_noreplace_io(
+                tmp_dir_fd, temp.name, dest_fd, dest_name, identity,
+            )
+            .map(|()| None),
+        };
+        let dirty = match result {
+            Ok(dirty) => {
+                temp.armed = false;
+                dirty
             }
-        } else {
-            match engine::move_witnessed_noreplace_io(
-                tmp_dir_fd, temp_name, dest_fd, dest_name, identity,
-            ) {
-                Ok(()) => Ok(envelope_digest),
-                Err(failure) => {
-                    if failure.is_outcome_unknown() {
-                        let _ = fs::unlinkat(tmp_dir_fd, temp_name);
-                    }
-                    Err(PublishError::from_move_failure(failure)
-                        .with_published_digest(envelope_digest))
+            Err(failure) => {
+                if failure.is_outcome_unknown() {
+                    temp.armed = false;
                 }
+                return Err(
+                    PublishError::from_move_failure(failure).with_published_digest(envelope_digest)
+                );
             }
+        };
+        if let Some(d) = dirty {
+            d.record(tmp_dir_fd)
+                .and_then(|()| d.record(dest_fd))
+                .map_err(|e| PublishError::OutcomeUnknownPublished {
+                    envelope_digest,
+                    error: Error::from(e),
+                })?;
+        }
+        Ok(envelope_digest)
+    }
+}
+
+/// Unlinks a named publication temp on drop unless disarmed. Disarm once
+/// the rename happened or may have happened.
+struct TempGuard<'a, 'fd> {
+    dir_fd: BorrowedFd<'fd>,
+    name: &'a str,
+    armed: bool,
+}
+
+impl<'a, 'fd> TempGuard<'a, 'fd> {
+    fn new(dir_fd: BorrowedFd<'fd>, name: &'a str) -> Self {
+        Self {
+            dir_fd,
+            name,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for TempGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::unlinkat(self.dir_fd, self.name);
         }
     }
 }
