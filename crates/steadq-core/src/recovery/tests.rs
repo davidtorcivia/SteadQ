@@ -1471,22 +1471,32 @@ fn readdir_permutations_preserve_promotion_budget_boundaries() {
 
     for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
         let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
-        let scan_budget = RecoveryScanBudget::default();
-        let mut scan_stats = RecoveryScanStats::default();
-        let mut scan = RecoveryScanContext {
-            budget: &scan_budget,
-            stats: &mut scan_stats,
-        };
-        let mut stats = RecoveryStats::default();
-        let wall_floor = queue.authenticated_wall_floor().unwrap();
-        queue.promote_delayed(wall_floor, &budget, &mut scan, &mut stats, u64::MAX);
-        fs::fault::reset();
-        assert_eq!(stats.operations_attempted, 1, "pass={pass}");
-        assert_eq!(
-            stats.delayed_promoted, 1,
-            "pass={pass} errors={:?}",
-            stats.errors
-        );
+        // Removing a drained shard or bucket spends the one operation too.
+        for attempt in 0.. {
+            let (rotation, reversed) = RECOVERY_READ_PERMUTATIONS[pass];
+            fs::fault::permute_readdir(rotation, reversed);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            queue.promote_delayed(wall_floor, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            if stats.delayed_promoted == 1 {
+                break;
+            }
+            assert_eq!(
+                stats.shards_removed + stats.buckets_removed,
+                1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            assert!(attempt < 3, "pass={pass} made no promotion progress");
+        }
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
         assert_removed_prefix(&delayed, pass);
@@ -5152,4 +5162,126 @@ fn colocated_reap_does_not_quarantine_on_validation_io_failure() {
         .iter()
         .any(|error| error.operation == "reap_validate"));
     assert!(source.exists());
+}
+
+fn enqueue_delayed_next_bucket(queue: &mut Queue, tmp: &TempDir) -> (PathBuf, u64) {
+    let not_before = queue
+        .authenticated_wall_floor()
+        .unwrap()
+        .unix_ns()
+        .checked_add(queue.format.delayed_bucket_width_ns())
+        .unwrap();
+    let ticket = enqueue_for_shard(queue, tmp, 0, Some(not_before), b"delayed cleanup");
+    let bucket_name = ticket.expected_relative_path.split('/').nth(1).unwrap();
+    let bucket = steadq_names::bucket_from_hex(bucket_name).unwrap();
+    (tmp.path().join("delayed").join(bucket_name), bucket)
+}
+
+#[test]
+fn promotion_removes_a_bucket_once_its_end_has_passed() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+    write_wall_watermark(&tmp, bucket + 1);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 2);
+    assert_eq!(stats.buckets_removed, 1);
+    assert_eq!(stats.operations_attempted, 4);
+    assert!(!bucket_dir.exists());
+}
+
+#[test]
+fn promotion_treats_only_a_missing_source_as_drained() {
+    // ENOENT reads as a vanished source, so the shard removal is attempted
+    // and finds the injected survivor; EIO leaves the shard alone.
+    for (errno, operations) in [(libc::ENOENT, 2), (libc::EIO, 1)] {
+        let (tmp, mut queue) = create_test_queue_with_shards(1);
+        let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+        write_wall_watermark(&tmp, bucket + 1);
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+        let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+        fs::fault::reset();
+        assert_eq!(stats.delayed_promoted, 0);
+        assert_eq!(stats.operations_attempted, operations, "errno={errno}");
+        assert_eq!(stats.shards_removed, 0);
+        assert!(bucket_dir.join("0000").exists());
+    }
+}
+
+#[test]
+fn promotion_keeps_the_current_bucket() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+    write_wall_watermark(&tmp, bucket);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 0);
+    assert_eq!(stats.buckets_removed, 0);
+    assert!(bucket_dir.join("0000").exists());
+}
+
+#[test]
+fn promotion_keeps_a_drained_shard_that_still_holds_an_entry() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let bucket = tmp.path().join("delayed/0000000000000000");
+    std::fs::create_dir_all(bucket.join("0000")).unwrap();
+    std::fs::create_dir_all(bucket.join("0001")).unwrap();
+    std::fs::write(bucket.join("0000/stray.txt"), b"stray").unwrap();
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 1);
+    assert_eq!(stats.buckets_removed, 0);
+    assert_eq!(stats.operations_attempted, 1);
+    assert!(bucket.join("0000/stray.txt").exists());
+    assert!(!bucket.join("0001").exists());
+}
+
+#[test]
+fn promotion_directory_removal_preserves_phase() {
+    for (fixture, fault, phase, outcome_unknown) in [
+        (
+            "0000000000000000/0000",
+            "unlinkat_dir",
+            crate::queue::engine::RemoveDirectoryPhase::Remove,
+            false,
+        ),
+        (
+            "0000000000000000/0000",
+            "fsync_dir_fd",
+            crate::queue::engine::RemoveDirectoryPhase::ParentFsync,
+            true,
+        ),
+        (
+            "0000000000000000",
+            "unlinkat_dir",
+            crate::queue::engine::RemoveDirectoryPhase::Remove,
+            false,
+        ),
+    ] {
+        let (tmp, mut queue) = create_test_queue_with_shards(1);
+        std::fs::create_dir_all(tmp.path().join("delayed").join(fixture)).unwrap();
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, 1, libc::EIO);
+        let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+        fs::fault::reset();
+        let operation = if fixture.contains('/') {
+            "promote_shard_remove"
+        } else {
+            "promote_bucket_remove"
+        };
+        assert_recorded_remove_directory_failure(
+            &stats,
+            operation,
+            &format!("delayed/{fixture}"),
+            phase,
+            outcome_unknown,
+        );
+        assert!(tmp.path().join("delayed/0000000000000000").exists());
+    }
 }
