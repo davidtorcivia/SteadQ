@@ -62,13 +62,13 @@ typedef struct SteadqJobId {
 const char *steadq_last_error(void);
 
 /**
- * After steadq_lease, steadq_ack, steadq_retry, or steadq_bury returns
- * STEADQ_INDETERMINATE, the transition ticket as JSON for steadq_resolve.
- * Returns NULL when the last such call left no ticket, and after an
- * indeterminate steadq_enqueue, which has no transition ticket. Thread-local;
- * valid until the next steadq_enqueue, steadq_lease, steadq_ack,
- * steadq_retry, or steadq_bury on the same thread, so it may be passed
- * straight into steadq_resolve. Do not free.
+ * After steadq_lease, steadq_renew, steadq_ack, steadq_retry, or
+ * steadq_bury returns STEADQ_INDETERMINATE, the transition ticket as JSON
+ * for steadq_resolve. Returns NULL when the last such call left no ticket,
+ * and after an indeterminate steadq_enqueue, which has no transition
+ * ticket. Thread-local; valid until the next steadq_enqueue, steadq_lease,
+ * steadq_renew, steadq_ack, steadq_retry, or steadq_bury on the same
+ * thread, so it may be passed straight into steadq_resolve. Do not free.
  */
 const char *steadq_last_ticket_json(void);
 
@@ -84,12 +84,16 @@ void steadq_free_string(const char *_s);
 unsigned int steadq_abi_version(void);
 
 /**
- * Initialize a new queue. Returns null on failure.
+ * Create a queue at `path` with `shard_count` shards and open it.
+ * Returns NULL on failure with the reason in steadq_last_error(); the
+ * message starts with the error class (for example "resource exhausted"
+ * or "unsupported filesystem") followed by the system error.
  */
 struct SteadqQueue *steadq_init(const char *path, unsigned int shard_count);
 
 /**
- * Open an existing queue. Returns null on failure.
+ * Open an existing queue. Returns NULL on failure with the reason in
+ * steadq_last_error().
  */
 struct SteadqQueue *steadq_open(const char *path);
 
@@ -99,7 +103,10 @@ struct SteadqQueue *steadq_open(const char *path);
 void steadq_close(struct SteadqQueue *queue);
 
 /**
- * Enqueue a job.
+ * Enqueue a job. Writes the job ID to `job_id_out` (zeroed first) when
+ * non-NULL. Returns STEADQ_OK when committed; STEADQ_INDETERMINATE when
+ * the job may or may not be durable (job_id_out is still set; there is no
+ * transition ticket); otherwise an error code with steadq_last_error().
  */
 int steadq_enqueue(struct SteadqQueue *queue,
                    const uint8_t *payload,
@@ -109,34 +116,70 @@ int steadq_enqueue(struct SteadqQueue *queue,
                    struct SteadqJobId *job_id_out);
 
 /**
- * Lease a job.
+ * Lease the next ready job for `lease_duration_ns` without waiting.
+ * Returns STEADQ_OK with a new lease in `*lease_out` (free it with
+ * steadq_lease_free). Returns STEADQ_NOT_COMMITTED with `*lease_out` NULL
+ * and steadq_last_error() "queue empty" when no job is ready.
+ * STEADQ_INDETERMINATE means a job may have been claimed without a usable
+ * lease; pass steadq_last_ticket_json() to steadq_resolve.
  */
 int steadq_lease(struct SteadqQueue *queue,
                  uint64_t lease_duration_ns,
                  struct SteadqLease **lease_out);
 
 /**
- * See steadq.h for documentation.
+ * Hash the leased payload and check it against the envelope digest.
+ * Returns STEADQ_OK when it matches, STEADQ_CORRUPTION when it does not,
+ * or another error code with steadq_last_error(). steadq_ack verifies the
+ * payload itself, so this is only needed before acting on the payload
+ * without steadq_lease_open_reader.
  */
 int steadq_lease_verify(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * See steadq.h for documentation.
+ * Extend a lease by `lease_duration_ns` from now. On STEADQ_OK the lease
+ * handle is updated in place and must be used for later calls. Returns
+ * STEADQ_NOT_COMMITTED with steadq_last_error() "lease lost" when the
+ * lease expired or was reaped (stop work on the job: it may run
+ * elsewhere). STEADQ_INDETERMINATE means the renewal may or may not have
+ * happened; the handle is unchanged, and steadq_last_ticket_json() holds
+ * the ticket for steadq_resolve.
+ */
+int steadq_renew(struct SteadqQueue *queue, struct SteadqLease *lease, uint64_t lease_duration_ns);
+
+/**
+ * Acknowledge a leased job: it completes and leaves a receipt. The payload
+ * is verified first. Returns STEADQ_OK when acked (also when it was
+ * already acked with this lease); STEADQ_NOT_COMMITTED with
+ * steadq_last_error() "lease lost" when the lease expired or was reaped;
+ * STEADQ_INDETERMINATE when the ack may or may not have happened, with the
+ * ticket in steadq_last_ticket_json() for steadq_resolve. The lease handle
+ * still needs steadq_lease_free.
  */
 int steadq_ack(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * See steadq.h for documentation.
+ * Return a leased job to ready now, consuming the attempt; a job with no
+ * attempts left goes to dead instead. Return codes and the lease-lost and
+ * ticket contract are as for steadq_ack.
  */
 int steadq_retry(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * See steadq.h for documentation.
+ * Move a leased job to dead with a reason code from spec/reasons.md:
+ * 0 unspecified, 1 consumer_rejected, 2 unsupported_content_type,
+ * 3 administrative_bury, 4 attempts_exhausted. Any other value returns
+ * STEADQ_NOT_COMMITTED without touching the job. Return codes and the
+ * lease-lost and ticket contract are as for steadq_ack.
  */
 int steadq_bury(struct SteadqQueue *queue, struct SteadqLease *lease, unsigned int reason);
 
 /**
- * Run a recovery pass.
+ * Run one recovery pass with the default work budget: reap expired leases,
+ * promote due delayed jobs, and compact and expire receipts. Returns
+ * STEADQ_OK when the pass had no errors, STEADQ_IO_FAILURE otherwise. A
+ * pass that runs out of budget still returns STEADQ_OK; call again to
+ * continue.
  */
 int steadq_recover(struct SteadqQueue *queue);
 
@@ -185,8 +228,11 @@ int steadq_lease_source_path(const struct SteadqLease *lease, char *out, size_t 
 
 /**
  * Open a verified payload reader for a lease. The payload is hashed once.
- * Returns STEADQ_OK and sets *reader_out on success.
- * The caller must free the reader with steadq_reader_free.
+ * Returns STEADQ_OK and sets *reader_out on success; the caller must free
+ * the reader with steadq_reader_free. Returns STEADQ_NOT_COMMITTED with
+ * steadq_last_error() "lease no longer current" when the leased file is
+ * gone (the lease was lost), and STEADQ_CORRUPTION when the payload does
+ * not match its digest.
  */
 int steadq_lease_open_reader(struct SteadqQueue *queue,
                              const struct SteadqLease *lease,
