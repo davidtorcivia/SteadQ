@@ -4,7 +4,7 @@ use super::publish::PublishError;
 use super::resolve::*;
 use super::*;
 use crate::FsckOptions;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 trait CommitOrPanic {
@@ -7887,6 +7887,41 @@ fn mkfifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 }
 
+/// Run `op` against a FIFO at `path`. If a reader is still blocked in open(2)
+/// after 2 s, a writer open releases it and the test fails instead of hanging.
+fn without_blocking_on_fifo<T>(path: &Path, op: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let stop = stop.clone();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !stop.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline
+                    && std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                        .is_ok()
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        })
+    };
+    let result = op();
+    stop.store(true, Ordering::SeqCst);
+    assert!(
+        !watchdog.join().unwrap(),
+        "open blocked on the FIFO at {}",
+        path.display()
+    );
+    result
+}
+
 fn fd_is_cloexec(fd: BorrowedFd<'_>) -> bool {
     // SAFETY: F_GETFD reads descriptor flags of a live descriptor.
     let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFD) };
@@ -7980,7 +8015,7 @@ fn active_object_fifo_or_symlink_is_corrupt_without_blocking() {
 
     mkfifo(&path);
     assert!(matches!(
-        validate_ready(&queue, &dir, &name),
+        without_blocking_on_fifo(&path, || validate_ready(&queue, &dir, &name)),
         Err(Error::QueueCorrupt(_))
     ));
     std::fs::remove_file(&path).unwrap();
@@ -8020,7 +8055,10 @@ fn open_rejects_oversize_symlinked_or_fifo_format() {
 
     std::fs::remove_file(&format).unwrap();
     mkfifo(&format);
-    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+    assert!(matches!(
+        without_blocking_on_fifo(&format, || open(&tmp)),
+        Err(Error::QueueCorrupt(_))
+    ));
 
     std::fs::remove_file(&format).unwrap();
     std::fs::write(&format, &original).unwrap();
@@ -8031,14 +8069,17 @@ fn open_rejects_oversize_symlinked_or_fifo_format() {
 fn open_rejects_a_fifo_recovery_cursor_without_blocking() {
     let (tmp, queue) = create_test_queue();
     drop(queue);
-    mkfifo(&tmp.path().join("control/recovery-cursor.json"));
-    let result = Queue::open(
-        tmp.path(),
-        &OpenOptions {
-            allow_unsupported_fs: true,
-            ..Default::default()
-        },
-    );
+    let cursor = tmp.path().join("control/recovery-cursor.json");
+    mkfifo(&cursor);
+    let result = without_blocking_on_fifo(&cursor, || {
+        Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+    });
     assert!(matches!(result, Err(Error::QueueCorrupt(_))));
 }
 
@@ -8072,7 +8113,7 @@ fn export_dead_refuses_an_existing_output_and_a_fifo_source() {
     std::fs::remove_file(&dead).unwrap();
     mkfifo(&dead);
     std::fs::remove_file(&output).unwrap();
-    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert!(without_blocking_on_fifo(&dead, || queue.export_dead(&lease.job_id, &output)).is_err());
     assert!(!output.exists());
 }
 
