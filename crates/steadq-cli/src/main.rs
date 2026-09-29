@@ -78,6 +78,7 @@ fn parse_hex_id(value: &str, label: &str) -> Result<[u8; 16], ExitCode> {
 #[derive(Parser)]
 #[command(name = "steadq", about = "Crash-safe filesystem queue")]
 struct Cli {
+    /// Emit JSON (honored by stats and doctor only)
     #[arg(long, global = true)]
     json: bool,
 
@@ -109,13 +110,15 @@ enum Commands {
         #[arg(long)]
         producer_id: Option<String>,
     },
-    /// Lease a job
+    /// Lease a job. Without --handle-file the handle JSON goes to stdout
+    /// (save it and pass it as --handle-file) and the summary to stderr
     Lease {
         path: PathBuf,
         #[arg(long, default_value = "30")]
         duration_seconds: u64,
         #[arg(long)]
         handle_file: Option<PathBuf>,
+        /// Write the transition ticket here on an indeterminate outcome
         #[arg(long)]
         ticket_out: Option<PathBuf>,
     },
@@ -143,6 +146,9 @@ enum Commands {
         path: PathBuf,
         #[arg(long)]
         handle_file: PathBuf,
+        /// Write the transition ticket here on an indeterminate outcome
+        #[arg(long)]
+        ticket_out: Option<PathBuf>,
     },
     /// Retry a lease
     Retry {
@@ -151,23 +157,42 @@ enum Commands {
         handle_file: PathBuf,
         #[arg(long)]
         after_seconds: Option<u64>,
+        /// Write the transition ticket here on an indeterminate outcome
+        #[arg(long)]
+        ticket_out: Option<PathBuf>,
     },
     /// Bury a lease
     Bury {
         path: PathBuf,
         #[arg(long)]
         handle_file: PathBuf,
+        /// Dead reason: 0-4 or unspecified, consumer_rejected,
+        /// unsupported_content_type, administrative_bury, attempts_exhausted
         #[arg(long, default_value = "0")]
-        reason: u16,
+        reason: String,
+        /// Write the transition ticket here on an indeterminate outcome
+        #[arg(long)]
+        ticket_out: Option<PathBuf>,
     },
     /// Run a command for each leased job: payload on stdin, lease renewed
-    /// while it runs, ack on exit 0, requeue on nonzero
+    /// while it runs, ack on exit 0, requeue on nonzero.
+    ///
+    /// The child sees STEADQ_JOB_ID (32 hex digits) and STEADQ_ATTEMPT in
+    /// its environment and is killed if the worker dies. The command is
+    /// checked on PATH before any lease; a missing command exits 127. If
+    /// spawning fails later, that job is requeued (one attempt consumed)
+    /// and the worker exits 127. SIGTERM or SIGINT stops leasing, forwards
+    /// SIGTERM to running children, and exits 0 once they finish; a second
+    /// signal exits at once. With --once the exit code is the child's own
+    /// code (128+N if it died from signal N), which can overlap steadq's
+    /// own exit codes.
     Work {
         path: PathBuf,
         /// Worker threads, each with its own queue handle
         #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
         concurrency: u32,
-        /// Lease duration; renewed at half this interval
+        /// Lease duration; renewed at half this interval, and every
+        /// min(duration/8, 1s) after a failed renewal
         #[arg(long, default_value = "60")]
         lease_seconds: u64,
         /// Run one job, then exit with the job's exit code
@@ -204,9 +229,13 @@ enum Commands {
         #[arg(long)]
         stabilize: bool,
     },
-    /// Run a benchmark
+    /// Run a benchmark. Leases and acks whatever is in the queue, so it
+    /// refuses a queue holding ready, leased, or delayed jobs
     Bench {
         path: PathBuf,
+        /// Run even if the queue holds jobs; they will be consumed
+        #[arg(long)]
+        allow_nonempty: bool,
         #[arg(long, default_value = "1")]
         producers: u32,
         #[arg(long, default_value = "1")]
@@ -257,7 +286,8 @@ enum AdminCommands {
         path: PathBuf,
         quarantine_id: String,
     },
-    /// Compact receipts manually
+    /// Run full recovery passes (reap, promote, compact and expire
+    /// receipts) until one completes within budget
     CompactReceipts { path: PathBuf },
 }
 
@@ -319,19 +349,25 @@ fn main() -> ExitCode {
 
         Commands::Doctor { path } => cmd_doctor(path, cli.json),
 
-        Commands::Ack { path, handle_file } => cmd_ack(path, handle_file),
+        Commands::Ack {
+            path,
+            handle_file,
+            ticket_out,
+        } => cmd_ack(path, handle_file, ticket_out),
 
         Commands::Retry {
             path,
             handle_file,
             after_seconds,
-        } => cmd_retry(path, handle_file, after_seconds),
+            ticket_out,
+        } => cmd_retry(path, handle_file, after_seconds, ticket_out),
 
         Commands::Bury {
             path,
             handle_file,
             reason,
-        } => cmd_bury(path, handle_file, reason),
+            ticket_out,
+        } => cmd_bury(path, handle_file, reason, ticket_out),
 
         Commands::Inspect { path, job_id } => cmd_inspect(path, job_id),
 
@@ -361,6 +397,7 @@ fn main() -> ExitCode {
 
         Commands::Bench {
             path,
+            allow_nonempty,
             producers,
             consumers,
             duration_seconds,
@@ -368,6 +405,7 @@ fn main() -> ExitCode {
             lease_duration_seconds,
         } => cmd_bench(
             path,
+            allow_nonempty,
             producers,
             consumers,
             duration_seconds,
@@ -403,17 +441,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// Upper bound on recovery passes for `admin compact-receipts`.
+const COMPACT_MAX_PASSES: u32 = 1000;
+
 fn cmd_compact_receipts(path: PathBuf) -> ExitCode {
     let mut queue = match open_or_exit(&path) {
         Ok(q) => q,
         Err(code) => return code,
     };
-    let stats = queue.recover(&steadq_core::WorkBudget::default());
+    let (mut compacted, mut expired, mut errors) = (0, 0, 0);
+    for _ in 0..COMPACT_MAX_PASSES {
+        let stats = queue.recover(&steadq_core::WorkBudget::default());
+        compacted += stats.receipts_compacted;
+        expired += stats.receipts_expired;
+        errors += stats.errors.len();
+        if !stats.budget_exhausted {
+            eprintln!("compacted: {compacted} expired: {expired}");
+            if errors > 0 {
+                eprintln!("{errors} recovery errors");
+                return exit(EXIT_IO_FAILURE);
+            }
+            return exit(EXIT_SUCCESS);
+        }
+    }
     eprintln!(
-        "compacted: {} expired: {}",
-        stats.receipts_compacted, stats.receipts_expired
+        "compacted: {compacted} expired: {expired}; incomplete after {COMPACT_MAX_PASSES} passes, {errors} errors"
     );
-    exit(EXIT_SUCCESS)
+    exit(EXIT_IO_FAILURE)
 }
 
 fn cmd_quarantine_remove(path: PathBuf, quarantine_id: String) -> ExitCode {
@@ -615,6 +669,7 @@ fn cmd_dead_list(path: PathBuf) -> ExitCode {
 
 fn cmd_bench(
     path: PathBuf,
+    allow_nonempty: bool,
     producers: u32,
     consumers: u32,
     duration_seconds: u64,
@@ -629,6 +684,28 @@ fn cmd_bench(
         eprintln!("lease duration overflows nanoseconds");
         return exit(EXIT_ORDINARY);
     };
+    if !allow_nonempty {
+        // Consumers ack whatever they lease, so real jobs would be lost.
+        match collect_stats(&path) {
+            Ok(stats) => {
+                let jobs: usize = ["ready", "leased", "delayed"]
+                    .iter()
+                    .filter_map(|state| stats.get(state))
+                    .map(|s| s.count)
+                    .sum();
+                if jobs > 0 {
+                    eprintln!(
+                        "refusing to bench a queue holding {jobs} jobs: bench leases and acks them; pass --allow-nonempty to consume them"
+                    );
+                    return exit(EXIT_ORDINARY);
+                }
+            }
+            Err(e) => {
+                eprintln!("bench: scan {}: {e}", path.display());
+                return exit_io(&e);
+            }
+        }
+    }
     eprintln!(
         "bench: {producers} producers, {consumers} consumers, {duration_seconds}s, {payload_size}B payload"
     );
@@ -957,7 +1034,7 @@ fn cmd_verify(file: PathBuf, deep: bool) -> ExitCode {
     match describe_record(&data, deep) {
         Ok(fields) => {
             for (key, value) in fields {
-                eprintln!("{key}: {value}");
+                println!("{key}: {value}");
             }
             eprintln!("valid");
             exit(EXIT_SUCCESS)
@@ -978,42 +1055,91 @@ fn cmd_inspect(path: PathBuf, job_id: String) -> ExitCode {
         Ok(b) => b,
         Err(code) => return code,
     };
-    match Queue::open(&path, &OpenOptions::default()) {
-        Ok(queue) => {
-            let snapshots = queue.inspect(&job_id_bytes);
-            if snapshots.is_empty() {
-                eprintln!("not found");
-                return exit(EXIT_ORDINARY);
-            }
-            for s in &snapshots {
-                println!(
-                    "{} gen={} attempt={}/{} {}",
-                    s.state, s.generation, s.attempt, s.maximum_attempts, s.relative_path
-                );
-            }
-            exit(EXIT_SUCCESS)
-        }
+    let queue = match open_or_exit(&path) {
+        Ok(q) => q,
+        Err(code) => return code,
+    };
+    let snapshots = queue.inspect(&job_id_bytes);
+    if snapshots.is_empty() {
+        eprintln!("not found");
+        return exit(EXIT_ORDINARY);
+    }
+    for s in &snapshots {
+        println!(
+            "{} gen={} attempt={}/{} {}",
+            s.state, s.generation, s.attempt, s.maximum_attempts, s.relative_path
+        );
+    }
+    exit(EXIT_SUCCESS)
+}
+
+/// Dead reason names from spec/reasons.md, indexed by code.
+const DEAD_REASON_NAMES: [&str; 5] = [
+    "unspecified",
+    "consumer_rejected",
+    "unsupported_content_type",
+    "administrative_bury",
+    "attempts_exhausted",
+];
+
+/// Parse a dead reason by name or decimal code.
+fn parse_dead_reason(value: &str) -> Option<steadq_core::DeadReason> {
+    let code = match DEAD_REASON_NAMES.iter().position(|name| *name == value) {
+        Some(index) => index as u16,
+        None => value.parse().ok()?,
+    };
+    steadq_core::DeadReason::from_u16(code)
+}
+
+/// Open the queue and load the lease handle bound to it.
+fn open_with_handle(
+    path: &std::path::Path,
+    handle_file: &std::path::Path,
+) -> Result<(Queue, steadq_core::LeaseInfo), ExitCode> {
+    let queue = open_or_exit(path)?;
+    match load_handle(handle_file, path, queue.format().queue_id()) {
+        Ok(lease) => Ok((queue, lease)),
         Err(e) => {
-            eprintln!("open failed: {e}");
-            exit_core(&e)
+            eprintln!("handle load failed: {e}");
+            Err(exit_io(&e))
         }
     }
 }
 
-fn cmd_bury(path: PathBuf, handle_file: PathBuf, reason: u16) -> ExitCode {
-    let mut queue = match open_or_exit(&path) {
-        Ok(q) => q,
+/// Report an indeterminate transition and persist its ticket for
+/// `steadq resolve` when a path was given.
+fn exit_unknown(
+    ticket: &steadq_core::TransitionTicket,
+    ticket_out: Option<&std::path::Path>,
+) -> ExitCode {
+    eprintln!("outcome unknown");
+    eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id()));
+    if let Some(path) = ticket_out {
+        match write_ticket_file(path, ticket) {
+            Ok(()) => eprintln!("ticket written to: {}", path.display()),
+            Err(e) => eprintln!("warning: failed to write ticket: {e}"),
+        }
+    }
+    exit(EXIT_INDETERMINATE)
+}
+
+fn cmd_bury(
+    path: PathBuf,
+    handle_file: PathBuf,
+    reason: String,
+    ticket_out: Option<PathBuf>,
+) -> ExitCode {
+    let Some(reason) = parse_dead_reason(&reason) else {
+        eprintln!(
+            "invalid dead reason {reason:?}: expected 0-4 or one of {}",
+            DEAD_REASON_NAMES.join(", ")
+        );
+        return exit(EXIT_ORDINARY);
+    };
+    let (mut queue, lease) = match open_with_handle(&path, &handle_file) {
+        Ok(opened) => opened,
         Err(code) => return code,
     };
-    let lease = match load_handle(&handle_file, queue.format().queue_id()) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("handle load failed: {e}");
-            return exit_io(&e);
-        }
-    };
-    let reason =
-        steadq_core::DeadReason::from_u16(reason).unwrap_or(steadq_core::DeadReason::Unspecified);
     match queue.bury(&lease, reason) {
         steadq_core::TransitionOutcome::Committed => {
             eprintln!("buried");
@@ -1027,24 +1153,21 @@ fn cmd_bury(path: PathBuf, handle_file: PathBuf, reason: u16) -> ExitCode {
             eprintln!("not committed: {e}");
             exit_core(&e)
         }
-        steadq_core::TransitionOutcome::OutcomeUnknown(_) => {
-            eprintln!("outcome unknown");
-            exit(EXIT_INDETERMINATE)
+        steadq_core::TransitionOutcome::OutcomeUnknown(ticket) => {
+            exit_unknown(&ticket, ticket_out.as_deref())
         }
     }
 }
 
-fn cmd_retry(path: PathBuf, handle_file: PathBuf, after_seconds: Option<u64>) -> ExitCode {
-    let mut queue = match open_or_exit(&path) {
-        Ok(q) => q,
+fn cmd_retry(
+    path: PathBuf,
+    handle_file: PathBuf,
+    after_seconds: Option<u64>,
+    ticket_out: Option<PathBuf>,
+) -> ExitCode {
+    let (mut queue, lease) = match open_with_handle(&path, &handle_file) {
+        Ok(opened) => opened,
         Err(code) => return code,
-    };
-    let lease = match load_handle(&handle_file, queue.format().queue_id()) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("handle load failed: {e}");
-            return exit_io(&e);
-        }
     };
     // retry_after() uses the rollback-safe effective wall clock.
     let outcome = match after_seconds {
@@ -1067,24 +1190,16 @@ fn cmd_retry(path: PathBuf, handle_file: PathBuf, after_seconds: Option<u64>) ->
             eprintln!("not committed: {e}");
             exit_core(&e)
         }
-        steadq_core::TransitionOutcome::OutcomeUnknown(_) => {
-            eprintln!("outcome unknown");
-            exit(EXIT_INDETERMINATE)
+        steadq_core::TransitionOutcome::OutcomeUnknown(ticket) => {
+            exit_unknown(&ticket, ticket_out.as_deref())
         }
     }
 }
 
-fn cmd_ack(path: PathBuf, handle_file: PathBuf) -> ExitCode {
-    let mut queue = match open_or_exit(&path) {
-        Ok(q) => q,
+fn cmd_ack(path: PathBuf, handle_file: PathBuf, ticket_out: Option<PathBuf>) -> ExitCode {
+    let (mut queue, lease) = match open_with_handle(&path, &handle_file) {
+        Ok(opened) => opened,
         Err(code) => return code,
-    };
-    let lease = match load_handle(&handle_file, queue.format().queue_id()) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("handle load failed: {e}");
-            return exit_io(&e);
-        }
     };
     // ack() performs strict payload verification; no separate
     // verify_lease_payload() call (avoids double hashing).
@@ -1105,15 +1220,15 @@ fn cmd_ack(path: PathBuf, handle_file: PathBuf) -> ExitCode {
             eprintln!("not committed: {e}");
             exit_core(&e)
         }
-        steadq_core::AckOutcome::OutcomeUnknown(_) => {
-            eprintln!("outcome unknown");
-            exit(EXIT_INDETERMINATE)
+        steadq_core::AckOutcome::OutcomeUnknown(ticket) => {
+            exit_unknown(&ticket, ticket_out.as_deref())
         }
     }
 }
 
 fn cmd_doctor(path: PathBuf, json: bool) -> ExitCode {
     let mut results: Vec<(&str, String, bool)> = Vec::new();
+    let mut unsupported_fs = false;
 
     // boot_id
     match steadq_fs_linux::read_boot_id() {
@@ -1141,6 +1256,7 @@ fn cmd_doctor(path: PathBuf, json: bool) -> ExitCode {
         match steadq_fs_linux::fs_type_magic(&path) {
             Ok(ft) => {
                 let (fs_name, fs_ok) = doctor_filesystem(ft);
+                unsupported_fs = !fs_ok;
                 results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), fs_ok));
             }
             Err(e) => results.push(("filesystem", e.to_string(), false)),
@@ -1208,9 +1324,10 @@ fn cmd_doctor(path: PathBuf, json: bool) -> ExitCode {
             eprintln!("  {}: {}{}", k, v, if *ok { "" } else { " [FAIL]" });
         }
     }
-    let all_ok = results.iter().all(|(_, _, ok)| *ok);
-    if all_ok {
+    if results.iter().all(|(_, _, ok)| *ok) {
         exit(EXIT_SUCCESS)
+    } else if unsupported_fs {
+        exit(EXIT_UNSUPPORTED)
     } else {
         exit(EXIT_IO_FAILURE)
     }
@@ -1263,77 +1380,52 @@ fn cmd_fsck(path: PathBuf, deep: bool, repair: bool) -> ExitCode {
 }
 
 fn cmd_stats(path: PathBuf, prometheus: bool, json: bool) -> ExitCode {
-    match Queue::open(&path, &OpenOptions::default()) {
-        Ok(_queue) => {
-            let root = &path;
-            let mut stats_map: std::collections::BTreeMap<String, StateStats> =
-                std::collections::BTreeMap::new();
-            for state in [
-                steadq_names::State::Ready,
-                steadq_names::State::Leased,
-                steadq_names::State::Delayed,
-                steadq_names::State::Receipt,
-                steadq_names::State::Dead,
-                steadq_names::State::Quarantine,
-            ]
-            .map(|state| state.dir_name())
-            {
-                let state_path = root.join(state);
-                if state_path.exists() {
-                    let stats = match state_stats(&state_path) {
-                        Ok(stats) => stats,
-                        Err(e) => {
-                            eprintln!("stats: {}: {e}", state_path.display());
-                            return exit_io(&e);
-                        }
-                    };
-                    stats_map.insert(state.to_string(), stats);
-                }
-            }
-            if prometheus {
-                for (state, stats) in &stats_map {
-                    println!("# TYPE steadq_{state}_objects gauge");
-                    println!("steadq_{state}_objects {}", stats.count);
-                }
-                for (state, stats) in &stats_map {
-                    if let Some(oldest) = stats.oldest {
-                        println!("# TYPE steadq_{state}_oldest_age_seconds gauge");
-                        println!("steadq_{state}_oldest_age_seconds {}", age_seconds(oldest));
-                    }
-                }
-            } else if json {
-                let plain: std::collections::BTreeMap<&str, serde_json::Value> = stats_map
-                    .iter()
-                    .map(|(state, stats)| {
-                        (
-                            state.as_str(),
-                            serde_json::json!({
-                                "objects": stats.count,
-                                "oldest_age_seconds": stats
-                                    .oldest
-                                    .map(age_seconds),
-                            }),
-                        )
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&plain).unwrap());
-            } else {
-                for (state, stats) in &stats_map {
-                    match stats.oldest {
-                        Some(oldest) => {
-                            println!("{state}: {} (oldest {}s)", stats.count, age_seconds(oldest))
-                        }
-                        None => println!("{state}: {}", stats.count),
-                    }
-                }
-            }
-            exit(EXIT_SUCCESS)
-        }
+    if let Err(code) = open_or_exit(&path) {
+        return code;
+    }
+    let stats_map = match collect_stats(&path) {
+        Ok(stats) => stats,
         Err(e) => {
-            eprintln!("open failed: {e}");
-            exit_core(&e)
+            eprintln!("stats: {}: {e}", path.display());
+            return exit_io(&e);
+        }
+    };
+    if prometheus {
+        for (state, stats) in &stats_map {
+            println!("# TYPE steadq_{state}_objects gauge");
+            println!("steadq_{state}_objects {}", stats.count);
+        }
+        for (state, stats) in &stats_map {
+            if let Some(oldest) = stats.oldest {
+                println!("# TYPE steadq_{state}_oldest_age_seconds gauge");
+                println!("steadq_{state}_oldest_age_seconds {}", age_seconds(oldest));
+            }
+        }
+    } else if json {
+        let plain: std::collections::BTreeMap<&str, serde_json::Value> = stats_map
+            .iter()
+            .map(|(state, stats)| {
+                (
+                    *state,
+                    serde_json::json!({
+                        "objects": stats.count,
+                        "oldest_age_seconds": stats.oldest.map(age_seconds),
+                    }),
+                )
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&plain).unwrap());
+    } else {
+        for (state, stats) in &stats_map {
+            match stats.oldest {
+                Some(oldest) => {
+                    println!("{state}: {} (oldest {}s)", stats.count, age_seconds(oldest))
+                }
+                None => println!("{state}: {}", stats.count),
+            }
         }
     }
+    exit(EXIT_SUCCESS)
 }
 
 fn cmd_lease(
@@ -1357,15 +1449,34 @@ fn cmd_lease(
     };
     match queue.lease(0, duration_ns) {
         LeaseOutcome::Leased(lease) => {
-            if let Some(ref hf) = handle_file {
-                if let Err(e) = save_handle_to_file(&path, queue.format().queue_id(), hf, &lease) {
-                    eprintln!("failed to write handle file: {e}");
+            let summary = format!(
+                "job_id: {}\ngeneration: {}\nattempt: {}/{}",
+                steadq_names::hex_encode(&lease.job_id),
+                lease.generation,
+                lease.attempt,
+                lease.maximum_attempts
+            );
+            let handle = handle_json(&path, queue.format().queue_id(), &lease);
+            match (handle, handle_file) {
+                (Ok(handle), Some(hf)) => {
+                    if let Err(e) = atomic_write_private(&hf, handle.as_bytes()) {
+                        eprintln!("failed to write handle file: {e}");
+                        return exit_io(&e);
+                    }
+                    println!("{summary}");
+                }
+                // The lease consumed an attempt; hand the caller the handle
+                // on stdout so the job can still be acked or retried.
+                (Ok(handle), None) => {
+                    println!("{handle}");
+                    eprintln!("{summary}");
+                }
+                (Err(e), _) => {
+                    eprintln!("{summary}");
+                    eprintln!("failed to encode handle: {e}");
                     return exit_io(&e);
                 }
             }
-            println!("job_id: {}", steadq_names::hex_encode(&lease.job_id));
-            println!("generation: {}", lease.generation);
-            println!("attempt: {}/{}", lease.attempt, lease.maximum_attempts);
             exit(EXIT_SUCCESS)
         }
         LeaseOutcome::Empty => {
@@ -1376,18 +1487,7 @@ fn cmd_lease(
             eprintln!("lease failed: {e}");
             exit_core(&e)
         }
-        LeaseOutcome::OutcomeUnknown(ticket) => {
-            eprintln!("outcome unknown");
-            eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id()));
-            // Persist the ticket for later resolution.
-            if let Some(ref tf) = ticket_out {
-                match write_ticket_file(tf, &ticket) {
-                    Ok(()) => eprintln!("ticket written to: {}", tf.display()),
-                    Err(e) => eprintln!("warning: failed to write ticket: {e}"),
-                }
-            }
-            exit(EXIT_INDETERMINATE)
-        }
+        LeaseOutcome::OutcomeUnknown(ticket) => exit_unknown(&ticket, ticket_out.as_deref()),
     }
 }
 
@@ -1484,37 +1584,87 @@ fn cmd_init(path: PathBuf, shards: u32, terminal_bucket_width_ns: u64) -> ExitCo
     }
 }
 
-/// Per-state object count and oldest mtime in one walk. Returns Err when a
-/// directory cannot be listed: "unreadable" must not read as "empty" on a
-/// monitoring surface.
+/// Per-state object count and oldest mtime.
+#[derive(Default)]
 struct StateStats {
     count: usize,
     oldest: Option<std::time::SystemTime>,
 }
 
-fn state_stats(path: &std::path::Path) -> std::io::Result<StateStats> {
-    let mut stats = StateStats {
-        count: 0,
-        oldest: None,
+impl StateStats {
+    fn add(&mut self, modified: Option<std::time::SystemTime>) {
+        self.count += 1;
+        self.oldest = [self.oldest, modified].into_iter().flatten().min();
+    }
+}
+
+/// Count objects per state directory. A live lease keeps its file in
+/// ready/<shard>/ under a leased name, so ready/ entries whose name parses
+/// as leased count as leased, together with the legacy leased/ tree.
+/// Returns Err when a directory cannot be listed: "unreadable" must not
+/// read as "empty" on a monitoring surface.
+fn collect_stats(
+    root: &std::path::Path,
+) -> std::io::Result<std::collections::BTreeMap<&'static str, StateStats>> {
+    use steadq_names::State;
+    let mut map = std::collections::BTreeMap::new();
+    for state in [
+        State::Ready,
+        State::Leased,
+        State::Delayed,
+        State::Receipt,
+        State::Dead,
+        State::Quarantine,
+    ] {
+        let dir = root.join(state.dir_name());
+        if !dir.exists() {
+            continue;
+        }
+        map.entry(state.dir_name())
+            .or_insert_with(StateStats::default);
+        walk_stats(&dir, &mut |name, modified| {
+            let bucket = if state == State::Ready && steadq_names::parse_leased(name).is_ok() {
+                State::Leased.dir_name()
+            } else {
+                state.dir_name()
+            };
+            map.entry(bucket)
+                .or_insert_with(StateStats::default)
+                .add(modified);
+        })?;
+    }
+    Ok(map)
+}
+
+/// Visit every non-directory entry below `path` with its name and mtime.
+/// A directory or entry that vanishes mid-walk (recovery removes emptied
+/// receipt and bucket directories) is absent, not an error.
+fn walk_stats(
+    path: &std::path::Path,
+    visit: &mut dyn FnMut(&str, Option<std::time::SystemTime>),
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    for entry in std::fs::read_dir(path)? {
+    for entry in entries {
         let entry = entry?;
-        let p = entry.path();
-        if p.is_dir() {
-            let sub = state_stats(&p)?;
-            stats.count += sub.count;
-            stats.oldest = [stats.oldest, sub.oldest].into_iter().flatten().min();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if metadata.is_dir() {
+            walk_stats(&entry.path(), visit)?;
         } else {
-            stats.count += 1;
-            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
-                stats.oldest = Some(match stats.oldest {
-                    Some(current) => current.min(modified),
-                    None => modified,
-                });
-            }
+            visit(
+                &entry.file_name().to_string_lossy(),
+                metadata.modified().ok(),
+            );
         }
     }
-    Ok(stats)
+    Ok(())
 }
 
 fn age_seconds(since: std::time::SystemTime) -> u64 {
@@ -1587,14 +1737,18 @@ fn write_ticket_file(
     atomic_write_private(path, &json)
 }
 
-fn save_handle_to_file(
+fn invalid_data(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// Serialize a lease handle bound to the queue's identity and canonical root.
+fn handle_json(
     queue_root: &std::path::Path,
     queue_id: &[u8; 16],
-    handle_path: &std::path::Path,
     lease: &steadq_core::LeaseInfo,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let handle = HandleFile {
-        queue_root: queue_root.display().to_string(),
+        queue_root: std::fs::canonicalize(queue_root)?.display().to_string(),
         queue_id: Some(steadq_names::hex_encode(queue_id)),
         job_id: steadq_names::hex_encode(&lease.job_id),
         generation: lease.generation,
@@ -1612,16 +1766,32 @@ fn save_handle_to_file(
         payload_length: lease.payload_length,
         payload_digest: steadq_names::hex_encode(&lease.payload_digest),
     };
-    let json = serde_json::to_string_pretty(&handle)?;
-    atomic_write_private(handle_path, json.as_bytes())
+    Ok(serde_json::to_string_pretty(&handle)?)
 }
 
 fn load_handle(
     path: &std::path::Path,
+    queue_root: &std::path::Path,
     queue_id: &[u8; 16],
 ) -> std::io::Result<steadq_core::LeaseInfo> {
     let data = std::fs::read(path)?;
-    let handle: HandleFile = serde_json::from_slice(&data)?;
+    let handle: HandleFile = serde_json::from_slice(&data)
+        .map_err(|e| invalid_data(format!("invalid handle file: {e}")))?;
+    // A copied queue keeps its queue_id and its leased files, so only the
+    // root tells a handle for the original from one for the copy.
+    let issued_for = std::fs::canonicalize(&handle.queue_root).map_err(|e| {
+        invalid_data(format!(
+            "handle file queue_root {} does not resolve: {e}",
+            handle.queue_root
+        ))
+    })?;
+    if issued_for != std::fs::canonicalize(queue_root)? {
+        return Err(invalid_data(format!(
+            "handle file was issued for the queue at {}",
+            handle.queue_root
+        )));
+    }
+
     let job_id = steadq_names::hex_decode_16(&handle.job_id)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad job_id"))?;
     let token = steadq_names::hex_decode_16(&handle.token)
@@ -1751,14 +1921,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_file_roundtrip_preserves_payload_identity() {
-        let handle_path = std::env::temp_dir().join(format!(
-            "steadq-handle-test-{}.json",
-            steadq_names::hex_encode(&steadq_fs_linux::random_128bit().unwrap())
-        ));
-        let queue_id = [0x11u8; 16];
-        let lease = steadq_core::LeaseInfo {
+    fn sample_lease() -> steadq_core::LeaseInfo {
+        steadq_core::LeaseInfo {
             job_id: [0x22; 16],
             envelope_digest: [0x33; 32],
             generation: 1,
@@ -1774,21 +1938,106 @@ mod tests {
             expected_dev: 1,
             expected_inode: 2,
             exact_source_path: "leased/a/b/c.sqj".into(),
-        };
-        save_handle_to_file(
-            std::path::Path::new("/tmp/q"),
-            &queue_id,
-            &handle_path,
-            &lease,
-        )
-        .unwrap();
-        let loaded = load_handle(&handle_path, &queue_id).unwrap();
-        let _ = std::fs::remove_file(&handle_path);
+        }
+    }
+
+    #[test]
+    fn handle_file_roundtrip_preserves_payload_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("q");
+        std::fs::create_dir(&root).unwrap();
+        let handle_path = tmp.path().join("handle.json");
+        let queue_id = [0x11u8; 16];
+        let json = handle_json(&root, &queue_id, &sample_lease()).unwrap();
+        atomic_write_private(&handle_path, json.as_bytes()).unwrap();
+        // The same queue through a non-canonical path still matches.
+        let loaded = load_handle(&handle_path, &root.join("."), &queue_id).unwrap();
         assert_eq!(loaded.payload_length, 11);
         assert_eq!(loaded.payload_digest, [0x55; 32]);
         assert_eq!(loaded.content_type, "text/plain");
         assert_eq!(loaded.envelope_digest, [0x33; 32]);
         assert_eq!(loaded.job_id, [0x22; 16]);
+    }
+
+    #[test]
+    fn handle_for_another_queue_root_or_malformed_is_invalid_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, copy) = (tmp.path().join("q"), tmp.path().join("copy"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&copy).unwrap();
+        let queue_id = [0x11u8; 16];
+        let handle_path = tmp.path().join("handle.json");
+        let json = handle_json(&root, &queue_id, &sample_lease()).unwrap();
+        std::fs::write(&handle_path, &json).unwrap();
+        let error = load_handle(&handle_path, &copy, &queue_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("issued for the queue at"),
+            "{error}"
+        );
+
+        std::fs::remove_dir(&root).unwrap();
+        let error = load_handle(&handle_path, &copy, &queue_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        // Truncated JSON is EOF to serde; it must still read as bad input.
+        std::fs::write(&handle_path, &json[..json.len() / 2]).unwrap();
+        let error = load_handle(&handle_path, &copy, &queue_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().starts_with("invalid handle file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dead_reason_accepts_names_and_codes_only_from_the_registry() {
+        use steadq_core::DeadReason;
+        assert_eq!(parse_dead_reason("0"), Some(DeadReason::Unspecified));
+        assert_eq!(parse_dead_reason("4"), Some(DeadReason::AttemptsExhausted));
+        assert_eq!(
+            parse_dead_reason("administrative_bury"),
+            Some(DeadReason::AdministrativeBury)
+        );
+        for bad in ["5", "65537", "-1", "", "Unspecified", "0x0001"] {
+            assert_eq!(parse_dead_reason(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn walk_stats_treats_vanished_directories_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut visits = 0;
+        walk_stats(&tmp.path().join("gone"), &mut |_, _| visits += 1).unwrap();
+        assert_eq!(visits, 0);
+
+        // Whichever subdirectory is visited first removes both; the other
+        // is already listed and must be skipped, not reported as an error.
+        for dir in ["a", "b"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("f"), b"x").unwrap();
+        }
+        let root = tmp.path().to_path_buf();
+        walk_stats(tmp.path(), &mut |_, _| {
+            visits += 1;
+            for dir in ["a", "b"] {
+                let _ = std::fs::remove_dir_all(root.join(dir));
+            }
+        })
+        .unwrap();
+        assert_eq!(visits, 1);
+    }
+
+    #[test]
+    fn collect_stats_counts_colocated_leases_as_leased() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = tmp.path().join("ready").join("00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::create_dir_all(tmp.path().join("leased")).unwrap();
+        std::fs::write(shard.join("not-a-leased-name.sqj"), b"x").unwrap();
+        let stats = collect_stats(tmp.path()).unwrap();
+        assert_eq!(stats["ready"].count, 1);
+        assert_eq!(stats["leased"].count, 0);
     }
 
     #[test]
@@ -1804,8 +2053,10 @@ mod tests {
             let ft = std::fs::File::options().write(true).open(&f).unwrap();
             ft.set_modified(old).unwrap();
         }
-        let stats = state_stats(root).unwrap();
+        let mut stats = StateStats::default();
+        walk_stats(root, &mut |_, modified| stats.add(modified)).unwrap();
         assert_eq!(stats.count, 3);
+
         // The oldest file lives in dir b, not the first-listed dir a: the
         // merge must be a min across siblings, not first-wins.
         let age = age_seconds(stats.oldest.unwrap());
