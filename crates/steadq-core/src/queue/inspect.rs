@@ -786,12 +786,11 @@ fn is_regular(stat: &libc::stat) -> bool {
 }
 
 /// Copy the regular file behind `file_fd` to `output`, which must not
-/// exist yet, and sync it. Returns the bytes written.
+/// exist yet, not even as a symlink, and sync it. Returns the bytes written.
 pub(crate) fn copy_file_to_path(
     file_fd: BorrowedFd<'_>,
     output: &std::path::Path,
 ) -> std::io::Result<u64> {
-    use std::os::unix::fs::OpenOptionsExt;
     if !is_regular(&fs::fstat(file_fd)?) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -802,7 +801,6 @@ pub(crate) fn copy_file_to_path(
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(output)?;
     let written = std::io::copy(&mut source, &mut out)?;
     out.sync_all()?;

@@ -584,17 +584,16 @@ impl Queue {
             Err(e) => return Err(regular_open_error(e)),
         };
         // One byte past the record is enough for decode to reject the size.
-        let mut format_buf = [0u8; steadq_format::FORMAT_SIZE + 1];
-        let mut format_len = 0;
-        while format_len < format_buf.len() {
-            match fs::read(format_fd.as_fd(), &mut format_buf[format_len..]) {
-                Ok(0) => break,
-                Ok(n) => format_len += n,
-                Err(e) => return Err(Error::from(e)),
-            }
-        }
-        let format_bytes = &format_buf[..format_len];
-        let format_rec = FormatRecord::decode(format_bytes).map_err(|e| match e {
+        let mut format_bytes = Vec::with_capacity(steadq_format::FORMAT_SIZE + 1);
+        io::Read::read_to_end(
+            &mut io::Read::take(
+                std::fs::File::from(format_fd),
+                steadq_format::FORMAT_SIZE as u64 + 1,
+            ),
+            &mut format_bytes,
+        )
+        .map_err(Error::from)?;
+        let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
             steadq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
         })?;

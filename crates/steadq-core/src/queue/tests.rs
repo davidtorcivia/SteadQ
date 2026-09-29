@@ -3259,6 +3259,7 @@ fn preferred_named_streaming_publication_bypasses_tmpfiles() {
         outcome => panic!("lease failed: {outcome:?}"),
     };
     assert_eq!(lease.job_id, ticket.job_id);
+    assert_eq!(lease.envelope_digest, ticket.envelope_digest);
     queue.verify_lease_payload(&lease).unwrap();
 }
 
@@ -8269,4 +8270,35 @@ fn lease_reports_a_failed_quarantine_as_a_scan_error() {
     );
     assert!(corrupt.exists());
     assert_eq!(quarantine_count(&tmp), 0);
+}
+
+#[test]
+fn export_dead_never_writes_through_an_output_symlink() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let target = tmp.path().join("target.bin");
+    let output = tmp.path().join("link.bin");
+    std::os::unix::fs::symlink(&target, &output).unwrap();
+    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert!(!target.exists());
+}
+
+#[test]
+fn inspect_skips_a_receipt_that_vanishes_and_reports_one_it_cannot_open() {
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let (_, calls) = count_calls("openat", || queue.inspect(&lease.job_id).unwrap());
+
+    fs::fault::reset();
+    fs::fault::inject_errno("openat", calls, libc::ENOENT);
+    let vanished = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert_eq!(vanished, Ok(Vec::new()));
+
+    fs::fault::inject_errno("openat", calls, libc::EIO);
+    let failed = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(failed, Err(Error::IoFailure(_))), "{failed:?}");
 }
