@@ -191,6 +191,11 @@ fn worker(
                 return 2;
             }
         };
+        // A signal during the lease wait: hand the job back unrun. The claim
+        // already counted the attempt, so a last attempt runs instead of dying.
+        if STOP.load(Ordering::SeqCst) && lease.attempt < lease.maximum_attempts {
+            return requeue(&mut queue, &lease);
+        }
         let code = run_one(&mut queue, lease, lease_duration_ns, &command);
         if once {
             return code;
