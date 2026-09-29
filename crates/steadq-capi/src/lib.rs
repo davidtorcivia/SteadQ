@@ -1,19 +1,23 @@
 // SteadQ/1 C ABI.
 // The queue handle is wrapped in a Mutex for thread safety; all FFI
 // functions catch panics to prevent process termination.
+//
+// Doc comments here are the header documentation: cbindgen copies them
+// into include/steadq.h.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::{c_char, c_int, c_uint};
+use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 use std::sync::Mutex;
 
 use steadq_core::{
     CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseInfo, LeaseOutcome, OpenOptions,
-    Queue, ResolutionOutcome, TransitionOutcome, TransitionTicket, VerifiedPayloadReader,
-    WorkBudget,
+    Queue, RenewOutcome, ResolutionOutcome, TransitionOutcome, TransitionTicket,
+    VerifiedPayloadReader, WorkBudget,
 };
 
 thread_local! {
@@ -131,13 +135,13 @@ pub extern "C" fn steadq_last_error() -> *const c_char {
     })
 }
 
-/// After steadq_lease, steadq_ack, steadq_retry, or steadq_bury returns
-/// STEADQ_INDETERMINATE, the transition ticket as JSON for steadq_resolve.
-/// Returns NULL when the last such call left no ticket, and after an
-/// indeterminate steadq_enqueue, which has no transition ticket. Thread-local;
-/// valid until the next steadq_enqueue, steadq_lease, steadq_ack,
-/// steadq_retry, or steadq_bury on the same thread, so it may be passed
-/// straight into steadq_resolve. Do not free.
+/// After steadq_lease, steadq_renew, steadq_ack, steadq_retry, or
+/// steadq_bury returns STEADQ_INDETERMINATE, the transition ticket as JSON
+/// for steadq_resolve. Returns NULL when the last such call left no ticket,
+/// and after an indeterminate steadq_enqueue, which has no transition
+/// ticket. Thread-local; valid until the next steadq_enqueue, steadq_lease,
+/// steadq_renew, steadq_ack, steadq_retry, or steadq_bury on the same
+/// thread, so it may be passed straight into steadq_resolve. Do not free.
 #[no_mangle]
 pub extern "C" fn steadq_last_ticket_json() -> *const c_char {
     LAST_TICKET.with(|cell| {
@@ -157,7 +161,17 @@ pub extern "C" fn steadq_abi_version() -> c_uint {
     1
 }
 
-/// Initialize a new queue. Returns null on failure.
+/// A C path as a filesystem path: any bytes but NUL, UTF-8 or not.
+fn c_path<'a>(path: *const c_char) -> &'a std::path::Path {
+    std::path::Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(path) }.to_bytes(),
+    ))
+}
+
+/// Create a queue at `path` with `shard_count` shards and open it.
+/// Returns NULL on failure with the reason in steadq_last_error(); the
+/// message starts with the error class (for example "resource exhausted"
+/// or "unsupported filesystem") followed by the system error.
 #[no_mangle]
 pub extern "C" fn steadq_init(path: *const c_char, shard_count: c_uint) -> *mut SteadqQueue {
     clear_last_error();
@@ -166,26 +180,29 @@ pub extern "C" fn steadq_init(path: *const c_char, shard_count: c_uint) -> *mut 
         return ptr::null_mut();
     }
     let result = std::panic::catch_unwind(|| {
-        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return Err(Error::InvalidInput("invalid UTF-8 path".into())),
-        };
+        let path = c_path(path);
         let opts = CreateOptions {
             shard_count,
             ..Default::default()
         };
-        match Queue::init(std::path::Path::new(path_str), &opts) {
-            Ok(_) => {}
-            Err(e) => return Err(classify_init_error(e)),
+        if let Err(e) = Queue::init(path, &opts) {
+            let detail = e.to_string();
+            let class = classify_init_error(e).to_string();
+            // Unit classes such as "resource exhausted" drop the errno text.
+            return Err(if class.contains(&detail) {
+                class
+            } else {
+                format!("{class}: {detail}")
+            });
         }
-        Queue::open(std::path::Path::new(path_str), &OpenOptions::default())
+        Queue::open(path, &OpenOptions::default()).map_err(leak_error)
     });
     match result {
         Ok(Ok(q)) => Box::into_raw(Box::new(SteadqQueue {
             inner: Mutex::new(q),
         })),
-        Ok(Err(e)) => {
-            set_last_error(&leak_error(e));
+        Ok(Err(message)) => {
+            set_last_error(&message);
             ptr::null_mut()
         }
         Err(_) => {
@@ -195,7 +212,8 @@ pub extern "C" fn steadq_init(path: *const c_char, shard_count: c_uint) -> *mut 
     }
 }
 
-/// Open an existing queue. Returns null on failure.
+/// Open an existing queue. Returns NULL on failure with the reason in
+/// steadq_last_error().
 #[no_mangle]
 pub extern "C" fn steadq_open(path: *const c_char) -> *mut SteadqQueue {
     clear_last_error();
@@ -203,13 +221,7 @@ pub extern "C" fn steadq_open(path: *const c_char) -> *mut SteadqQueue {
         set_last_error("null path");
         return ptr::null_mut();
     }
-    let result = std::panic::catch_unwind(|| {
-        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return Err(Error::InvalidInput("invalid UTF-8 path".into())),
-        };
-        Queue::open(std::path::Path::new(path_str), &OpenOptions::default())
-    });
+    let result = std::panic::catch_unwind(|| Queue::open(c_path(path), &OpenOptions::default()));
     match result {
         Ok(Ok(q)) => Box::into_raw(Box::new(SteadqQueue {
             inner: Mutex::new(q),
@@ -233,7 +245,10 @@ pub extern "C" fn steadq_close(queue: *mut SteadqQueue) {
     }
 }
 
-/// Enqueue a job.
+/// Enqueue a job. Writes the job ID to `job_id_out` (zeroed first) when
+/// non-NULL. Returns STEADQ_OK when committed; STEADQ_INDETERMINATE when
+/// the job may or may not be durable (job_id_out is still set; there is no
+/// transition ticket); otherwise an error code with steadq_last_error().
 #[no_mangle]
 pub extern "C" fn steadq_enqueue(
     queue: *mut SteadqQueue,
@@ -322,7 +337,12 @@ pub extern "C" fn steadq_enqueue(
         }
     }
 }
-/// Lease a job.
+/// Lease the next ready job for `lease_duration_ns` without waiting.
+/// Returns STEADQ_OK with a new lease in `*lease_out` (free it with
+/// steadq_lease_free). Returns STEADQ_NOT_COMMITTED with `*lease_out` NULL
+/// and steadq_last_error() "queue empty" when no job is ready.
+/// STEADQ_INDETERMINATE means a job may have been claimed without a usable
+/// lease; pass steadq_last_ticket_json() to steadq_resolve.
 #[no_mangle]
 pub extern "C" fn steadq_lease(
     queue: *mut SteadqQueue,
@@ -351,7 +371,7 @@ pub extern "C" fn steadq_lease(
                 STEADQ_OK
             }
             LeaseOutcome::Empty => {
-                unsafe { *lease_out = ptr::null_mut() };
+                set_last_error("queue empty");
                 STEADQ_NOT_COMMITTED
             }
             LeaseOutcome::NotCommitted(e) => {
@@ -374,7 +394,11 @@ pub extern "C" fn steadq_lease(
     }
 }
 
-/// See steadq.h for documentation.
+/// Hash the leased payload and check it against the envelope digest.
+/// Returns STEADQ_OK when it matches, STEADQ_CORRUPTION when it does not,
+/// or another error code with steadq_last_error(). steadq_ack verifies the
+/// payload itself, so this is only needed before acting on the payload
+/// without steadq_lease_open_reader.
 #[no_mangle]
 pub extern "C" fn steadq_lease_verify(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -410,7 +434,71 @@ pub extern "C" fn steadq_lease_verify(queue: *mut SteadqQueue, lease: *mut Stead
     }
 }
 
-/// See steadq.h for documentation.
+/// Extend a lease by `lease_duration_ns` from now. On STEADQ_OK the lease
+/// handle is updated in place and must be used for later calls. Returns
+/// STEADQ_NOT_COMMITTED with steadq_last_error() "lease lost" when the
+/// lease expired or was reaped (stop work on the job: it may run
+/// elsewhere). STEADQ_INDETERMINATE means the renewal may or may not have
+/// happened; the handle is unchanged, and steadq_last_ticket_json() holds
+/// the ticket for steadq_resolve.
+#[no_mangle]
+pub extern "C" fn steadq_renew(
+    queue: *mut SteadqQueue,
+    lease: *mut SteadqLease,
+    lease_duration_ns: u64,
+) -> c_int {
+    clear_last_error();
+    clear_last_ticket();
+    if queue.is_null() || lease.is_null() {
+        set_last_error("null queue or lease");
+        return STEADQ_NOT_COMMITTED;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = match queue.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                set_last_error("queue mutex poisoned");
+                return STEADQ_CORRUPTION;
+            }
+        };
+        let lease_ref = unsafe { &mut *lease };
+        match guard.renew(&lease_ref.inner, lease_duration_ns) {
+            RenewOutcome::Renewed(fresh) | RenewOutcome::Deferred(fresh) => {
+                lease_ref.inner = fresh;
+                STEADQ_OK
+            }
+            RenewOutcome::LeaseLost => {
+                set_last_error("lease lost");
+                STEADQ_NOT_COMMITTED
+            }
+            RenewOutcome::NotCommitted(e) => {
+                let code = error_to_code(&e);
+                set_last_error(&leak_error(e));
+                code
+            }
+            RenewOutcome::OutcomeUnknown(ticket) => {
+                set_last_ticket(&ticket);
+                STEADQ_INDETERMINATE
+            }
+        }
+    });
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in steadq_renew");
+            STEADQ_IO_FAILURE
+        }
+    }
+}
+
+/// Acknowledge a leased job: it completes and leaves a receipt. The payload
+/// is verified first. Returns STEADQ_OK when acked (also when it was
+/// already acked with this lease); STEADQ_NOT_COMMITTED with
+/// steadq_last_error() "lease lost" when the lease expired or was reaped;
+/// STEADQ_INDETERMINATE when the ack may or may not have happened, with the
+/// ticket in steadq_last_ticket_json() for steadq_resolve. The lease handle
+/// still needs steadq_lease_free.
 #[no_mangle]
 pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -456,7 +544,9 @@ pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -
     }
 }
 
-/// See steadq.h for documentation.
+/// Return a leased job to ready now, consuming the attempt; a job with no
+/// attempts left goes to dead instead. Return codes and the lease-lost and
+/// ticket contract are as for steadq_ack.
 #[no_mangle]
 pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -501,7 +591,11 @@ pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease)
     }
 }
 
-/// See steadq.h for documentation.
+/// Move a leased job to dead with a reason code from spec/reasons.md:
+/// 0 unspecified, 1 consumer_rejected, 2 unsupported_content_type,
+/// 3 administrative_bury, 4 attempts_exhausted. Any other value returns
+/// STEADQ_NOT_COMMITTED without touching the job. Return codes and the
+/// lease-lost and ticket contract are as for steadq_ack.
 #[no_mangle]
 pub extern "C" fn steadq_bury(
     queue: *mut SteadqQueue,
@@ -514,6 +608,13 @@ pub extern "C" fn steadq_bury(
         set_last_error("null queue or lease");
         return STEADQ_NOT_COMMITTED;
     }
+    let Some(reason) = u16::try_from(reason)
+        .ok()
+        .and_then(steadq_core::DeadReason::from_u16)
+    else {
+        set_last_error(&format!("invalid dead reason {reason}: expected 0-4"));
+        return STEADQ_NOT_COMMITTED;
+    };
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
         let mut guard = match queue.inner.lock() {
@@ -524,8 +625,6 @@ pub extern "C" fn steadq_bury(
             }
         };
         let lease_ref = unsafe { &*lease };
-        let reason = steadq_core::DeadReason::from_u16(reason as u16)
-            .unwrap_or(steadq_core::DeadReason::Unspecified);
         match guard.bury(&lease_ref.inner, reason) {
             TransitionOutcome::Committed => STEADQ_OK,
             TransitionOutcome::LeaseLost => {
@@ -552,7 +651,11 @@ pub extern "C" fn steadq_bury(
     }
 }
 
-/// Run a recovery pass.
+/// Run one recovery pass with the default work budget: reap expired leases,
+/// promote due delayed jobs, and compact and expire receipts. Returns
+/// STEADQ_OK when the pass had no errors, STEADQ_IO_FAILURE otherwise. A
+/// pass that runs out of budget still returns STEADQ_OK; call again to
+/// continue.
 #[no_mangle]
 pub extern "C" fn steadq_recover(queue: *mut SteadqQueue) -> c_int {
     clear_last_error();
@@ -705,8 +808,11 @@ pub extern "C" fn steadq_lease_source_path(
 }
 
 /// Open a verified payload reader for a lease. The payload is hashed once.
-/// Returns STEADQ_OK and sets *reader_out on success.
-/// The caller must free the reader with steadq_reader_free.
+/// Returns STEADQ_OK and sets *reader_out on success; the caller must free
+/// the reader with steadq_reader_free. Returns STEADQ_NOT_COMMITTED with
+/// steadq_last_error() "lease no longer current" when the leased file is
+/// gone (the lease was lost), and STEADQ_CORRUPTION when the payload does
+/// not match its digest.
 #[no_mangle]
 pub extern "C" fn steadq_lease_open_reader(
     queue: *mut SteadqQueue,
@@ -732,7 +838,10 @@ pub extern "C" fn steadq_lease_open_reader(
                 unsafe { *reader_out = Box::into_raw(boxed) };
                 STEADQ_OK
             }
-            Ok(None) => STEADQ_NOT_COMMITTED,
+            Ok(None) => {
+                set_last_error("lease no longer current");
+                STEADQ_NOT_COMMITTED
+            }
             Err(e) => {
                 set_last_error(&format!("{e}"));
                 error_to_code(&e)
@@ -891,10 +1000,116 @@ mod tests {
         );
 
         let mut lease = std::ptr::null_mut();
-        steadq_lease(queue, 1_000_000_000, &mut lease);
+        assert_eq!(
+            steadq_lease(queue, 1_000_000_000, &mut lease),
+            STEADQ_NOT_COMMITTED
+        );
         assert!(lease.is_null());
         assert!(steadq_last_ticket_json().is_null());
+        assert_eq!(last_error(), "queue empty");
         steadq_close(queue);
+    }
+
+    fn last_error() -> String {
+        let error = steadq_last_error();
+        assert!(!error.is_null());
+        unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Enqueue one job and lease it.
+    fn leased_queue(dir: &std::path::Path) -> (*mut SteadqQueue, *mut SteadqLease) {
+        let path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let queue = steadq_init(path.as_ptr(), 1);
+        assert!(!queue.is_null());
+        let mut id = SteadqJobId { bytes: [0; 16] };
+        let payload = b"job";
+        assert_eq!(
+            steadq_enqueue(
+                queue,
+                payload.as_ptr(),
+                payload.len(),
+                ptr::null(),
+                3,
+                &mut id
+            ),
+            STEADQ_OK
+        );
+        let mut lease = ptr::null_mut();
+        assert_eq!(steadq_lease(queue, 30_000_000_000, &mut lease), STEADQ_OK);
+        (queue, lease)
+    }
+
+    #[test]
+    fn bury_rejects_reasons_outside_the_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (queue, lease) = leased_queue(dir.path());
+        for reason in [5, 0x1_0001] {
+            assert_eq!(steadq_bury(queue, lease, reason), STEADQ_NOT_COMMITTED);
+            assert!(last_error().starts_with("invalid dead reason"));
+        }
+        assert_eq!(steadq_bury(queue, lease, 1), STEADQ_OK);
+        steadq_lease_free(lease);
+        steadq_close(queue);
+    }
+
+    #[test]
+    fn renew_updates_the_lease_in_place_and_reader_reports_lost_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (queue, lease) = leased_queue(dir.path());
+        let before = unsafe { (*lease).inner.expires_boottime_ns };
+        assert_eq!(steadq_renew(queue, lease, 60_000_000_000), STEADQ_OK);
+        assert!(unsafe { (*lease).inner.expires_boottime_ns } > before);
+        // The renewed handle acks; the stale path is gone for readers.
+        let stale = SteadqLease {
+            inner: unsafe { (*lease).inner.clone() },
+        };
+        assert_eq!(steadq_ack(queue, lease), STEADQ_OK);
+        let mut reader = ptr::null_mut();
+        assert_eq!(
+            steadq_lease_open_reader(queue, &stale, &mut reader),
+            STEADQ_NOT_COMMITTED
+        );
+        assert!(reader.is_null());
+        assert_eq!(last_error(), "lease no longer current");
+        assert_eq!(
+            steadq_renew(queue, lease, 1_000_000_000),
+            STEADQ_NOT_COMMITTED
+        );
+        assert_eq!(last_error(), "lease lost");
+        steadq_lease_free(lease);
+        steadq_close(queue);
+    }
+
+    #[test]
+    fn init_and_open_accept_non_utf8_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut bytes = dir.path().as_os_str().as_bytes().to_vec();
+        bytes.extend_from_slice(b"/q\xff");
+        let path = CString::new(bytes).unwrap();
+        let queue = steadq_init(path.as_ptr(), 1);
+        if queue.is_null() {
+            // The bytes reached the filesystem; a utf8only filesystem (ZFS)
+            // refuses the name with EILSEQ.
+            assert!(last_error().contains("os error 84"), "{}", last_error());
+            return;
+        }
+        steadq_close(queue);
+        let queue = steadq_open(path.as_ptr());
+        assert!(!queue.is_null(), "{}", last_error());
+        steadq_close(queue);
+    }
+
+    #[test]
+    fn init_failure_names_the_class_and_the_system_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let path = CString::new(file.join("q").as_os_str().as_bytes()).unwrap();
+        assert!(steadq_init(path.as_ptr(), 1).is_null());
+        let error = last_error();
+        assert!(error.contains(": "), "{error}");
     }
 
     #[test]

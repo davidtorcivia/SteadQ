@@ -19,7 +19,10 @@ static void rmrf(const char *path) {
 
 int main(void) {
     /* P1-24: Use a unique temp directory and clean it up. */
-    char tmpl[] = "/tmp/steadq_capi_XXXXXX";
+    const char *tmpdir = getenv("TMPDIR");
+    char tmpl[512];
+    snprintf(tmpl, sizeof(tmpl), "%s/steadq_capi_XXXXXX",
+             tmpdir && *tmpdir ? tmpdir : "/tmp");
     char *d = mkdtemp(tmpl);
     if (!d) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
     char path[512];
@@ -81,9 +84,20 @@ int main(void) {
     }
     (void)rc2;
 
+    rc = steadq_renew(q, lease, 60000000000ULL);
+    if (rc != STEADQ_OK) { fprintf(stderr, "renew failed: %d\n", rc); return 1; }
+    printf("renewed\n");
+
     rc = steadq_ack(q, lease);
     if (rc != STEADQ_OK) { fprintf(stderr, "ack failed: %d\n", rc); return 1; }
     printf("acked\n");
+
+    /* An empty queue is NOT_COMMITTED with a message, not a bare code. */
+    SteadqLease *none = NULL;
+    rc = steadq_lease(q, 30000000000ULL, &none);
+    assert(rc == STEADQ_NOT_COMMITTED && none == NULL);
+    assert(steadq_last_error() && strcmp(steadq_last_error(), "queue empty") == 0);
+
 
     steadq_lease_free(lease);
     steadq_close(q);
