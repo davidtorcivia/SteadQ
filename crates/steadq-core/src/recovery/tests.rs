@@ -3528,7 +3528,7 @@ fn reap_to_dead_uses_phase_aware_move_executor() {
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
         let shard_fd = open_relative(queue.root_fd(), &format!("ready/{}", parts[1])).unwrap();
-        let result = queue.reap_colocated_to_dead(
+        let result = queue.reap_to_dead(
             shard_fd.as_fd(),
             parts[2],
             &common,
@@ -4799,6 +4799,7 @@ fn recovery_does_not_invent_terminal_bucket_without_wall_floor() {
     );
 
     assert_eq!(stats.leases_to_dead, 0);
+    assert_eq!(stats.operations_attempted, 0);
     assert!(stats
         .errors
         .iter()
@@ -4881,4 +4882,274 @@ fn receipt_retention_quarantines_a_malformed_receipt_name() {
     );
     assert!(!stray.exists());
     assert_eq!(queue.list_quarantine().len(), 1);
+}
+
+fn reap_expired_with_scan_budget(
+    queue: &mut Queue,
+    scan_budget: &RecoveryScanBudget,
+) -> RecoveryStats {
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    stats
+}
+
+fn lease_one_per_shard(shard_count: u32) -> (TempDir, Queue) {
+    let (tmp, mut queue) = create_test_queue_with_shards(shard_count);
+    for shard in 0..shard_count {
+        enqueue_for_shard(&mut queue, &tmp, shard, None, b"colocated");
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+    }
+    (tmp, queue)
+}
+
+#[test]
+fn colocated_reap_persists_the_shard_when_the_scan_budget_runs_out() {
+    let (_tmp, mut queue) = lease_one_per_shard(2);
+    let one_read = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let first = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(first.leases_reaped, 0, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+
+    // Resuming at a saved shard skips leased/, so the one read reaches it.
+    let second = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+
+    let third = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(third.leases_reaped, 1, "errors: {:?}", third.errors);
+    assert!(!third.budget_exhausted);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+fn stream_fixture() -> (TempDir, std::fs::File) {
+    let tmp = TempDir::new().unwrap();
+    for name in ["a", "bb", "ccc"] {
+        std::fs::write(tmp.path().join(name), b"x").unwrap();
+    }
+    let dir = std::fs::File::open(tmp.path()).unwrap();
+    (tmp, dir)
+}
+
+fn stream_with(
+    dir: &std::fs::File,
+    budget: &RecoveryScanBudget,
+    deadline_mono: u64,
+) -> (
+    Result<Vec<fs::DirEntryName>, RecoveryDirectoryError>,
+    RecoveryScanStats,
+) {
+    let mut stats = RecoveryScanStats::default();
+    let result = stream_recovery_directory(dir.as_fd(), deadline_mono, budget, &mut stats, |name| {
+        name.as_bytes().len() == 2
+    });
+    (result, stats)
+}
+
+#[test]
+fn streamed_directory_charges_every_entry_and_keeps_only_matches() {
+    let (_tmp, dir) = stream_fixture();
+    let unbounded = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let (result, stats) = stream_with(&dir, &unbounded, u64::MAX);
+    let kept = result.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].as_bytes(), b"bb");
+    assert_eq!(
+        stats,
+        RecoveryScanStats {
+            directories_read: 1,
+            entries_read: 3,
+            name_bytes_read: 6,
+        }
+    );
+
+    // The end of the stream is only observed with budget left over.
+    for (entries, name_bytes, completes) in [
+        (3, u64::MAX, false),
+        (4, u64::MAX, true),
+        (u64::MAX, 6, false),
+        (u64::MAX, 7, true),
+    ] {
+        let budget = RecoveryScanBudget {
+            max_directories_read: 1,
+            max_entries_read: entries,
+            max_name_bytes_read: name_bytes,
+        };
+        let (result, _) = stream_with(&dir, &budget, u64::MAX);
+        match result {
+            Ok(_) => assert!(completes, "entries={entries} bytes={name_bytes}"),
+            Err(RecoveryDirectoryError::BudgetExhausted) => {
+                assert!(!completes, "entries={entries} bytes={name_bytes}")
+            }
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn streamed_directory_refuses_without_read_or_time_budget() {
+    let (_tmp, dir) = stream_fixture();
+    let no_reads = RecoveryScanBudget {
+        max_directories_read: 0,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let (result, stats) = stream_with(&dir, &no_reads, u64::MAX);
+    assert!(matches!(result, Err(RecoveryDirectoryError::BudgetExhausted)));
+    assert_eq!(stats, RecoveryScanStats::default());
+
+    let (result, stats) = stream_with(&dir, &RecoveryScanBudget::default(), 0);
+    assert!(matches!(result, Err(RecoveryDirectoryError::BudgetExhausted)));
+    assert_eq!(stats.directories_read, 1);
+    assert_eq!(stats.entries_read, 0);
+}
+
+#[test]
+fn streamed_directory_classifies_clock_and_read_failures() {
+    let (_tmp, dir) = stream_fixture();
+    fs::fault::reset();
+    fs::fault::inject_errno("clock_monotonic_ns", 1, libc::EIO);
+    let (clock, _) = stream_with(&dir, &RecoveryScanBudget::default(), u64::MAX);
+    fs::fault::inject_errno("directory_stream_next", 1, libc::EIO);
+    let (read, _) = stream_with(&dir, &RecoveryScanBudget::default(), u64::MAX);
+    fs::fault::reset();
+    assert!(matches!(
+        clock,
+        Err(RecoveryDirectoryError::Clock(ref error)) if error.raw_os_error() == Some(libc::EIO)
+    ));
+    assert!(matches!(
+        read,
+        Err(RecoveryDirectoryError::Io(ref error)) if error.raw_os_error() == Some(libc::EIO)
+    ));
+}
+
+#[test]
+fn colocated_reap_streams_a_ready_shard_past_the_bounded_read_size() {
+    let (tmp, mut queue) = lease_one_per_shard(1);
+    for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
+        enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
+    }
+    // Three entries fit this budget; a bounded read would demand 65,537.
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let small = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: 4,
+        max_name_bytes_read: u64::MAX,
+    };
+    let stats = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn colocated_reap_resumes_a_shard_that_outgrows_the_pass() {
+    let (tmp, mut queue) = lease_one_per_shard(1);
+    enqueue_for_shard(&mut queue, &tmp, 0, None, b"backlog");
+    let small = RecoveryScanBudget {
+        max_directories_read: 2,
+        max_entries_read: 1,
+        max_name_bytes_read: u64::MAX,
+    };
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let stats = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(stats.leases_reaped, 0, "errors: {:?}", stats.errors);
+    assert!(stats.budget_exhausted);
+    assert!(!stats.phase_blocked);
+    assert_eq!(stats.scan_skips, 1);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+}
+
+#[test]
+fn colocated_ready_stream_failure_blocks_and_moves_to_the_next_shard() {
+    let (_tmp, mut queue) = lease_one_per_shard(2);
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    fs::fault::reset();
+    fs::fault::inject_errno("directory_stream_next", 1, libc::EIO);
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    fs::fault::reset();
+    assert!(stats.phase_blocked);
+    assert_eq!(stats.scan_skips, 1);
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0000"));
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+fn corrupt_header(path: &Path) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(&[0xff; 4], 0).unwrap();
+}
+
+#[test]
+fn colocated_reap_quarantines_a_corrupt_expired_lease() {
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    let lease = lease_recovery_job(&mut queue, 3);
+    let source = tmp.path().join(&lease.exact_source_path);
+    corrupt_header(&source);
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    assert_eq!(stats.leases_reaped, 0);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.quarantined[0].relative_path, lease.exact_source_path);
+    assert!(!source.exists());
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn colocated_reap_does_not_quarantine_on_validation_io_failure() {
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    let lease = lease_recovery_job(&mut queue, 3);
+    let source = tmp.path().join(&lease.exact_source_path);
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    fs::fault::reset();
+    fs::fault::inject_errno("fstatat", 1, libc::EIO);
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(wall_floor),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    fs::fault::reset();
+    assert!(stats.quarantined.is_empty());
+    assert_eq!(stats.leases_reaped, 0);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_validate"));
+    assert!(source.exists());
 }

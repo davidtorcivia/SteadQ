@@ -21,8 +21,8 @@ const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
 const RECOVERY_CURSOR_VERSION: u16 = 1;
 const RECOVERY_CURSOR_FILE: &str = "recovery-cursor.json";
 const RECOVERY_CURSOR_MAX_BYTES: u64 = 16 * 1024;
-const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_NONBLOCK;
-const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_RDWR;
+const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDWR;
 const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
@@ -104,6 +104,45 @@ fn read_recovery_directory(
                 RecoveryDirectoryError::Io(error)
             }
         })
+}
+
+/// Stream a directory of any size and keep only the names `keep` accepts.
+///
+/// Every entry read is charged to the scan budget, so memory is bounded by
+/// the kept names. The directory must finish inside one pass's remaining
+/// entry, name-byte, and time budget; a caller resuming at directory
+/// granularity otherwise never gets past it.
+fn stream_recovery_directory(
+    dir_fd: BorrowedFd<'_>,
+    deadline_mono: u64,
+    budget: &RecoveryScanBudget,
+    stats: &mut RecoveryScanStats,
+    mut keep: impl FnMut(&fs::DirEntryName) -> bool,
+) -> Result<Vec<fs::DirEntryName>, RecoveryDirectoryError> {
+    if stats.directories_read >= budget.max_directories_read {
+        return Err(RecoveryDirectoryError::BudgetExhausted);
+    }
+    stats.directories_read = stats.directories_read.saturating_add(1);
+    let mut stream = fs::DirectoryStream::open(dir_fd).map_err(RecoveryDirectoryError::Io)?;
+    let mut kept = Vec::new();
+    loop {
+        if stats.entries_read >= budget.max_entries_read
+            || stats.name_bytes_read >= budget.max_name_bytes_read
+            || Queue::budget_time_exceeded(deadline_mono).map_err(RecoveryDirectoryError::Clock)?
+        {
+            return Err(RecoveryDirectoryError::BudgetExhausted);
+        }
+        let Some(name) = stream.next_entry().map_err(RecoveryDirectoryError::Io)? else {
+            return Ok(kept);
+        };
+        stats.entries_read = stats.entries_read.saturating_add(1);
+        stats.name_bytes_read = stats
+            .name_bytes_read
+            .saturating_add(u64::try_from(name.as_bytes().len()).unwrap_or(u64::MAX));
+        if keep(&name) {
+            kept.push(name);
+        }
+    }
 }
 
 #[derive(Debug)]

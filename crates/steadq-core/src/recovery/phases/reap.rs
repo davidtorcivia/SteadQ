@@ -32,6 +32,19 @@ impl Queue {
         ) {
             return;
         }
+        // A saved colocated shard means leased/ finished earlier in this
+        // cycle; rescanning it would spend the budget the shard needs.
+        if self.recovery_cursor.reap_colocated_shard.is_some() {
+            self.reap_colocated_ready_leases(
+                boottime_now,
+                wall_floor,
+                budget,
+                scan,
+                stats,
+                deadline_mono,
+            );
+            return;
+        }
 
         let mut boot_dirs = match read_recovery_directory(
             leased_fd.as_fd(),
@@ -364,14 +377,13 @@ impl Queue {
                         if !entry.ends_with(".sqj") {
                             continue;
                         }
+                        let relative_path =
+                            format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}");
 
                         // Parse the leased filename to get deadline and attempt info
                         let parsed = match steadq_names::parse_leased(entry) {
                             Ok(p) => p,
                             Err(_) => {
-                                let relative_path = format!(
-                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                );
                                 Self::record_error(
                                     stats,
                                     "reap_parse",
@@ -409,27 +421,19 @@ impl Queue {
                         if let Err(e) =
                             self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
                         {
-                            Self::record_error(
-                                stats,
-                                "reap_validate",
-                                &format!(
-                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                ),
-                                &format!("{e}"),
-                            );
+                            Self::record_error(stats, "reap_validate", &relative_path, &format!("{e}"));
                             // Quarantine corrupt objects
                             if matches!(e, Error::QueueCorrupt(_))
                                 && !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {
                                         source_directory_fd: shard_fd.as_fd(),
                                         filename: entry,
-                                        relative_path: &format!(
-                                            "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                        ),
+                                        relative_path: &relative_path,
                                         reason: crate::QuarantineReason::EnvelopeCorrupt,
                                     },
                                     stats,
-                                    budget)
+                                    budget,
+                                )
                             {
                                 self.recovery_cursor.reap_leases = previous_entry_cursor;
                                 return;
@@ -445,37 +449,20 @@ impl Queue {
                             Self::record_error(
                                 stats,
                                 "reap_bucket_check",
-                                &format!(
-                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                ),
+                                &relative_path,
                                 "invalid lease bucket width",
                             );
                             return;
                         };
-                        let actual_bucket = match u64::from_str_radix(bucket_name, 16) {
-                            Ok(bucket) => bucket,
-                            Err(_) => {
-                                Self::record_error(
-                                    stats,
-                                    "reap_bucket_check",
-                                    &format!(
-                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                    ),
-                                    "invalid lease bucket name",
-                                );
-                                continue;
-                            }
-                        };
-                        if actual_bucket != expected_lease_bucket {
+                        if bucket_num != expected_lease_bucket {
                             Self::record_error(
                                 stats,
                                 "reap_bucket_check",
+                                &relative_path,
                                 &format!(
-                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                    "bucket mismatch: dir {bucket_num} != deadline-derived {expected_lease_bucket}"
                                 ),
-                                &format!(
-                                    "bucket mismatch: dir {actual_bucket} != deadline-derived {expected_lease_bucket}"
-                                ));
+                            );
                             continue;
                         }
 
@@ -485,17 +472,11 @@ impl Queue {
                                 Self::record_error(
                                     stats,
                                     "reap_to_dead",
-                                    &format!(
-                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                    ),
+                                    &relative_path,
                                     "authenticated wall floor unavailable",
                                 );
                                 continue;
                             };
-                            // Move to dead
-                            let relative_path = format!(
-                                "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                            );
                             stats.operations_attempted += 1;
                             match self.reap_to_dead(
                                 shard_fd.as_fd(),
@@ -513,14 +494,10 @@ impl Queue {
                                 ),
                             }
                         } else {
-                            // Move to ready
-                            let relative_path = format!(
-                                "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                            );
                             stats.operations_attempted += 1;
                             match self.reap_to_ready(
                                 shard_fd.as_fd(),
-                                shard_name,
+                                shard,
                                 entry,
                                 &parsed.common,
                             ) {
@@ -559,9 +536,10 @@ impl Queue {
     ) {
         let first_shard = self.recovery_cursor.reap_colocated_shard.unwrap_or(0);
         for shard in first_shard..self.format.shard_count() {
+            // Every early return below resumes at this shard.
+            self.recovery_cursor.reap_colocated_shard = Some(shard);
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.reap_colocated_shard = Some(shard);
                 return;
             }
             let ready_dir = self.layout().ready_shard_dir(shard);
@@ -573,11 +551,17 @@ impl Queue {
                     continue;
                 }
             };
-            let mut entries = match read_recovery_directory(
+            // A ready shard holds the whole ready backlog, so it is streamed
+            // and only lease names are kept.
+            let mut entries = match stream_recovery_directory(
                 shard_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
+                |name| {
+                    name.as_ascii_str()
+                        .is_some_and(|name| steadq_names::parse_leased(name).is_ok())
+                },
             ) {
                 Ok(entries) => entries,
                 Err(error) => {
@@ -634,14 +618,26 @@ impl Queue {
                     self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
                 {
                     Self::record_error(stats, "reap_validate", &relative_path, &format!("{error}"));
+                    if matches!(error, Error::QueueCorrupt(_))
+                        && !self.quarantine_recovery_object(
+                            RecoveryQuarantineCandidate {
+                                source_directory_fd: shard_fd.as_fd(),
+                                filename: entry,
+                                relative_path: &relative_path,
+                                reason: crate::QuarantineReason::EnvelopeCorrupt,
+                            },
+                            stats,
+                            budget,
+                        )
+                    {
+                        return;
+                    }
                     continue;
                 }
                 if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
-                    self.recovery_cursor.reap_colocated_shard = Some(shard);
                     return;
                 }
-                stats.operations_attempted += 1;
                 if parsed.common.attempt >= parsed.common.maximum_attempts {
                     let Some(wall_floor) = wall_floor else {
                         Self::record_error(
@@ -652,7 +648,8 @@ impl Queue {
                         );
                         continue;
                     };
-                    match self.reap_colocated_to_dead(
+                    stats.operations_attempted += 1;
+                    match self.reap_to_dead(
                         shard_fd.as_fd(),
                         entry,
                         &parsed.common,
@@ -668,6 +665,7 @@ impl Queue {
                         ),
                     }
                 } else {
+                    stats.operations_attempted += 1;
                     match self.reap_colocated_to_ready(shard_fd.as_fd(), entry, &parsed.common) {
                         Ok(()) => stats.leases_reaped += 1,
                         Err(failure) => Self::record_move_failure(
@@ -699,63 +697,14 @@ impl Queue {
         move_verified_noreplace(shard_fd, leased_name, shard_fd, &ready_name)
     }
 
-    pub(crate) fn reap_colocated_to_dead(
-        &self,
-        src_fd: BorrowedFd<'_>,
-        leased_name: &str,
-        common: &steadq_names::CommonFields,
-        reason: DeadReason,
-        wall_floor: WallFloor,
-    ) -> Result<(), MoveFailure> {
-        let terminal_bucket = steadq_math::bucket_number(
-            wall_floor.unix_ns(),
-            self.format.terminal_bucket_width_ns(),
-        )
-        .ok_or_else(|| MoveFailure::NotCommitted {
-            phase: MovePhase::PreRename,
-            source: std::io::Error::other("terminal bucket overflow"),
-        })?;
-        let dead_common =
-            crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToDead, common)
-                .map_err(|_| MoveFailure::NotCommitted {
-                phase: MovePhase::PreRename,
-                source: std::io::Error::other("generation or attempt overflow"),
-            })?;
-        let dead_target =
-            self.layout()
-                .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
-        let dest_dir = dead_target.directory();
-        self.ensure_dir(&dest_dir)
-            .map_err(|error| MoveFailure::NotCommitted {
-                phase: MovePhase::EnsureDest,
-                source: error,
-            })?;
-        let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
-            MoveFailure::NotCommitted {
-                phase: MovePhase::EnsureDest,
-                source: error,
-            }
-        })?;
-        move_verified_noreplace(src_fd, leased_name, dest_fd.as_fd(), &dead_target.filename)
-    }
-
     pub(crate) fn reap_to_ready(
         &self,
         src_fd: BorrowedFd<'_>,
-        shard: &str,
+        shard: u32,
         leased_name: &str,
         common: &steadq_names::CommonFields,
     ) -> Result<(), MoveFailure> {
-        let shard_num = match u32::from_str_radix(shard, 16) {
-            Ok(n) => n,
-            Err(_) => {
-                return Err(MoveFailure::NotCommitted {
-                    phase: MovePhase::PreRename,
-                    source: std::io::Error::other(format!("invalid shard: {shard}")),
-                })
-            }
-        };
-        let dest_dir = self.layout().ready_shard_dir(shard_num);
+        let dest_dir = self.layout().ready_shard_dir(shard);
 
         let ready_common =
             crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToReady, common)
@@ -777,7 +726,6 @@ impl Queue {
         move_verified_noreplace(src_fd, leased_name, dest_fd.as_fd(), &ready_name)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reap_to_dead(
         &self,
         src_fd: BorrowedFd<'_>,
