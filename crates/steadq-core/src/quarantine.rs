@@ -1542,6 +1542,25 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_listing_fails_when_a_legacy_subdirectory_cannot_open() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        std::fs::create_dir(tmp.path().join("quarantine/legacy")).unwrap();
+        let queue = open_test_queue(tmp.path());
+        fs::fault::reset();
+        fs::fault::track();
+        queue.list_quarantine().unwrap();
+        // The scan's last two open_directory calls are the subdirectory open
+        // and the stream's reopen of it.
+        let child_open = fs::fault::call_count("open_directory") - 1;
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", child_open, libc::EIO);
+        let listed = queue.list_quarantine();
+        fs::fault::reset();
+        assert_eq!(listed.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
     fn quarantine_listing_treats_a_missing_directory_as_empty() {
         let tmp = TempDir::new().unwrap();
         init_test_queue(tmp.path());
