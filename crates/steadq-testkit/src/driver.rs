@@ -228,7 +228,7 @@ impl ProductionDriver {
             TransitionOutcome::Committed => {
                 // Production may have sent to ready (normal retry) or dead
                 // (attempts exhausted). Check actual state via inspect.
-                let snapshots = self.queue.inspect(job_id);
+                let snapshots = self.queue.inspect(job_id).expect("inspect the queue");
                 if snapshots.iter().any(|s| s.state == "dead") {
                     self.oracle.record_bury(job_id);
                     trace.source_state = Some("leased".into());
@@ -310,7 +310,7 @@ impl ProductionDriver {
     pub fn verify_consistency(&self) -> Vec<ConsistencyError> {
         let mut errors = Vec::new();
         for job in self.oracle.jobs() {
-            let snapshots = self.queue.inspect(&job.job_id);
+            let snapshots = self.queue.inspect(&job.job_id).expect("inspect the queue");
             let expected_state = oracle_state_name(&job.state);
             let actual = snapshots.iter().find(|s| s.state == expected_state);
 
@@ -499,7 +499,7 @@ mod tests {
         driver.lease(30_000_000_000).unwrap().expect("should lease");
         driver.bury(&job_id).unwrap();
 
-        let snapshots = driver.queue().inspect(&job_id);
+        let snapshots = driver.queue().inspect(&job_id).expect("inspect the queue");
         assert!(snapshots.iter().any(|s| s.state == "dead"));
     }
 
@@ -539,7 +539,7 @@ mod tests {
 
         // Reopen: queue state should persist
         let mut driver2 = ProductionDriver::reopen(&root).unwrap();
-        let snapshots = driver2.queue().inspect(&job_id);
+        let snapshots = driver2.queue().inspect(&job_id).expect("inspect the queue");
         assert!(snapshots.iter().any(|s| s.state == "ready"));
     }
 
@@ -774,7 +774,7 @@ mod stateful_tests {
         // Reopen and verify jobs persisted
         let mut driver2 = ProductionDriver::reopen(&root).unwrap();
         for job_id in &job_ids {
-            let snapshots = driver2.queue().inspect(job_id);
+            let snapshots = driver2.queue().inspect(job_id).expect("inspect the queue");
             assert!(
                 snapshots.iter().any(|s| s.state == "ready"),
                 "job {} should be in ready after reopen",
@@ -789,7 +789,7 @@ mod stateful_tests {
         // Drop and reopen; the queue should still be consistent
         let mut driver3 = ProductionDriver::reopen(&root).unwrap();
         for job_id in &job_ids {
-            let snapshots = driver3.queue().inspect(job_id);
+            let snapshots = driver3.queue().inspect(job_id).expect("inspect the queue");
             assert!(
                 !snapshots.is_empty(),
                 "job {} vanished after reopen",

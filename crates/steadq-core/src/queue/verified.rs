@@ -150,6 +150,7 @@ pub(crate) fn receipt_read_open_flags() -> i32 {
     libc::O_RDONLY
         .checked_add(libc::O_CLOEXEC)
         .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .and_then(|flags| flags.checked_add(libc::O_NONBLOCK))
         .expect("receipt read flags are disjoint")
 }
 
@@ -373,9 +374,18 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
     })
 }
 
+/// A short read means the object is truncated, which no retry fixes.
+fn read_error(error: std::io::Error) -> VerificationError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        VerificationError::Corrupt("object is shorter than its envelope".into())
+    } else {
+        VerificationError::Io(error.to_string())
+    }
+}
+
 fn read_and_verify_header(fd: BorrowedFd<'_>) -> Result<FixedHeader, VerificationError> {
     let mut header_buf = [0u8; 128];
-    fs::pread_exact(fd, &mut header_buf, 0).map_err(|e| VerificationError::Io(e.to_string()))?;
+    fs::pread_exact(fd, &mut header_buf, 0).map_err(read_error)?;
     let header = FixedHeader::decode(&header_buf)
         .map_err(|e| VerificationError::Corrupt(format!("header decode: {e}")))?;
     let ext_len = header.extension_header_length as usize;
@@ -390,7 +400,7 @@ fn read_and_verify_header(fd: BorrowedFd<'_>) -> Result<FixedHeader, Verificatio
 fn read_extension(fd: BorrowedFd<'_>, ext_len: usize) -> Result<Vec<u8>, VerificationError> {
     let mut ext_buf = vec![0u8; ext_len];
     if is_extension_present(ext_len) {
-        fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| VerificationError::Io(e.to_string()))?;
+        fs::pread_exact(fd, &mut ext_buf, 128).map_err(read_error)?;
     }
     Ok(ext_buf)
 }
@@ -905,7 +915,7 @@ mod tests {
     fn receipt_open_flags_are_exact() {
         assert_eq!(
             receipt_read_open_flags(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
         );
         assert_eq!(
             receipt_write_open_flags(),

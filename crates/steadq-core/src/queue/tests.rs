@@ -4,7 +4,7 @@ use super::publish::PublishError;
 use super::resolve::*;
 use super::*;
 use crate::FsckOptions;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 trait CommitOrPanic {
@@ -854,25 +854,189 @@ fn dirtyset_record_deduplicates_and_sync_all_fsyncs() {
     assert!(dirty.is_empty());
 }
 
+fn dir_identity(path: &Path) -> (u64, u64) {
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+fn delayed_input(payload: &[u8]) -> EnqueueInput {
+    EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".into(),
+        initial_not_before: Some(fs::clock_realtime_ns().unwrap() + 3_600_000_000_000),
+        payload: payload.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// Run `op` with every fsync_dir_fd recorded, and return what it synced.
+fn synced_dirs<T>(op: impl FnOnce() -> T) -> (T, Vec<(u64, u64)>) {
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    let result = op();
+    let synced = fs::fault::fd_identities("fsync_dir_fd");
+    fs::fault::reset();
+    (result, synced)
+}
+
+fn committed_path(tmp: &TempDir, outcome: EnqueueOutcome) -> PathBuf {
+    match outcome {
+        EnqueueOutcome::Committed(ticket) | EnqueueOutcome::Deferred(ticket) => {
+            tmp.path().join(ticket.expected_relative_path)
+        }
+        other => panic!("enqueue failed: {other:?}"),
+    }
+}
+
 #[test]
-fn dirty_ensure_skips_known_directory_without_recording_parent() {
-    let (_tmp, queue) = create_test_queue();
-    let mut initial_dirty = engine::DirtySet::new();
-    queue
-        .ensure_dir_with_dirty("ready/0000", Some(&mut initial_dirty))
-        .unwrap();
-    initial_dirty.sync_all().unwrap();
+fn strict_enqueue_syncs_bucket_entries_left_pending_by_a_dropped_batch() {
+    let (tmp, mut queue) = create_test_queue();
+    {
+        let mut batch = queue.batch();
+        assert!(matches!(
+            batch.enqueue(delayed_input(b"dropped")),
+            BatchEnqueueOutcome::Pending(_)
+        ));
+    }
+    let (outcome, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"strict")));
+    let job = committed_path(&tmp, outcome);
+    let bucket = job.parent().unwrap().parent().unwrap();
+    assert!(synced.contains(&dir_identity(bucket)));
+    assert!(synced.contains(&dir_identity(&tmp.path().join("delayed"))));
+}
 
-    fs::fault::reset();
-    fs::fault::inject_errno("mkdirat", 1, libc::EIO);
-    let mut next_dirty = engine::DirtySet::new();
-    let result = queue.ensure_dir_with_dirty("ready/0000", Some(&mut next_dirty));
-    let mkdir_calls = fs::fault::call_count("mkdirat");
-    fs::fault::reset();
+#[test]
+fn batch_commit_marks_its_directories_durable() {
+    let (tmp, mut queue) = create_test_queue();
+    let mut batch = queue.batch();
+    assert!(matches!(
+        batch.enqueue(delayed_input(b"batched")),
+        BatchEnqueueOutcome::Pending(_)
+    ));
+    batch.commit().unwrap();
+    let (outcome, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"strict")));
+    let job = committed_path(&tmp, outcome);
+    let bucket = job.parent().unwrap().parent().unwrap();
+    assert!(!synced.contains(&dir_identity(bucket)));
+    assert!(!synced.contains(&dir_identity(&tmp.path().join("delayed"))));
+}
 
-    assert!(result.is_ok());
-    assert_eq!(mkdir_calls, 0);
-    assert!(next_dirty.is_empty());
+#[test]
+fn first_sighting_of_an_existing_bucket_syncs_its_parent_once() {
+    let (tmp, mut queue) = create_test_queue();
+    let mut other = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Another handle created the bucket; this handle cannot know whether
+    // that creator reached its barrier.
+    committed_path(&tmp, other.enqueue(delayed_input(b"other")));
+    let delayed = dir_identity(&tmp.path().join("delayed"));
+
+    let (first, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"first")));
+    committed_path(&tmp, first);
+    assert!(synced.contains(&delayed));
+
+    let (second, synced) = synced_dirs(|| queue.enqueue(delayed_input(b"second")));
+    let job = committed_path(&tmp, second);
+    assert!(!synced.contains(&delayed));
+    assert!(!synced.contains(&dir_identity(job.parent().unwrap().parent().unwrap())));
+}
+
+#[test]
+fn deferred_directories_become_known_only_after_sync() {
+    let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let job = committed_path(&tmp, queue.enqueue(delayed_input(b"deferred")));
+    let shard = job.parent().unwrap();
+    let relative = shard
+        .strip_prefix(tmp.path())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Pending: a strict caller must still sync the bucket.
+    let (result, synced) = synced_dirs(|| queue.ensure_dir_with_dirty(&relative, None));
+    result.unwrap();
+    assert!(synced.contains(&dir_identity(shard.parent().unwrap())));
+
+    let job = committed_path(&tmp, queue.enqueue(delayed_input(b"second")));
+    queue.sync().unwrap();
+    assert!(queue.dirty.borrow().is_empty());
+    let relative = format!(
+        "{}/{}",
+        relative.rsplit_once('/').unwrap().0,
+        job.parent().unwrap().file_name().unwrap().to_str().unwrap()
+    );
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    fs::fault::inject("mkdirat", u64::MAX);
+    let result = queue.ensure_dir_with_dirty(&relative, None);
+    let calls = (
+        fs::fault::call_count("mkdirat"),
+        fs::fault::call_count("fsync_dir_fd"),
+    );
+    fs::fault::reset();
+    result.unwrap();
+    assert_eq!(calls, (0, 0));
+}
+
+#[test]
+fn dead_letter_move_in_deferred_mode_syncs_its_directories_now() {
+    let tmp = TempDir::new().unwrap();
+    fs::fault::pin_clock_realtime_ns(fs::clock_realtime_ns().unwrap());
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let job = committed_path(
+        &tmp,
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }),
+    );
+    queue.sync().unwrap();
+    let relative = job.strip_prefix(tmp.path()).unwrap().to_str().unwrap();
+    let (ready_dir, ready_name) = relative.rsplit_once('/').unwrap();
+    let parsed = steadq_names::parse_ready(ready_name).unwrap();
+    let wall_floor = queue.wall_floor_for_mutation().unwrap();
+
+    let (result, synced) = synced_dirs(|| {
+        queue.move_to_dead(
+            ready_dir,
+            ready_name,
+            &parsed.common,
+            DeadReason::AttemptsExhausted,
+            wall_floor,
+        )
+    });
+    result.unwrap();
+    assert!(synced.contains(&dir_identity(&tmp.path().join("dead"))));
+    assert!(queue.dirty.borrow().is_empty());
 }
 
 #[test]
@@ -1832,30 +1996,6 @@ fn claim_source_evidence_detects_in_place_header_change() {
 }
 
 #[test]
-fn lease_reports_ready_header_corruption_without_flattening() {
-    let (tmp, mut queue) = create_test_queue();
-    let enqueue = match queue.enqueue(EnqueueInput {
-        maximum_attempts: 3,
-        content_type: "text/plain".to_string(),
-        payload: b"corrupt claim".to_vec(),
-        ..Default::default()
-    }) {
-        EnqueueOutcome::Committed(ticket) => ticket,
-        outcome => panic!("expected committed enqueue, got {outcome:?}"),
-    };
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(tmp.path().join(enqueue.expected_relative_path))
-        .unwrap();
-    file.write_at(&[0xff], 0).unwrap();
-
-    assert!(matches!(
-        queue.lease(0, 30_000_000_000),
-        LeaseOutcome::NotCommitted(Error::QueueCorrupt(_))
-    ));
-}
-
-#[test]
 fn enqueue_delayed() {
     let (_tmp, mut queue) = create_test_queue();
     let future = fs::clock_realtime_ns().unwrap() + 60_000_000_000; // 60s in future
@@ -2387,7 +2527,7 @@ fn retry_with_policy_works() {
     let policy = steadq_math::RetryPolicy::new(1000, 300_000, false, None).unwrap();
     let result = queue.retry_with_policy(&lease, &policy);
     assert!(matches!(result, TransitionOutcome::Committed));
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "delayed");
 }
@@ -2405,7 +2545,7 @@ fn inspect_finds_ready_job() {
         _ => panic!("enqueue failed"),
     };
 
-    let snapshots = queue.inspect(&ticket.job_id);
+    let snapshots = queue.inspect(&ticket.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "ready");
     assert_eq!(snapshots[0].generation, 0);
@@ -2425,7 +2565,7 @@ fn inspect_finds_leased_job() {
         _ => panic!("lease failed"),
     };
 
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "leased");
 }
@@ -2457,7 +2597,7 @@ fn duplicate_ack_returns_already_acked() {
 fn inspect_returns_empty_for_unknown() {
     let (_tmp, queue) = create_test_queue();
     let unknown_id = [0xFF; 16];
-    let snapshots = queue.inspect(&unknown_id);
+    let snapshots = queue.inspect(&unknown_id).unwrap();
     assert!(snapshots.is_empty());
 }
 #[test]
@@ -2702,7 +2842,7 @@ fn enqueue_survives_reopen() {
         },
     )
     .unwrap();
-    let snapshots = queue2.inspect(&ticket.job_id);
+    let snapshots = queue2.inspect(&ticket.job_id).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].state, "ready");
 }
@@ -3119,6 +3259,7 @@ fn preferred_named_streaming_publication_bypasses_tmpfiles() {
         outcome => panic!("lease failed: {outcome:?}"),
     };
     assert_eq!(lease.job_id, ticket.job_id);
+    assert_eq!(lease.envelope_digest, ticket.envelope_digest);
     queue.verify_lease_payload(&lease).unwrap();
 }
 
@@ -4204,6 +4345,7 @@ fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
         .commit_or_panic();
     let dead_snapshot = dead_queue
         .inspect(&dead_lease.job_id)
+        .unwrap()
         .into_iter()
         .find(|snapshot| snapshot.state == "dead")
         .unwrap();
@@ -4233,6 +4375,7 @@ fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
     ));
     let receipt_snapshot = receipt_queue
         .inspect(&receipt_lease.job_id)
+        .unwrap()
         .into_iter()
         .find(|snapshot| snapshot.state == "receipt")
         .unwrap();
@@ -5985,17 +6128,18 @@ fn export_dead_copies_file_content_through_core() {
     queue.bury(&lease, DeadReason::AdministrativeBury);
 
     let output = tmp.path().join("exported.bin");
-    let n = queue.export_dead(&lease.job_id, &output).unwrap();
+    let n = queue.export_dead(&lease.job_id, &output).unwrap().unwrap();
     assert!(n > b"dead job payload".len() as u64);
     let data = std::fs::read(&output).unwrap();
     assert!(data.ends_with(b"dead job payload"));
 }
 
 #[test]
-fn export_dead_returns_error_for_missing_job() {
-    let (_tmp, queue) = create_test_queue();
-    let result = queue.export_dead(&[0xFF; 16], std::path::Path::new("/tmp/nonexistent"));
-    assert!(result.is_err());
+fn export_dead_reports_a_missing_job_as_none() {
+    let (tmp, queue) = create_test_queue();
+    let output = tmp.path().join("nonexistent");
+    assert_eq!(queue.export_dead(&[0xFF; 16], &output), Ok(None));
+    assert!(!output.exists());
 }
 
 #[test]
@@ -6018,7 +6162,7 @@ fn remove_dead_deletes_file_through_core() {
     );
 
     // Job should be in dead.
-    let snapshots = queue.inspect(&lease.job_id);
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
     assert!(snapshots.iter().any(|s| s.state == "dead"));
 
     // Remove it.
@@ -6026,11 +6170,11 @@ fn remove_dead_deletes_file_through_core() {
     assert!(removed);
 
     // Job should be gone.
-    let snapshots2 = queue.inspect(&lease.job_id);
+    let snapshots2 = queue.inspect(&lease.job_id).unwrap();
     assert!(snapshots2.is_empty());
 
-    // Remove again returns error (not found by inspect).
-    assert!(queue.remove_dead(&lease.job_id).is_err());
+    // Removing it again finds nothing.
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(false));
 
     drop(tmp);
 }
@@ -6271,7 +6415,7 @@ fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
     };
     let wall_floor = queue.authenticated_wall_floor().unwrap();
     let before = queue.check_duplicate_ack_bounded(&lease, wall_floor);
-    assert!(!before, "no receipt yet, duplicate check must be false");
+    assert_eq!(before, Ok(false), "no receipt yet");
     queue.verify_lease_payload(&lease).unwrap();
     let ack = queue.ack(&lease);
     assert!(
@@ -6279,7 +6423,7 @@ fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
         "ack must succeed, got {ack:?}"
     );
     let after = queue.check_duplicate_ack_bounded(&lease, wall_floor);
-    assert!(after, "after ack, duplicate check must be true");
+    assert_eq!(after, Ok(true), "after ack");
 }
 
 #[test]
@@ -6348,7 +6492,7 @@ fn oracle_driven_closed_loop() {
                 if let EnqueueOutcome::Committed(ticket) = outcome {
                     oracle.insert(ticket.job_id, State::Ready);
                     // Reconcile: inspect must see a ready object for this id.
-                    let snaps = queue.inspect(&ticket.job_id);
+                    let snaps = queue.inspect(&ticket.job_id).unwrap();
                     assert!(
                         snaps.iter().any(|s| s.state == "ready"),
                         "oracle Ready not reflected by inspect for {}",
@@ -6361,7 +6505,7 @@ fn oracle_driven_closed_loop() {
                     let id = l.job_id;
                     oracle.insert(id, State::Leased);
                     leases.insert(id, l);
-                    let snaps = queue.inspect(&id);
+                    let snaps = queue.inspect(&id).unwrap();
                     assert!(
                         snaps.iter().any(|s| s.state == "leased"),
                         "oracle Leased not reflected by inspect"
@@ -6380,7 +6524,7 @@ fn oracle_driven_closed_loop() {
                         match queue.ack(&lease) {
                             AckOutcome::Acked | AckOutcome::AlreadyAcked => {
                                 oracle.insert(job_id, State::Acked);
-                                let snaps = queue.inspect(&job_id);
+                                let snaps = queue.inspect(&job_id).unwrap();
                                 assert!(
                                     snaps.iter().any(|s| s.state == "receipt")
                                         || snaps.is_empty()
@@ -6407,7 +6551,7 @@ fn oracle_driven_closed_loop() {
                         }
                     } else if let TransitionOutcome::Committed = queue.retry_now(&l) {
                         leases.remove(&id);
-                        let snaps = queue.inspect(&id);
+                        let snaps = queue.inspect(&id).unwrap();
                         // retry_now moves to ready, or to dead when
                         // attempts are exhausted.
                         if snaps.iter().any(|s| s.state == "ready") {
@@ -6440,7 +6584,7 @@ fn oracle_driven_closed_loop() {
     for (id, state) in &oracle {
         match state {
             State::Ready => {
-                let snaps = queue.inspect(id);
+                let snaps = queue.inspect(id).unwrap();
                 // May have been leased later without oracle update if we only
                 // track transitions we apply; re-check live state.
                 let live_ready = snaps.iter().any(|s| s.state == "ready");
@@ -6452,7 +6596,7 @@ fn oracle_driven_closed_loop() {
                 );
             }
             State::Leased => {
-                let snaps = queue.inspect(id);
+                let snaps = queue.inspect(id).unwrap();
                 assert!(
                     snaps.iter().any(|s| s.state == "leased")
                         || snaps.iter().any(|s| s.state == "ready")
@@ -7398,6 +7542,7 @@ fn list_dead_returns_authenticated_dead_objects_only() {
     ));
     let expected: Vec<_> = queue
         .inspect(&lease.job_id)
+        .unwrap()
         .into_iter()
         .filter(|s| s.state == "dead")
         .collect();
@@ -7734,4 +7879,574 @@ fn claim_preserves_resource_exhaustion_before_rename() {
             ));
         }
     }
+}
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c_path` is NUL-terminated and outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+}
+
+/// Run `op` against a FIFO at `path`. If an open(2) of the FIFO is still
+/// blocked after 2 s, an O_RDWR open releases it and the test fails instead
+/// of hanging.
+fn without_blocking_on_fifo<T>(path: &Path, op: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let stop = stop.clone();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !stop.load(Ordering::SeqCst) {
+                // O_RDWR on a FIFO never blocks and releases a blocked
+                // opener of either direction.
+                if std::time::Instant::now() >= deadline
+                    && std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                        .is_ok()
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        })
+    };
+    let result = op();
+    stop.store(true, Ordering::SeqCst);
+    assert!(
+        !watchdog.join().unwrap(),
+        "open blocked on the FIFO at {}",
+        path.display()
+    );
+    result
+}
+
+fn fd_is_cloexec(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: F_GETFD reads descriptor flags of a live descriptor.
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFD) };
+    assert!(flags >= 0);
+    flags & libc::FD_CLOEXEC != 0
+}
+
+#[test]
+fn lock_files_open_close_on_exec_without_following_symlinks() {
+    for access in [libc::O_RDONLY, libc::O_RDWR] {
+        assert_eq!(
+            lock_open_flags(access),
+            access | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+    }
+    let (_tmp, queue) = create_test_queue();
+    assert!(fd_is_cloexec(
+        queue._maint_lock_fd.as_ref().unwrap().as_fd()
+    ));
+}
+
+#[test]
+fn raw_reads_never_block_follow_or_leak() {
+    assert_eq!(
+        raw_read_open_flags(),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+    );
+}
+
+fn first_ready_job(tmp: &TempDir, queue: &mut Queue) -> (String, String) {
+    let ticket = match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: b"payload".to_vec(),
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(ticket) => ticket,
+        other => panic!("enqueue failed: {other:?}"),
+    };
+    assert!(tmp.path().join(&ticket.expected_relative_path).exists());
+    let (dir, name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+    (dir.to_string(), name.to_string())
+}
+
+fn validate_ready(queue: &Queue, dir: &str, name: &str) -> Result<FixedHeader, Error> {
+    let dir_fd = open_relative(queue.root_fd(), dir).unwrap();
+    let shard = dir.rsplit_once('/').unwrap().1.to_string();
+    queue.validate_active_object(
+        dir_fd.as_fd(),
+        name,
+        &crate::ActivePathContext::Ready { shard },
+    )
+}
+
+#[test]
+fn truncated_active_object_is_corrupt_not_io() {
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(&dir).join(&name);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(100)
+        .unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert!(matches!(
+        verified::verify_envelope_on_fd(file.as_fd()),
+        Err(verified::VerificationError::Corrupt(_))
+    ));
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::QueueCorrupt(_))
+    ));
+}
+
+#[test]
+fn active_object_fifo_or_symlink_is_corrupt_without_blocking() {
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(&dir).join(&name);
+    let saved = tmp.path().join("saved.sqj");
+    std::fs::rename(&path, &saved).unwrap();
+
+    std::os::unix::fs::symlink(&saved, &path).unwrap();
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::QueueCorrupt(_))
+    ));
+    std::fs::remove_file(&path).unwrap();
+
+    mkfifo(&path);
+    assert!(matches!(
+        without_blocking_on_fifo(&path, || validate_ready(&queue, &dir, &name)),
+        Err(Error::QueueCorrupt(_))
+    ));
+    std::fs::remove_file(&path).unwrap();
+
+    assert!(matches!(
+        validate_ready(&queue, &dir, &name),
+        Err(Error::IoFailure(_))
+    ));
+}
+
+#[test]
+fn open_rejects_oversize_symlinked_or_fifo_format() {
+    let open = |tmp: &TempDir| {
+        Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+    };
+    let (tmp, queue) = create_test_queue();
+    drop(queue);
+    let format = tmp.path().join("FORMAT");
+    let original = std::fs::read(&format).unwrap();
+
+    std::fs::remove_file(&format).unwrap();
+    let mut oversize = original.clone();
+    oversize.push(0);
+    std::fs::write(&format, &oversize).unwrap();
+    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+
+    std::fs::remove_file(&format).unwrap();
+    std::fs::write(tmp.path().join("FORMAT.real"), &original).unwrap();
+    std::os::unix::fs::symlink("FORMAT.real", &format).unwrap();
+    assert!(matches!(open(&tmp), Err(Error::QueueCorrupt(_))));
+
+    std::fs::remove_file(&format).unwrap();
+    mkfifo(&format);
+    assert!(matches!(
+        without_blocking_on_fifo(&format, || open(&tmp)),
+        Err(Error::QueueCorrupt(_))
+    ));
+
+    std::fs::remove_file(&format).unwrap();
+    std::fs::write(&format, &original).unwrap();
+    open(&tmp).unwrap();
+}
+
+#[test]
+fn open_rejects_a_fifo_recovery_cursor_without_blocking() {
+    let (tmp, queue) = create_test_queue();
+    drop(queue);
+    let cursor = tmp.path().join("control/recovery-cursor.json");
+    mkfifo(&cursor);
+    let result = without_blocking_on_fifo(&cursor, || {
+        Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(matches!(result, Err(Error::QueueCorrupt(_))));
+}
+
+fn bury_one(queue: &mut Queue) -> LeaseInfo {
+    queue.enqueue(EnqueueInput {
+        maximum_attempts: 1,
+        content_type: "x".to_string(),
+        payload: b"dead job payload".to_vec(),
+        ..Default::default()
+    });
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(l) => l,
+        o => panic!("lease failed: {o:?}"),
+    };
+    queue
+        .bury(&lease, DeadReason::AdministrativeBury)
+        .commit_or_panic();
+    lease
+}
+
+#[test]
+fn export_dead_refuses_an_existing_output_and_a_fifo_source() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let output = tmp.path().join("exported.bin");
+    std::fs::write(&output, b"keep").unwrap();
+    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+
+    let dead = find_file_with_suffix(&tmp.path().join("dead"), ".sqj").unwrap();
+    std::fs::remove_file(&dead).unwrap();
+    mkfifo(&dead);
+    std::fs::remove_file(&output).unwrap();
+    assert!(without_blocking_on_fifo(&dead, || queue.export_dead(&lease.job_id, &output)).is_err());
+    assert!(!output.exists());
+}
+
+/// Count `func` calls made by `op`, with a fault armed so counting is on.
+fn count_calls<T>(func: &str, op: impl FnOnce() -> T) -> (T, u64) {
+    fs::fault::reset();
+    fs::fault::inject("clock_monotonic_ns", u64::MAX);
+    let result = op();
+    let calls = fs::fault::call_count(func);
+    fs::fault::reset();
+    (result, calls)
+}
+
+#[test]
+fn inspect_reports_directory_errors_and_treats_missing_ones_as_empty() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+
+    fs::fault::reset();
+    fs::fault::inject("open_directory", 1);
+    let result = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(result, Err(Error::IoFailure(_))), "{result:?}");
+
+    std::fs::remove_dir(tmp.path().join("delayed")).unwrap();
+    let snapshots = queue.inspect(&lease.job_id).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].state, "dead");
+}
+
+#[test]
+fn dead_admin_io_failure_is_not_reported_as_corruption_or_absence() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let (_, calls) = count_calls("open_directory", || queue.inspect(&lease.job_id).unwrap());
+    for target in 1..=calls {
+        fs::fault::reset();
+        fs::fault::inject("open_directory", target);
+        let removed = queue.remove_dead(&lease.job_id);
+        fs::fault::reset();
+        fs::fault::inject("open_directory", target);
+        let exported = queue.export_dead(&lease.job_id, &tmp.path().join("out"));
+        fs::fault::reset();
+        assert!(
+            matches!(removed, Err(Error::IoFailure(_))),
+            "{target}: {removed:?}"
+        );
+        assert!(
+            matches!(exported, Err(Error::IoFailure(_))),
+            "{target}: {exported:?}"
+        );
+    }
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(true));
+}
+
+#[test]
+fn inspect_and_remove_dead_ignore_an_unauthenticated_dead_name() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let dead = find_file_with_suffix(&tmp.path().join("dead"), ".sqj").unwrap();
+    let shard_dir = dead.parent().unwrap();
+    let shard = shard_dir.file_name().unwrap().to_owned();
+    // The name tag binds the bucket, so the same name under another bucket
+    // does not authenticate.
+    let forged_dir = shard_dir
+        .parent()
+        .unwrap()
+        .with_file_name("ffffffffffffffff")
+        .join(shard);
+    std::fs::create_dir_all(&forged_dir).unwrap();
+    let forged = forged_dir.join(dead.file_name().unwrap());
+    std::fs::rename(&dead, &forged).unwrap();
+
+    assert_eq!(queue.inspect(&lease.job_id), Ok(Vec::new()));
+    assert_eq!(queue.remove_dead(&lease.job_id), Ok(false));
+    assert!(forged.exists());
+}
+
+#[test]
+fn inspect_reports_a_receipt_read_failure() {
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let (snapshots, calls) = count_calls("fstat", || queue.inspect(&lease.job_id).unwrap());
+    assert!(snapshots.iter().any(|s| s.state == "receipt"));
+    fs::fault::reset();
+    fs::fault::inject("fstat", calls);
+    let result = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(result, Err(Error::IoFailure(_))), "{result:?}");
+}
+
+#[test]
+fn ack_of_a_vanished_source_reports_receipt_probe_io_failure() {
+    let setup = || {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        std::fs::remove_file(tmp.path().join(&lease.exact_source_path)).unwrap();
+        (tmp, queue, lease)
+    };
+    let (_tmp, mut queue, lease) = setup();
+    let (outcome, calls) = count_calls("openat", || queue.ack(&lease));
+    assert_eq!(outcome, AckOutcome::LeaseLost);
+
+    let (_tmp, mut queue, lease) = setup();
+    fs::fault::reset();
+    fs::fault::inject("openat", calls);
+    let outcome = queue.ack(&lease);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, AckOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
+}
+
+fn temp_names(tmp: &TempDir, queue: &Queue) -> Vec<PathBuf> {
+    let mut names = Vec::new();
+    let boot = tmp.path().join("tmp").join(&queue.boot_id);
+    for shard in std::fs::read_dir(boot).into_iter().flatten().flatten() {
+        names.extend(
+            std::fs::read_dir(shard.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path()),
+        );
+    }
+    names
+}
+
+#[test]
+fn named_streaming_publication_removes_its_temp_when_nothing_committed() {
+    for (fault, count) in [("renameat2_noreplace", 1), ("pwrite", 1)] {
+        let (tmp, mut queue) = create_test_queue();
+        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+        fs::fault::reset();
+        fs::fault::inject(fault, count);
+        let outcome = queue.enqueue_streaming(
+            3,
+            "x".into(),
+            Default::default(),
+            None,
+            None,
+            None,
+            std::io::Cursor::new(b"streamed named"),
+        );
+        let reached = fs::fault::call_count(fault);
+        fs::fault::reset();
+        assert_eq!(reached, count, "{fault}");
+        assert!(
+            matches!(outcome, EnqueueOutcome::NotCommitted(..)),
+            "{fault}: {outcome:?}"
+        );
+        assert_eq!(temp_names(&tmp, &queue), Vec::<PathBuf>::new(), "{fault}");
+    }
+}
+
+fn corrupt_ready_job(tmp: &TempDir, queue: &mut Queue) -> PathBuf {
+    let (dir, name) = first_ready_job(tmp, queue);
+    let path = tmp.path().join(dir).join(name);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // Flip a byte of the envelope digest, the last field of the fixed header.
+    file.write_at(&[0xA5], 127).unwrap();
+    path
+}
+
+fn quarantine_count(tmp: &TempDir) -> usize {
+    std::fs::read_dir(tmp.path().join("quarantine"))
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn lease_quarantines_an_envelope_corrupt_ready_object_and_keeps_scanning() {
+    let (tmp, mut queue) = create_test_queue();
+    let corrupt = corrupt_ready_job(&tmp, &mut queue);
+    let outcome = queue.lease(0, 30_000_000_000);
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert!(!corrupt.exists());
+    assert_eq!(quarantine_count(&tmp), 1);
+    assert!(!queue.is_poisoned());
+}
+
+#[test]
+fn lease_reports_a_failed_quarantine_as_a_scan_error() {
+    let (tmp, mut queue) = create_test_queue();
+    let corrupt = corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject("renameat2_noreplace", 1);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, LeaseOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
+    assert!(corrupt.exists());
+    assert_eq!(quarantine_count(&tmp), 0);
+}
+
+#[test]
+fn export_dead_never_writes_through_an_output_symlink() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = bury_one(&mut queue);
+    let target = tmp.path().join("target.bin");
+    let output = tmp.path().join("link.bin");
+    std::os::unix::fs::symlink(&target, &output).unwrap();
+    assert!(queue.export_dead(&lease.job_id, &output).is_err());
+    assert!(!target.exists());
+}
+
+#[test]
+fn inspect_skips_a_receipt_that_vanishes_and_reports_one_it_cannot_open() {
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let (_, calls) = count_calls("openat", || queue.inspect(&lease.job_id).unwrap());
+
+    fs::fault::reset();
+    fs::fault::inject_errno("openat", calls, libc::ENOENT);
+    let vanished = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert_eq!(vanished, Ok(Vec::new()));
+
+    fs::fault::inject_errno("openat", calls, libc::EIO);
+    let failed = queue.inspect(&lease.job_id);
+    fs::fault::reset();
+    assert!(matches!(failed, Err(Error::IoFailure(_))), "{failed:?}");
+}
+
+#[test]
+fn lease_skips_a_corrupt_object_another_actor_quarantined_first() {
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject_errno("renameat2_noreplace", 1, libc::ENOENT);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert!(!queue.is_poisoned());
+}
+
+#[test]
+fn lease_poisons_when_a_corrupt_object_quarantine_is_indeterminate() {
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    let (outcome, calls) = count_calls("fsync_dir_fd", || queue.lease(0, 30_000_000_000));
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", calls);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, LeaseOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        queue.poison_reason(),
+        Some(PoisonReason::PostLinearizationStateUnknown)
+    );
+    assert_eq!(quarantine_count(&tmp), 1);
+}
+
+#[test]
+fn corrupt_ready_reason_names_the_cause() {
+    for (mode, links, reason) in [
+        (libc::S_IFIFO | 0o600, 1, QuarantineReason::NonRegularFile),
+        (libc::S_IFDIR | 0o700, 2, QuarantineReason::NonRegularFile),
+        (
+            libc::S_IFREG | 0o600,
+            2,
+            QuarantineReason::UnexpectedHardLink,
+        ),
+        (libc::S_IFREG | 0o600, 1, QuarantineReason::EnvelopeCorrupt),
+    ] {
+        assert_eq!(super::lease::corrupt_ready_reason(mode, links), reason);
+    }
+}
+
+#[test]
+fn lease_quarantines_hard_linked_and_fifo_ready_objects_by_cause() {
+    let reasons = |queue: &Queue| {
+        queue
+            .list_quarantine()
+            .into_iter()
+            .map(|entry| entry.reason)
+            .collect::<Vec<_>>()
+    };
+
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    add_hard_link(&tmp, &format!("{dir}/{name}"), "extra");
+    assert!(matches!(
+        queue.lease(0, 30_000_000_000),
+        LeaseOutcome::Empty
+    ));
+    assert_eq!(
+        reasons(&queue),
+        vec![QuarantineReason::UnexpectedHardLink as u16]
+    );
+
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(dir).join(name);
+    std::fs::remove_file(&path).unwrap();
+    mkfifo(&path);
+    let outcome = without_blocking_on_fifo(&path, || queue.lease(0, 30_000_000_000));
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert_eq!(
+        reasons(&queue),
+        vec![QuarantineReason::NonRegularFile as u16]
+    );
+}
+
+#[test]
+fn receipt_reads_do_not_block_on_a_fifo() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let receipt = find_file_with_suffix(&tmp.path().join("receipts"), ".rct").unwrap();
+    std::fs::remove_file(&receipt).unwrap();
+    mkfifo(&receipt);
+
+    let inspected = without_blocking_on_fifo(&receipt, || queue.inspect(&lease.job_id));
+    assert_eq!(inspected, Ok(Vec::new()));
+    let probe = without_blocking_on_fifo(&receipt, || queue.check_duplicate_ack(&lease));
+    assert_eq!(probe, AckOutcome::LeaseLost);
 }

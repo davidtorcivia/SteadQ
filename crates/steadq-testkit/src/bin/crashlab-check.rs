@@ -247,7 +247,7 @@ fn check_prefix_jobs(queue: &Queue, prefix: &DurablePrefix) -> (Vec<String>, Vec
     let mut missing = Vec::new();
     let mut acked_bad = Vec::new();
     for job in &prefix.committed {
-        let snapshots = queue.inspect(job);
+        let snapshots = queue.inspect(job).expect("inspect the queue");
         if snapshots.is_empty() {
             missing.push(hex(job));
             continue;
@@ -260,7 +260,7 @@ fn check_prefix_jobs(queue: &Queue, prefix: &DurablePrefix) -> (Vec<String>, Vec
     // a prior lease of a committed job), but check them anyway if present.
     for job in &prefix.acked {
         if !prefix.committed.contains(job) {
-            let snapshots = queue.inspect(job);
+            let snapshots = queue.inspect(job).expect("inspect the queue");
             if is_active(&snapshots) {
                 acked_bad.push(format!("{}:{}", hex(job), snapshots[0].state));
             }

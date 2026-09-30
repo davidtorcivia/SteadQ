@@ -70,14 +70,8 @@ impl Queue {
         // Validate the current lease source before acknowledging
         let source = match self.open_and_validate_current_lease(lease) {
             Ok(Some(source)) => source,
-            Ok(None) => {
-                // Source is gone. Before returning LeaseLost,
-                // check if this was a duplicate ack by probing receipts.
-                if self.check_duplicate_ack_bounded(lease, wall_floor) {
-                    return AckOutcome::AlreadyAcked;
-                }
-                return AckOutcome::LeaseLost;
-            }
+            // Source is gone: a duplicate ack left a receipt, or the lease is lost.
+            Ok(None) => return self.duplicate_ack_outcome(lease, wall_floor),
             Err(Error::QueueCorrupt(e)) => {
                 self.poison(PoisonReason::InternalInvariantViolation);
                 return AckOutcome::NotCommitted(Error::QueueCorrupt(e));
@@ -124,16 +118,7 @@ impl Queue {
                     ))
                 }
             }
-            LeasedMoveOutcome::SourceGone => {
-                // On source absence, do a bounded receipt probe.
-                // Construct the finite set of exact retained receipt paths
-                // and check them directly (bounded, not full scan).
-                if self.check_duplicate_ack_bounded(lease, wall_floor) {
-                    AckOutcome::AlreadyAcked
-                } else {
-                    AckOutcome::LeaseLost
-                }
-            }
+            LeasedMoveOutcome::SourceGone => self.duplicate_ack_outcome(lease, wall_floor),
             LeasedMoveOutcome::SourceChanged => {
                 self.poison(PoisonReason::InternalInvariantViolation);
                 AckOutcome::NotCommitted(Error::QueueCorrupt(

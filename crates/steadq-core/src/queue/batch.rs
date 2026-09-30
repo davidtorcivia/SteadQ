@@ -131,13 +131,13 @@ impl<'a> Batch<'a> {
     pub fn commit(self) -> Result<BatchCommitOutcome, BatchCommitOutcome> {
         let Batch {
             queue,
-            dirty,
+            mut dirty,
             pending_enqueues,
             pending_leases,
             pending_acks,
         } = self;
 
-        let sync_result = dirty.sync_all();
+        let sync_result = queue.sync_dirty(&mut dirty);
 
         if let Err(e) = sync_result {
             queue.poison(PoisonReason::PostLinearizationStateUnknown);

@@ -5,7 +5,9 @@ mod consumer;
 mod cursors;
 pub mod engine;
 mod inspect;
-pub(crate) use inspect::{copy_file_to_path, raw_read_open_flags};
+pub(crate) use inspect::{
+    copy_file_to_path, open_regular_read, raw_read_open_flags, regular_open_error,
+};
 pub mod layout;
 mod lease;
 mod options;
@@ -81,8 +83,7 @@ pub(super) struct LeasedSourceWitness {
 /// A reader for a verified lease payload that does not re-hash on each read.
 ///
 /// The payload is verified once at construction. Subsequent `read_at` calls
-/// perform direct pread on the held fd, avoiding the O(n^2) cost of calling
-/// `read_lease_payload_chunk` repeatedly.
+/// perform direct pread on the held fd without re-hashing.
 pub struct VerifiedPayloadReader {
     file_fd: OwnedFd,
     payload_start: u64,
@@ -167,6 +168,15 @@ pub(super) fn is_singly_linked_regular(mode: libc::mode_t, link_count: libc::nli
 pub(super) fn stat_matches_witness(stat: &libc::stat, device: u64, inode: u64) -> bool {
     is_singly_linked_regular(stat.st_mode, stat.st_nlink)
         && identity_matches(stat.st_dev, stat.st_ino, device, inode)
+}
+
+/// Lock files are never opened through a symlink and never inherited by a
+/// child process, which would keep holding the OFD lock after this handle.
+pub(crate) fn lock_open_flags(access: i32) -> i32 {
+    access
+        .checked_add(libc::O_CLOEXEC)
+        .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .expect("Linux open flags fit i32")
 }
 
 pub(super) fn resolver_file_open_flags() -> i32 {
@@ -375,7 +385,12 @@ impl Queue {
         let lock_fd =
             fs::create_exclusive(control_fd.as_fd(), "maintenance.lock", 0o600).or_else(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
-                    fs::openat(control_fd.as_fd(), "maintenance.lock", libc::O_RDWR, 0o600)
+                    fs::openat(
+                        control_fd.as_fd(),
+                        "maintenance.lock",
+                        lock_open_flags(libc::O_RDWR),
+                        0o600,
+                    )
                 } else {
                     Err(e)
                 }
@@ -438,7 +453,12 @@ impl Queue {
         for lock_file in ["maintenance.lock", "wall-watermark.lock", "recovery.lock"] {
             let fd = fs::create_exclusive(control_fd.as_fd(), lock_file, 0o600).or_else(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
-                    fs::openat(control_fd.as_fd(), lock_file, 0o2, 0o600)
+                    fs::openat(
+                        control_fd.as_fd(),
+                        lock_file,
+                        lock_open_flags(libc::O_RDWR),
+                        0o600,
+                    )
                 } else {
                     Err(e)
                 }
@@ -550,8 +570,8 @@ impl Queue {
 
         // Read FORMAT through descriptor-relative open, not pathname.
         // If FORMAT is absent, check whether an initialization was interrupted.
-        let format_fd = match fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0) {
-            Ok(fd) => fd,
+        let format_fd = match open_regular_read(root_fd.as_fd(), "FORMAT") {
+            Ok((fd, _)) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 if fs::fstatat(root_fd.as_fd(), ".initializing").is_ok() {
                     return Err(Error::QueueCorrupt(
@@ -561,19 +581,18 @@ impl Queue {
                 }
                 return Err(Error::QueueCorrupt("FORMAT file is missing".into()));
             }
-            Err(e) => return Err(Error::from(e)),
+            Err(e) => return Err(regular_open_error(e)),
         };
-        let mut format_bytes = Vec::new();
-        {
-            let mut buf = [0u8; 4096];
-            loop {
-                match fs::read(format_fd.as_fd(), &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => format_bytes.extend_from_slice(&buf[..n]),
-                    Err(e) => return Err(Error::from(e)),
-                }
-            }
-        }
+        // One byte past the record is enough for decode to reject the size.
+        let mut format_bytes = Vec::with_capacity(steadq_format::FORMAT_SIZE + 1);
+        io::Read::read_to_end(
+            &mut io::Read::take(
+                std::fs::File::from(format_fd),
+                steadq_format::FORMAT_SIZE as u64 + 1,
+            ),
+            &mut format_bytes,
+        )
+        .map_err(Error::from)?;
         let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
             steadq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
@@ -600,16 +619,7 @@ impl Queue {
             classify_filesystem_type(fs::fs_type_magic(root), opts.allow_unsupported_fs)?;
 
         // Require all state directories to exist and be on the same device.
-        for state_dir in &[
-            "control",
-            "ready",
-            "leased",
-            "delayed",
-            "receipts",
-            "dead",
-            "quarantine",
-            "tmp",
-        ] {
+        for state_dir in STATE_DIRECTORIES {
             match fs::fstatat(root_fd.as_fd(), state_dir) {
                 Ok(stat) => {
                     if stat.st_dev != root_stat.st_dev {
@@ -640,8 +650,13 @@ impl Queue {
         let worker_nonce = fs::random_128bit().map_err(Error::from)?;
 
         // Acquire shared maintenance lock
-        let maint_fd = fs::openat(root_fd.as_fd(), "control/maintenance.lock", 0o0, 0o600)
-            .map_err(Error::from)?;
+        let maint_fd = fs::openat(
+            root_fd.as_fd(),
+            "control/maintenance.lock",
+            lock_open_flags(libc::O_RDONLY),
+            0,
+        )
+        .map_err(Error::from)?;
         let locked = fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(Error::from)?;
         if !locked {
             return Err(Error::MaintenanceBusy);
@@ -649,6 +664,7 @@ impl Queue {
         let recovery_cursor =
             crate::recovery::load_recovery_cursor(root_fd.as_fd(), format_rec.queue_id())?;
         let publication_mode = filesystem_type.and_then(preferred_publication_mode);
+        let known_dirs = init_synced_directories(&format_rec);
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -664,7 +680,7 @@ impl Queue {
             recovery_cursor,
             cached_wall_floor: None,
             cached_watermark_fd: std::cell::RefCell::new(None),
-            known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
+            known_dirs: std::cell::RefCell::new(known_dirs),
             cached_dest_fd: None,
             publication_mode,
             deferred_dir_sync: opts.deferred_dir_sync,
@@ -722,6 +738,27 @@ impl Queue {
             &self.boot_id,
         )
     }
+}
+
+const STATE_DIRECTORIES: [&str; 8] = [
+    "control",
+    "ready",
+    "leased",
+    "delayed",
+    "receipts",
+    "dead",
+    "quarantine",
+    "tmp",
+];
+
+/// Directories init creates and syncs before it publishes FORMAT, so an
+/// opened queue already holds durable entries for them.
+fn init_synced_directories(format: &FormatRecord) -> std::collections::HashSet<String> {
+    STATE_DIRECTORIES
+        .iter()
+        .map(|dir| (*dir).to_string())
+        .chain((0..format.shard_count()).map(|shard| format!("ready/{}", shard_hex(shard))))
+        .collect()
 }
 
 /// Open a relative path from a directory fd.

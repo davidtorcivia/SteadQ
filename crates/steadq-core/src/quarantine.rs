@@ -1572,6 +1572,11 @@ mod tests {
             ("fsync_dir_fd", 2, "move:SourceFsync", false),
         ] {
             let (tmp, queue) = queue_with_quarantine_candidate();
+            // Open marks init's directories known; forget quarantine/ so
+            // ensure_dir reaches mkdirat.
+            if fault == "mkdirat" {
+                queue.known_dirs.borrow_mut().remove("quarantine");
+            }
             let quarantine_id = [count as u8; 16];
             let quarantine_name = steadq_names::quarantine_filename(
                 &quarantine_id,

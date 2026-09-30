@@ -2511,7 +2511,7 @@ fn recovery_cursor_record_boundary_table() {
     assert_eq!(RECOVERY_CURSOR_MAX_BYTES, 16_384);
     assert_eq!(
         RECOVERY_CURSOR_OPEN_FLAGS,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
     );
     assert_eq!(
         RECOVERY_LOCK_OPEN_FLAGS,
@@ -3606,6 +3606,7 @@ fn reap_to_ready_records_executor_failure_without_counting_commit() {
         if outcome_unknown {
             assert!(queue
                 .inspect(&lease.job_id)
+                .unwrap()
                 .iter()
                 .any(|snapshot| snapshot.state == "ready"));
         }
@@ -3664,6 +3665,7 @@ fn reap_to_dead_records_executor_failure_without_counting_commit() {
         if outcome_unknown {
             assert!(queue
                 .inspect(&lease.job_id)
+                .unwrap()
                 .iter()
                 .any(|snapshot| snapshot.state == "dead"));
         }
@@ -3733,6 +3735,7 @@ fn delayed_promotion_records_executor_failure_without_counting_commit() {
         if outcome_unknown {
             assert!(queue
                 .inspect(&ticket.job_id)
+                .unwrap()
                 .iter()
                 .any(|snapshot| snapshot.state == "ready"));
         }
@@ -4227,6 +4230,7 @@ fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
     ));
     assert!(!queue
         .inspect(&lease.job_id)
+        .unwrap()
         .iter()
         .any(|snapshot| snapshot.state == "receipt"));
 

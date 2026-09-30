@@ -10,6 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 
+#[cfg(test)]
 use crate::errors::Error;
 
 /// Explicit dirty-directory tracking. Records the exact directory FDs that
@@ -19,27 +20,32 @@ use crate::errors::Error;
 #[derive(Debug, Default)]
 pub struct DirtySet {
     dirs: HashMap<(u64, u64), OwnedFd>,
+    /// Directories whose parent entry is only durable once this set syncs.
+    /// The queue marks them known after a successful barrier; dropping the
+    /// set unsynced forgets them.
+    pub(super) pending_dirs: std::collections::HashSet<String>,
 }
 
 impl DirtySet {
     pub fn new() -> Self {
-        Self {
-            dirs: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn is_empty(&self) -> bool {
         self.dirs.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.dirs.len()
     }
 
     pub fn clear(&mut self) {
         self.dirs.clear();
+        self.pending_dirs.clear();
     }
 
+    #[cfg(test)]
     pub fn extend(&mut self, other: Self) {
         for (k, v) in other.dirs {
             self.dirs.entry(k).or_insert(v);
@@ -322,6 +328,7 @@ impl MoveFailure {
     pub fn is_outcome_unknown(&self) -> bool {
         matches!(self, Self::OutcomeUnknown { .. })
     }
+    #[cfg(test)]
     pub fn is_not_committed(&self) -> bool {
         matches!(self, Self::NotCommitted { .. })
     }
@@ -889,6 +896,7 @@ pub(super) fn publish_tmpfile_noreplace_deferred_with_mode(
 
 /// Convert a MoveFailure into the public Error / poison decision.
 /// The caller decides poison; this helper maps phases to Error variants.
+#[cfg(test)]
 pub fn map_move_failure(f: MoveFailure) -> Error {
     match f {
         MoveFailure::AlreadyExists => Error::QueueCorrupt("destination already exists".into()),
@@ -899,12 +907,15 @@ pub fn map_move_failure(f: MoveFailure) -> Error {
 }
 
 // helpers for mutant killing
+#[cfg(test)]
 pub fn is_already_exists(f: &MoveFailure) -> bool {
     matches!(f, MoveFailure::AlreadyExists)
 }
+#[cfg(test)]
 pub fn is_source_missing(f: &MoveFailure) -> bool {
     matches!(f, MoveFailure::SourceMissing)
 }
+#[cfg(test)]
 pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
     matches!(
         phase,
@@ -914,6 +925,7 @@ pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
             | MovePhase::SourceFsync
     )
 }
+#[cfg(test)]
 pub fn is_not_committed_phase(phase: MovePhase) -> bool {
     matches!(
         phase,

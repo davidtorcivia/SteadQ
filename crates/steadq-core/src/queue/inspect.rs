@@ -83,7 +83,8 @@ impl Queue {
     /// Read a chunk of a leased job's payload at the given offset.
     /// Returns the number of bytes read (0 at EOF).
     /// Validates source identity before reading.
-    pub fn read_lease_payload_chunk(
+    #[cfg(test)]
+    pub(crate) fn read_lease_payload_chunk(
         &self,
         lease: &LeaseInfo,
         buf: &mut [u8],
@@ -160,258 +161,150 @@ impl Queue {
     }
 
     /// Diagnostic lookup: find all states for a job_id.
-    /// Scans active and terminal states for the computed shard.
-    pub fn inspect(&self, job_id: &[u8; 16]) -> Vec<Snapshot> {
-        let mut results = Vec::new();
-        let shard = compute_shard(self.format.queue_id(), job_id, self.format.shard_count());
+    /// Scans active and terminal states for the computed shard. A missing
+    /// directory is empty; any other directory or receipt read failure is an
+    /// error rather than a partial answer.
+    pub fn inspect(&self, job_id: &[u8; 16]) -> Result<Vec<Snapshot>, Error> {
+        let queue_id = self.format.queue_id();
+        let shard = compute_shard(queue_id, job_id, self.format.shard_count());
         let shard_str = shard_hex(shard);
+        let mut results = Vec::new();
+        let mut push = |state: &str, common: &CommonFields, relative_path: String| {
+            if common.job_id == *job_id {
+                results.push(Snapshot {
+                    job_id: *job_id,
+                    state: state.into(),
+                    generation: common.generation,
+                    attempt: common.attempt,
+                    maximum_attempts: common.maximum_attempts,
+                    shard,
+                    relative_path,
+                    size: 0,
+                });
+            }
+        };
+        let root = self.root_fd.as_fd();
 
-        // Check ready
-        let ready_dir = format!("ready/{shard_str}");
-        if let Ok(dir_fd) = open_relative(self.root_fd.as_fd(), &ready_dir) {
-            if let Ok(entries) = fs::read_dir_entries(dir_fd.as_fd()) {
-                for entry in entries {
-                    let Some(entry) = entry.as_ascii_str() else {
-                        continue;
-                    };
-                    if let Ok(parsed) = steadq_names::parse_ready(entry) {
-                        if parsed.common.job_id == *job_id {
-                            results.push(Snapshot {
-                                job_id: *job_id,
-                                state: "ready".into(),
-                                generation: parsed.common.generation,
-                                attempt: parsed.common.attempt,
-                                maximum_attempts: parsed.common.maximum_attempts,
-                                shard,
-                                relative_path: format!("{ready_dir}/{entry}"),
-                                size: 0,
-                            });
-                        }
-                    } else if let Ok(parsed) = steadq_names::parse_leased(entry) {
-                        if parsed.common.job_id == *job_id {
-                            results.push(Snapshot {
-                                job_id: *job_id,
-                                state: "leased".into(),
-                                generation: parsed.common.generation,
-                                attempt: parsed.common.attempt,
-                                maximum_attempts: parsed.common.maximum_attempts,
-                                shard,
-                                relative_path: format!("{ready_dir}/{entry}"),
-                                size: 0,
-                            });
-                        }
+        visit_shard_dirs(root, "ready", 0, &shard_str, &mut |dir, _| {
+            for entry in names_in(dir.fd)? {
+                if let Ok(parsed) = steadq_names::parse_ready(&entry) {
+                    push("ready", &parsed.common, dir.child(&entry));
+                } else if let Ok(parsed) = steadq_names::parse_leased(&entry) {
+                    push("leased", &parsed.common, dir.child(&entry));
+                }
+            }
+            Ok(())
+        })?;
+        visit_shard_dirs(root, "leased", 2, &shard_str, &mut |dir, _| {
+            for entry in names_in(dir.fd)? {
+                if let Ok(parsed) = steadq_names::parse_leased(&entry) {
+                    push("leased", &parsed.common, dir.child(&entry));
+                }
+            }
+            Ok(())
+        })?;
+        visit_shard_dirs(root, "delayed", 1, &shard_str, &mut |dir, _| {
+            for entry in names_in(dir.fd)? {
+                if let Ok(parsed) = steadq_names::parse_delayed(&entry) {
+                    push("delayed", &parsed.common, dir.child(&entry));
+                }
+            }
+            Ok(())
+        })?;
+        visit_shard_dirs(root, "dead", 1, &shard_str, &mut |dir, bucket| {
+            for entry in names_in(dir.fd)? {
+                if let Ok(parsed) = steadq_names::parse_dead(&entry) {
+                    if parsed.authenticate_tag(queue_id, bucket, &shard_str) {
+                        push("dead", &parsed.common, dir.child(&entry));
                     }
                 }
             }
-        }
-
-        // Check leased (scan boot dirs)
-        if let Ok(leased_root) = fs::open_directory(self.root_fd.as_fd(), "leased") {
-            if let Ok(boot_dirs) = fs::read_dir_entries(leased_root.as_fd()) {
-                for boot_dir in boot_dirs {
-                    let Some(boot_dir) = boot_dir.as_ascii_str() else {
-                        continue;
+            Ok(())
+        })?;
+        visit_shard_dirs(root, "receipts", 1, &shard_str, &mut |dir, bucket| {
+            for entry in names_in(dir.fd)? {
+                let Ok(parsed) = steadq_names::parse_receipt(&entry) else {
+                    continue;
+                };
+                if parsed.common.job_id != *job_id {
+                    continue;
+                }
+                let file_fd =
+                    match fs::openat(dir.fd, &entry, verified::receipt_read_open_flags(), 0) {
+                        Ok(file_fd) => file_fd,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(Error::from(error)),
                     };
-                    let boot_path = format!("leased/{boot_dir}");
-                    if let Ok(boot_fd) = open_relative(self.root_fd.as_fd(), &boot_path) {
-                        if let Ok(bucket_dirs) = fs::read_dir_entries(boot_fd.as_fd()) {
-                            for bucket_dir in bucket_dirs {
-                                let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
-                                    continue;
-                                };
-                                let shard_path = format!("{boot_path}/{bucket_dir}/{shard_str}");
-                                if let Ok(shard_fd) =
-                                    open_relative(self.root_fd.as_fd(), &shard_path)
-                                {
-                                    if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
-                                        for entry in entries {
-                                            let Some(entry) = entry.as_ascii_str() else {
-                                                continue;
-                                            };
-                                            if let Ok(parsed) = steadq_names::parse_leased(entry) {
-                                                if parsed.common.job_id == *job_id {
-                                                    results.push(Snapshot {
-                                                        job_id: *job_id,
-                                                        state: "leased".into(),
-                                                        generation: parsed.common.generation,
-                                                        attempt: parsed.common.attempt,
-                                                        maximum_attempts: parsed
-                                                            .common
-                                                            .maximum_attempts,
-                                                        shard,
-                                                        relative_path: format!(
-                                                            "{shard_path}/{entry}"
-                                                        ),
-                                                        size: 0,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                match verified::verify_receipt_on_fd(
+                    file_fd.as_fd(),
+                    self.receipt_context(bucket, &shard_str, &entry),
+                    None,
+                ) {
+                    Ok(_) => push("receipt", &parsed.common, dir.child(&entry)),
+                    Err(verified::VerificationError::Io(message)) => {
+                        return Err(Error::IoFailure(message))
                     }
+                    Err(_) => {}
                 }
             }
-        }
-
-        // Check delayed
-        if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_fd(), "delayed") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries(delayed_root.as_fd()) {
-                for bucket_dir in bucket_dirs {
-                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
-                        continue;
-                    };
-                    let shard_path = format!("delayed/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
-                            for entry in entries {
-                                let Some(entry) = entry.as_ascii_str() else {
-                                    continue;
-                                };
-                                if let Ok(parsed) = steadq_names::parse_delayed(entry) {
-                                    if parsed.common.job_id == *job_id {
-                                        results.push(Snapshot {
-                                            job_id: *job_id,
-                                            state: "delayed".into(),
-                                            generation: parsed.common.generation,
-                                            attempt: parsed.common.attempt,
-                                            maximum_attempts: parsed.common.maximum_attempts,
-                                            shard,
-                                            relative_path: format!("{shard_path}/{entry}"),
-                                            size: 0,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check dead
-        if let Ok(dead_root) = fs::open_directory(self.root_fd.as_fd(), "dead") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries(dead_root.as_fd()) {
-                for bucket_dir in bucket_dirs {
-                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
-                        continue;
-                    };
-                    let shard_path = format!("dead/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
-                            for entry in entries {
-                                let Some(entry) = entry.as_ascii_str() else {
-                                    continue;
-                                };
-                                if let Ok(parsed) = steadq_names::parse_dead(entry) {
-                                    if parsed.common.job_id == *job_id {
-                                        results.push(Snapshot {
-                                            job_id: *job_id,
-                                            state: "dead".into(),
-                                            generation: parsed.common.generation,
-                                            attempt: parsed.common.attempt,
-                                            maximum_attempts: parsed.common.maximum_attempts,
-                                            shard,
-                                            relative_path: format!("{shard_path}/{entry}"),
-                                            size: 0,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check receipts
-        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_fd(), "receipts") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries(receipts_root.as_fd()) {
-                for bucket_dir in bucket_dirs {
-                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
-                        continue;
-                    };
-                    let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
-                            for entry in entries {
-                                let Some(entry) = entry.as_ascii_str() else {
-                                    continue;
-                                };
-                                if let Ok(parsed) = steadq_names::parse_receipt(entry) {
-                                    if parsed.common.job_id == *job_id {
-                                        let file_fd = match fs::openat(
-                                            shard_fd.as_fd(),
-                                            entry,
-                                            verified::receipt_read_open_flags(),
-                                            0,
-                                        ) {
-                                            Ok(file_fd) => file_fd,
-                                            Err(_) => continue,
-                                        };
-                                        if verified::verify_receipt_on_fd(
-                                            file_fd.as_fd(),
-                                            verified::ReceiptContext {
-                                                queue_id: self.format.queue_id(),
-                                                shard_count: self.format.shard_count(),
-                                                terminal_bucket_width_ns: self
-                                                    .format
-                                                    .terminal_bucket_width_ns(),
-                                                max_payload_length: self
-                                                    .format
-                                                    .max_payload_length(),
-                                                bucket: bucket_dir,
-                                                shard: &shard_str,
-                                                filename: entry,
-                                            },
-                                            None,
-                                        )
-                                        .is_ok()
-                                        {
-                                            results.push(Snapshot {
-                                                job_id: *job_id,
-                                                state: "receipt".into(),
-                                                generation: parsed.common.generation,
-                                                attempt: parsed.common.attempt,
-                                                maximum_attempts: parsed.common.maximum_attempts,
-                                                shard,
-                                                relative_path: format!("{shard_path}/{entry}"),
-                                                size: 0,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        results
+            Ok(())
+        })?;
+        Ok(results)
     }
 
-    /// Export a dead job's raw bytes to an output file. Opens the job through
-    /// the root capability with O_NOFOLLOW, not via a pathname.
-    pub fn export_dead(&self, job_id: &[u8; 16], output: &std::path::Path) -> Result<u64, Error> {
-        let snapshot = self
-            .inspect(job_id)
+    fn receipt_context<'a>(
+        &'a self,
+        bucket: &'a str,
+        shard: &'a str,
+        filename: &'a str,
+    ) -> verified::ReceiptContext<'a> {
+        verified::ReceiptContext {
+            queue_id: self.format.queue_id(),
+            shard_count: self.format.shard_count(),
+            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+            max_payload_length: self.format.max_payload_length(),
+            bucket,
+            shard,
+            filename,
+        }
+    }
+
+    /// The first authenticated dead object for `job_id`, as (directory, name).
+    fn find_dead(&self, job_id: &[u8; 16]) -> Result<Option<(OwnedFd, String)>, Error> {
+        let Some(snapshot) = self
+            .inspect(job_id)?
             .into_iter()
             .find(|s| s.state == "dead")
-            .ok_or_else(|| Error::QueueCorrupt("dead job not found".into()))?;
-
+        else {
+            return Ok(None);
+        };
         let (dir_rel, name) = snapshot
             .relative_path
             .rsplit_once('/')
-            .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
-
+            .expect("inspect paths name a file inside a directory");
         let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel).map_err(Error::from)?;
-        let file_fd =
-            fs::openat(dir_fd.as_fd(), name, raw_read_open_flags(), 0).map_err(Error::from)?;
+        Ok(Some((dir_fd, name.to_string())))
+    }
 
-        copy_file_to_path(file_fd.as_fd(), output).map_err(Error::from)
+    /// Export a dead job's raw bytes to a new output file. Opens the job
+    /// through the root capability with O_NOFOLLOW, not via a pathname.
+    /// `Ok(None)` means no dead object exists for the job.
+    pub fn export_dead(
+        &self,
+        job_id: &[u8; 16],
+        output: &std::path::Path,
+    ) -> Result<Option<u64>, Error> {
+        let Some((dir_fd, name)) = self.find_dead(job_id)? else {
+            return Ok(None);
+        };
+        let file_fd = match fs::openat(dir_fd.as_fd(), &name, raw_read_open_flags(), 0) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::from(error)),
+        };
+        copy_file_to_path(file_fd.as_fd(), output)
+            .map(Some)
+            .map_err(regular_open_error)
     }
 
     /// List every dead object whose name parses and whose tag authenticates
@@ -466,21 +359,12 @@ impl Queue {
     }
 
     /// Remove a dead job through the phase-aware unlink executor.
+    /// `Ok(false)` means no dead object exists for the job.
     pub fn remove_dead(&self, job_id: &[u8; 16]) -> Result<bool, Error> {
-        let snapshot = self
-            .inspect(job_id)
-            .into_iter()
-            .find(|s| s.state == "dead")
-            .ok_or_else(|| Error::QueueCorrupt("dead job not found".into()))?;
-
-        let (dir_rel, name) = snapshot
-            .relative_path
-            .rsplit_once('/')
-            .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
-
-        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel).map_err(Error::from)?;
-
-        match engine::unlink_verified(dir_fd.as_fd(), name) {
+        let Some((dir_fd, name)) = self.find_dead(job_id)? else {
+            return Ok(false);
+        };
+        match engine::unlink_verified(dir_fd.as_fd(), &name) {
             Ok(()) => Ok(true),
             Err(engine::UnlinkFailure::SourceMissing) => Ok(false),
             Err(engine::UnlinkFailure::NotCommitted { phase, source }) => {
@@ -499,15 +383,24 @@ impl Queue {
 
     /// Duplicate acknowledgment probe: check if a receipt exists for this lease.
     /// Probes exact receipt filenames across retained terminal buckets.
-    pub fn check_duplicate_ack(&self, lease: &LeaseInfo) -> AckOutcome {
-        let wall_floor = match self.authenticated_wall_floor() {
-            Ok(wall_floor) => wall_floor,
-            Err(error) => return AckOutcome::NotCommitted(error),
-        };
-        if self.check_duplicate_ack_bounded(lease, wall_floor) {
-            AckOutcome::AlreadyAcked
-        } else {
-            AckOutcome::LeaseLost
+    #[cfg(test)]
+    pub(crate) fn check_duplicate_ack(&self, lease: &LeaseInfo) -> AckOutcome {
+        match self.authenticated_wall_floor() {
+            Ok(wall_floor) => self.duplicate_ack_outcome(lease, wall_floor),
+            Err(error) => AckOutcome::NotCommitted(error),
+        }
+    }
+
+    /// The outcome of acknowledging a lease whose source is gone.
+    pub(super) fn duplicate_ack_outcome(
+        &self,
+        lease: &LeaseInfo,
+        wall_floor: WallFloor,
+    ) -> AckOutcome {
+        match self.check_duplicate_ack_bounded(lease, wall_floor) {
+            Ok(true) => AckOutcome::AlreadyAcked,
+            Ok(false) => AckOutcome::LeaseLost,
+            Err(error) => AckOutcome::NotCommitted(error),
         }
     }
 
@@ -521,13 +414,7 @@ impl Queue {
         name: &str,
         ctx: &ActivePathContext,
     ) -> Result<FixedHeader, Error> {
-        // Stat with NOFOLLOW
-        let stat = fs::fstatat(dir_fd, name).map_err(Error::from)?;
-
-        // Regular file
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(Error::QueueCorrupt(format!("{name}: not a regular file")));
-        }
+        let (file_fd, stat) = open_regular_read(dir_fd, name).map_err(regular_open_error)?;
 
         // Link count
         if stat.st_nlink != 1 {
@@ -538,9 +425,6 @@ impl Queue {
         }
 
         // Use central verifier for header, extension, envelope, and size.
-        // stat has already been collected for mode and nlink; verify_envelope_on_fd
-        // will re-stat the fd for size, which is fine since the fd is held open.
-        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0).map_err(Error::from)?;
         let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
         let header = verified.header();
 
@@ -676,20 +560,23 @@ impl Queue {
         .is_ok()
     }
 
+    /// Bounded duplicate-ack check. Only a missing receipt directory or
+    /// receipt is absence; any other failure is an error, never a definite
+    /// "not acknowledged".
     pub(super) fn check_duplicate_ack_bounded(
         &self,
         lease: &LeaseInfo,
         wall_floor: WallFloor,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         let retention = self.options.receipt_retention_ns;
         let width = self.format.terminal_bucket_width_ns();
         let now_bucket = match steadq_math::bucket_number(wall_floor.unix_ns(), width) {
             Some(bucket) => bucket,
-            None => return false,
+            None => return Ok(false),
         };
         let retention_buckets = match steadq_math::ceiling_bucket(retention, width) {
             Some(buckets) => buckets,
-            None => return false,
+            None => return Ok(false),
         };
         let min_bucket = now_bucket.saturating_sub(retention_buckets + 2);
         let shard = compute_shard(
@@ -701,7 +588,7 @@ impl Queue {
         let Ok(receipt_common) =
             next_identity(ProtocolOperation::Acknowledge, &lease_common(lease))
         else {
-            return false;
+            return Ok(false);
         };
         let expected = verified::ExpectedReceipt {
             common: receipt_common.clone(),
@@ -709,6 +596,7 @@ impl Queue {
             envelope_digest: lease.envelope_digest,
             payload_length: lease.payload_length,
         };
+        let absent = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
         for bucket_num in min_bucket..=now_bucket {
             let bucket_str = bucket_hex(bucket_num);
             let receipt_name = steadq_names::make_receipt_name(
@@ -719,34 +607,36 @@ impl Queue {
                 &lease.token,
             );
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
-            if let Ok(dir_fd) = open_relative(self.root_fd.as_fd(), &receipt_dir) {
-                if let Ok(file_fd) = fs::openat(
-                    dir_fd.as_fd(),
-                    &receipt_name,
-                    verified::receipt_read_open_flags(),
-                    0,
-                ) {
-                    if verified::verify_receipt_on_fd(
-                        file_fd.as_fd(),
-                        verified::ReceiptContext {
-                            queue_id: self.format.queue_id(),
-                            shard_count: self.format.shard_count(),
-                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
-                            max_payload_length: self.format.max_payload_length(),
-                            bucket: &bucket_str,
-                            shard: &shard_str,
-                            filename: &receipt_name,
-                        },
-                        Some(&expected),
-                    )
-                    .is_ok()
-                    {
-                        return true;
-                    }
+            let dir_fd = match open_relative(self.root_fd.as_fd(), &receipt_dir) {
+                Ok(fd) => fd,
+                Err(error) if absent(&error) => continue,
+                Err(error) => return Err(Error::from(error)),
+            };
+            let file_fd = match fs::openat(
+                dir_fd.as_fd(),
+                &receipt_name,
+                verified::receipt_read_open_flags(),
+                0,
+            ) {
+                Ok(fd) => fd,
+                Err(error) if absent(&error) => continue,
+                Err(error) => return Err(Error::from(error)),
+            };
+            // A receipt that does not verify as strict evidence is not a
+            // duplicate; only a failed read leaves the answer unknown.
+            match verified::verify_receipt_on_fd(
+                file_fd.as_fd(),
+                self.receipt_context(&bucket_str, &shard_str, &receipt_name),
+                Some(&expected),
+            ) {
+                Ok(_) => return Ok(true),
+                Err(verified::VerificationError::Io(message)) => {
+                    return Err(Error::IoFailure(message))
                 }
+                Err(_) => {}
             }
         }
-        false
+        Ok(false)
     }
 
     /// Resolve an indeterminate operation by probing exact paths.
@@ -778,19 +668,140 @@ fn open_child_dir(parent: BorrowedFd<'_>, name: &str) -> Result<Option<OwnedFd>,
     }
 }
 
-/// Read-only open of an object by name, never through a symlink.
-pub(crate) fn raw_read_open_flags() -> i32 {
-    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+/// A shard directory found by `visit_shard_dirs`.
+struct ShardDir<'a> {
+    fd: BorrowedFd<'a>,
+    path: &'a str,
 }
 
-/// Copy the whole file behind `file_fd` to a new file at `output` and sync
-/// it. Returns the bytes written.
+impl ShardDir<'_> {
+    fn child(&self, name: &str) -> String {
+        format!("{}/{name}", self.path)
+    }
+}
+
+/// ASCII entry names of a directory; other names are not protocol names.
+fn names_in(dir: BorrowedFd<'_>) -> Result<Vec<String>, Error> {
+    Ok(fs::read_dir_entries(dir)
+        .map_err(Error::from)?
+        .iter()
+        .filter_map(|entry| entry.as_ascii_str().map(str::to_owned))
+        .collect())
+}
+
+/// Call `visit` for every `<state>/<level>.../<shard>` directory `depth`
+/// levels below `state`, with the name of the last level (the bucket).
+/// Directories that vanish or are not directories are skipped.
+fn visit_shard_dirs(
+    root: BorrowedFd<'_>,
+    state: &str,
+    depth: usize,
+    shard: &str,
+    visit: &mut dyn FnMut(ShardDir<'_>, &str) -> Result<(), Error>,
+) -> Result<(), Error> {
+    fn walk(
+        parent: BorrowedFd<'_>,
+        path: &str,
+        last: &str,
+        depth: usize,
+        shard: &str,
+        visit: &mut dyn FnMut(ShardDir<'_>, &str) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if depth == 0 {
+            if let Some(fd) = open_child_dir(parent, shard)? {
+                let path = format!("{path}/{shard}");
+                visit(
+                    ShardDir {
+                        fd: fd.as_fd(),
+                        path: &path,
+                    },
+                    last,
+                )?;
+            }
+            return Ok(());
+        }
+        for name in names_in(parent)? {
+            if let Some(child) = open_child_dir(parent, &name)? {
+                walk(
+                    child.as_fd(),
+                    &format!("{path}/{name}"),
+                    &name,
+                    depth - 1,
+                    shard,
+                    visit,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    match open_child_dir(root, state)? {
+        Some(fd) => walk(fd.as_fd(), state, state, depth, shard, visit),
+        None => Ok(()),
+    }
+}
+
+/// Read-only open of an object by name: never through a symlink, never
+/// blocking on a FIFO, never inherited by a child process.
+pub(crate) fn raw_read_open_flags() -> i32 {
+    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+}
+
+/// Open `name` under `dir_fd` for reading and require a regular file. A
+/// symlink or any other file type is `InvalidData`; see `regular_open_error`.
+pub(crate) fn open_regular_read(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+) -> std::io::Result<(OwnedFd, libc::stat)> {
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{name}: not a regular file"),
+        )
+    };
+    let fd = fs::openat(dir_fd, name, raw_read_open_flags(), 0).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            not_regular()
+        } else {
+            error
+        }
+    })?;
+    let stat = fs::fstat(fd.as_fd())?;
+    if !is_regular(&stat) {
+        return Err(not_regular());
+    }
+    Ok((fd, stat))
+}
+
+/// A file that is not regular is corruption; anything else is I/O.
+pub(crate) fn regular_open_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        Error::QueueCorrupt(error.to_string())
+    } else {
+        Error::from(error)
+    }
+}
+
+fn is_regular(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+/// Copy the regular file behind `file_fd` to `output`, which must not
+/// exist yet, not even as a symlink, and sync it. Returns the bytes written.
 pub(crate) fn copy_file_to_path(
     file_fd: BorrowedFd<'_>,
     output: &std::path::Path,
 ) -> std::io::Result<u64> {
+    if !is_regular(&fs::fstat(file_fd)?) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "export source is not a regular file",
+        ));
+    }
     let mut source = std::fs::File::from(file_fd.try_clone_to_owned()?);
-    let mut out = std::fs::File::create(output)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
     let written = std::io::copy(&mut source, &mut out)?;
     out.sync_all()?;
     Ok(written)
