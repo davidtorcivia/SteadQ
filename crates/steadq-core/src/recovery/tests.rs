@@ -5234,7 +5234,7 @@ fn colocated_reap_does_not_quarantine_on_validation_io_failure() {
     };
     let mut stats = RecoveryStats::default();
     fs::fault::reset();
-    fs::fault::inject_errno("fstatat", 1, libc::EIO);
+    fs::fault::inject_errno("fstat", 1, libc::EIO);
     queue.reap_expired_leases(
         u64::MAX,
         Some(wall_floor),

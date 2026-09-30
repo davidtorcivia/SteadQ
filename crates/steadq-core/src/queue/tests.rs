@@ -8405,6 +8405,7 @@ fn lease_quarantines_hard_linked_and_fifo_ready_objects_by_cause() {
     let reasons = |queue: &Queue| {
         queue
             .list_quarantine()
+            .unwrap()
             .into_iter()
             .map(|entry| entry.reason)
             .collect::<Vec<_>>()
