@@ -7,11 +7,8 @@ exclude_re = [
     "receipt_is_authentic",
     "fsck_verify_name_tag",
     "verify_shard_placement",
-    "delete_expired_receipts",
     "reap_expired_leases",
     "promote_delayed",
-    "cleanup_temp_files",
-    "compact_receipts",
     # Optimization guards backed by decode validation: behavioral outcome
     # is identical whether the guard uses == or !=, && or ||.
     "fsck_file",
