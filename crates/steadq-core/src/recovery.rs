@@ -1409,6 +1409,7 @@ impl Queue {
 }
 
 mod phases;
+mod walk;
 
 #[cfg(test)]
 mod tests;

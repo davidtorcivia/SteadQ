@@ -59,37 +59,25 @@ impl Queue {
 
         for bucket_entry in &bucket_dirs {
             // Skip buckets already processed in a prior pass.
-            if let Some(cursor) = &self.recovery_cursor.promote_delayed {
-                if bucket_entry.as_bytes() < cursor.first.as_slice() {
-                    continue;
-                }
+            if directory_before_cursor(
+                self.recovery_cursor
+                    .promote_delayed
+                    .as_ref()
+                    .map(ThreeLevelCursor::directories),
+                &[],
+                bucket_entry.as_bytes(),
+            ) {
+                continue;
             }
 
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
-                Self::record_error(
-                    stats,
-                    "promote_bucket_name",
-                    &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not ASCII",
-                );
+            let Some((bucket_name, bucket_num)) =
+                bucket_directory_name(stats, "promote_bucket_name", bucket_entry)
+            else {
                 continue;
-            };
-
-            let bucket_num = match steadq_names::bucket_from_hex(bucket_name) {
-                Some(bucket) => bucket,
-                None => {
-                    Self::record_error(
-                        stats,
-                        "promote_bucket_name",
-                        bucket_name,
-                        "bucket directory name is not canonical",
-                    );
-                    continue;
-                }
             };
 
             // Only promote buckets at or below the current wall bucket
@@ -97,59 +85,26 @@ impl Queue {
                 continue;
             }
 
-            let bucket_fd = match fs::open_directory(delayed_fd.as_fd(), bucket_name) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(
-                        stats,
-                        "promote_bucket_open",
-                        &format!("delayed/{bucket_name}"),
-                        &error.to_string(),
-                    );
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::PromoteDelayed,
-                        RecoveryHierarchyRetryKind::Open,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("delayed/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_fd(),
+            let bucket_path = format!("delayed/{bucket_name}");
+            let (bucket_fd, shard_dirs) = match self.descend_level(
+                delayed_fd.as_fd(),
+                &Level {
+                    phase: RecoveryPhase::PromoteDelayed,
+                    name: bucket_name,
+                    components: &[bucket_entry.as_bytes()],
+                    open_operation: "promote_bucket_open",
+                    read_operation: "promote_shard_read",
+                    path: &bucket_path,
+                    open_error_path: &bucket_path,
+                },
+                scan,
+                stats,
                 deadline_mono,
-                scan.budget,
-                scan.stats,
             ) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    if Self::record_directory_error(
-                        stats,
-                        "promote_shard_read",
-                        &format!("delayed/{bucket_name}"),
-                        &error,
-                    ) {
-                        return;
-                    }
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::PromoteDelayed,
-                        RecoveryHierarchyRetryKind::Enumerate,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("delayed/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
+                Descend::Entries(fd, entries) => (fd, entries),
+                Descend::Skip => continue,
+                Descend::Stop => return,
             };
-            shard_dirs.sort();
             // A producer only targets a bucket ending after its own wall
             // floor, so a bucket whose end has passed by a full width is
             // drained for good and its directories can be removed.
@@ -158,93 +113,44 @@ impl Queue {
 
             for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some(cursor) = &self.recovery_cursor.promote_delayed {
-                    if bucket_entry.as_bytes() == cursor.first
-                        && shard_entry.as_bytes() < cursor.second.as_slice()
-                    {
-                        continue;
-                    }
-                }
-                let Some(shard_name) = shard_entry.as_ascii_str() else {
-                    Self::record_error(
-                        stats,
-                        "promote_shard_name",
-                        &raw_name_for_error(shard_entry),
-                        "shard directory name is not ASCII",
-                    );
-                    continue;
-                };
-                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
-                    Self::record_error(
-                        stats,
-                        "promote_shard_name",
-                        shard_name,
-                        "shard directory name is not canonical",
-                    );
-                    continue;
-                };
-                if shard >= self.format.shard_count() {
-                    Self::record_error(
-                        stats,
-                        "promote_shard_name",
-                        shard_name,
-                        "shard directory is outside the queue shard range",
-                    );
-                    continue;
-                }
-                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "promote_shard_open",
-                            &format!("{bucket_name}/{shard_name}"),
-                            &error.to_string(),
-                        );
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::PromoteDelayed,
-                            RecoveryHierarchyRetryKind::Open,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("delayed/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let mut entries = match read_recovery_directory(
-                    shard_fd.as_fd(),
-                    deadline_mono,
-                    scan.budget,
-                    scan.stats,
+                if directory_before_cursor(
+                    self.recovery_cursor
+                        .promote_delayed
+                        .as_ref()
+                        .map(ThreeLevelCursor::directories),
+                    &[bucket_entry.as_bytes()],
+                    shard_entry.as_bytes(),
                 ) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        if Self::record_directory_error(
-                            stats,
-                            "promote_entry_read",
-                            &format!("delayed/{bucket_name}/{shard_name}"),
-                            &error,
-                        ) {
-                            return;
-                        }
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::PromoteDelayed,
-                            RecoveryHierarchyRetryKind::Enumerate,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("delayed/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                let Some((shard_name, _)) = shard_directory_name(
+                    stats,
+                    "promote_shard_name",
+                    shard_entry,
+                    self.format.shard_count(),
+                ) else {
+                    continue;
                 };
-                entries.sort();
+                let shard_path = format!("delayed/{bucket_name}/{shard_name}");
+                let (shard_fd, entries) = match self.descend_level(
+                    bucket_fd.as_fd(),
+                    &Level {
+                        phase: RecoveryPhase::PromoteDelayed,
+                        name: shard_name,
+                        components: &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                        open_operation: "promote_shard_open",
+                        read_operation: "promote_entry_read",
+                        path: &shard_path,
+                        open_error_path: &format!("{bucket_name}/{shard_name}"),
+                    },
+                    scan,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Descend::Entries(fd, entries) => (fd, entries),
+                    Descend::Skip => continue,
+                    Descend::Stop => return,
+                };
                 let mut absent_entries = 0usize;
 
                 for raw_entry in &entries {
@@ -373,24 +279,22 @@ impl Queue {
                 {
                     continue;
                 }
-                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
-                    stats.budget_exhausted = true;
-                    return;
-                }
-                stats.operations_attempted += 1;
-                match remove_empty_directory_verified(bucket_fd.as_fd(), shard_name) {
-                    Ok(()) => {
+                match Self::prune_empty_directory(
+                    bucket_fd.as_fd(),
+                    shard_name,
+                    "promote_shard_remove",
+                    &shard_path,
+                    budget,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Prune::Removed => {
                         stats.shards_removed += 1;
                         absent_shards += 1;
                     }
-                    Err(RemoveDirectoryFailure::SourceMissing) => absent_shards += 1,
-                    Err(RemoveDirectoryFailure::NotEmpty) => {}
-                    Err(failure) => Self::record_remove_directory_failure(
-                        stats,
-                        "promote_shard_remove",
-                        &format!("delayed/{bucket_name}/{shard_name}"),
-                        failure,
-                    ),
+                    Prune::Missing => absent_shards += 1,
+                    Prune::Kept => {}
+                    Prune::Stop => return,
                 }
             }
 
@@ -398,20 +302,18 @@ impl Queue {
             {
                 continue;
             }
-            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
-                stats.budget_exhausted = true;
-                return;
-            }
-            stats.operations_attempted += 1;
-            match remove_empty_directory_verified(delayed_fd.as_fd(), bucket_name) {
-                Ok(()) => stats.buckets_removed += 1,
-                Err(RemoveDirectoryFailure::SourceMissing | RemoveDirectoryFailure::NotEmpty) => {}
-                Err(failure) => Self::record_remove_directory_failure(
-                    stats,
-                    "promote_bucket_remove",
-                    &format!("delayed/{bucket_name}"),
-                    failure,
-                ),
+            match Self::prune_empty_directory(
+                delayed_fd.as_fd(),
+                bucket_name,
+                "promote_bucket_remove",
+                &bucket_path,
+                budget,
+                stats,
+                deadline_mono,
+            ) {
+                Prune::Removed => stats.buckets_removed += 1,
+                Prune::Missing | Prune::Kept => {}
+                Prune::Stop => return,
             }
         }
 

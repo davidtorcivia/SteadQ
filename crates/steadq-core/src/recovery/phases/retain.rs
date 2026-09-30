@@ -41,169 +41,86 @@ impl Queue {
         boot_dirs.sort();
 
         for boot_entry in &boot_dirs {
-            if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
-                if boot_entry.as_bytes() < cursor.first.as_slice() {
-                    continue;
-                }
+            if directory_before_cursor(
+                self.recovery_cursor
+                    .cleanup_temp
+                    .as_ref()
+                    .map(ThreeLevelCursor::directories),
+                &[],
+                boot_entry.as_bytes(),
+            ) {
+                continue;
             }
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(boot_dir_name) = boot_entry.as_ascii_str() else {
-                Self::record_error(
-                    stats,
-                    "temp_boot_name",
-                    &raw_name_for_error(boot_entry),
-                    "boot directory name is not ASCII",
-                );
+            let Some(boot_dir_name) = boot_directory_name(stats, "temp_boot_name", boot_entry)
+            else {
                 continue;
             };
-            if steadq_names::boot_id_bytes(boot_dir_name).is_none() {
-                Self::record_error(
-                    stats,
-                    "temp_boot_name",
-                    boot_dir_name,
-                    "boot directory name is not canonical",
-                );
-                continue;
-            }
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
-            let boot_dir_fd = match fs::open_directory(tmp_fd.as_fd(), boot_dir_name) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::CleanupTemp,
-                        RecoveryHierarchyRetryKind::Open,
-                        &[boot_entry.as_bytes()],
-                        stats,
-                        boot_dir_name,
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let mut shard_dirs = match read_recovery_directory(
-                boot_dir_fd.as_fd(),
+            let (boot_dir_fd, shard_dirs) = match self.descend_level(
+                tmp_fd.as_fd(),
+                &Level {
+                    phase: RecoveryPhase::CleanupTemp,
+                    name: boot_dir_name,
+                    components: &[boot_entry.as_bytes()],
+                    open_operation: "temp_boot_open",
+                    read_operation: "temp_shard_read",
+                    path: boot_dir_name,
+                    open_error_path: boot_dir_name,
+                },
+                scan,
+                stats,
                 deadline_mono,
-                scan.budget,
-                scan.stats,
             ) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    if Self::record_directory_error(stats, "temp_shard_read", boot_dir_name, &error)
-                    {
-                        return;
-                    }
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::CleanupTemp,
-                        RecoveryHierarchyRetryKind::Enumerate,
-                        &[boot_entry.as_bytes()],
-                        stats,
-                        boot_dir_name,
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
+                Descend::Entries(fd, entries) => (fd, entries),
+                Descend::Skip => continue,
+                Descend::Stop => return,
             };
-            shard_dirs.sort();
 
             for shard_entry in &shard_dirs {
-                if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
-                    if boot_entry.as_bytes() == cursor.first
-                        && shard_entry.as_bytes() < cursor.second.as_slice()
-                    {
-                        continue;
-                    }
-                }
-                let Some(shard_name) = shard_entry.as_ascii_str() else {
-                    Self::record_error(
-                        stats,
-                        "temp_shard_name",
-                        &raw_name_for_error(shard_entry),
-                        "shard directory name is not ASCII",
-                    );
-                    continue;
-                };
-                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
-                    Self::record_error(
-                        stats,
-                        "temp_shard_name",
-                        shard_name,
-                        "shard directory name is not canonical",
-                    );
-                    continue;
-                };
-                if shard >= self.format.shard_count() {
-                    Self::record_error(
-                        stats,
-                        "temp_shard_name",
-                        shard_name,
-                        "shard directory is outside the queue shard range",
-                    );
-                    continue;
-                }
-                let shard_fd = match fs::open_directory(boot_dir_fd.as_fd(), shard_name) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "temp_shard_open",
-                            &format!("tmp/{boot_dir_name}/{shard_name}"),
-                            &error.to_string(),
-                        );
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::CleanupTemp,
-                            RecoveryHierarchyRetryKind::Open,
-                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("tmp/{boot_dir_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let mut entries = match read_recovery_directory(
-                    shard_fd.as_fd(),
-                    deadline_mono,
-                    scan.budget,
-                    scan.stats,
+                if directory_before_cursor(
+                    self.recovery_cursor
+                        .cleanup_temp
+                        .as_ref()
+                        .map(ThreeLevelCursor::directories),
+                    &[boot_entry.as_bytes()],
+                    shard_entry.as_bytes(),
                 ) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        if Self::record_directory_error(
-                            stats,
-                            "temp_entry_read",
-                            &format!("tmp/{boot_dir_name}/{shard_name}"),
-                            &error,
-                        ) {
-                            return;
-                        }
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::CleanupTemp,
-                            RecoveryHierarchyRetryKind::Enumerate,
-                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("tmp/{boot_dir_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                let Some((shard_name, _)) = shard_directory_name(
+                    stats,
+                    "temp_shard_name",
+                    shard_entry,
+                    self.format.shard_count(),
+                ) else {
+                    continue;
                 };
-                entries.sort();
+                let shard_path = format!("tmp/{boot_dir_name}/{shard_name}");
+                let (shard_fd, entries) = match self.descend_level(
+                    boot_dir_fd.as_fd(),
+                    &Level {
+                        phase: RecoveryPhase::CleanupTemp,
+                        name: shard_name,
+                        components: &[boot_entry.as_bytes(), shard_entry.as_bytes()],
+                        open_operation: "temp_shard_open",
+                        read_operation: "temp_entry_read",
+                        path: &shard_path,
+                        open_error_path: &shard_path,
+                    },
+                    scan,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Descend::Entries(fd, entries) => (fd, entries),
+                    Descend::Skip => continue,
+                    Descend::Stop => return,
+                };
 
                 for raw_entry in &entries {
                     if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -309,178 +226,88 @@ impl Queue {
 
         for bucket_entry in &bucket_dirs {
             // Skip buckets already processed in a prior pass.
-            if let Some(cursor) = &self.recovery_cursor.compact_receipts {
-                if bucket_entry.as_bytes() < cursor.first.as_slice() {
-                    continue;
-                }
+            if directory_before_cursor(
+                self.recovery_cursor
+                    .compact_receipts
+                    .as_ref()
+                    .map(ThreeLevelCursor::directories),
+                &[],
+                bucket_entry.as_bytes(),
+            ) {
+                continue;
             }
 
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
-                Self::record_error(
-                    stats,
-                    "compact_bucket_name",
-                    &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not ASCII",
-                );
+            let Some((bucket_name, _)) =
+                bucket_directory_name(stats, "compact_bucket_name", bucket_entry)
+            else {
                 continue;
             };
-            if steadq_names::bucket_from_hex(bucket_name).is_none() {
-                Self::record_error(
-                    stats,
-                    "compact_bucket_name",
-                    bucket_name,
-                    "bucket directory name is not canonical",
-                );
-                continue;
-            }
 
-            let bucket_fd = match fs::open_directory(receipts_fd.as_fd(), bucket_name) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(
-                        stats,
-                        "compact_bucket_open",
-                        &format!("receipts/{bucket_name}"),
-                        &error.to_string(),
-                    );
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::CompactReceipts,
-                        RecoveryHierarchyRetryKind::Open,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("receipts/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_fd(),
+            let bucket_path = format!("receipts/{bucket_name}");
+            let (bucket_fd, shard_dirs) = match self.descend_level(
+                receipts_fd.as_fd(),
+                &Level {
+                    phase: RecoveryPhase::CompactReceipts,
+                    name: bucket_name,
+                    components: &[bucket_entry.as_bytes()],
+                    open_operation: "compact_bucket_open",
+                    read_operation: "compact_shard_read",
+                    path: &bucket_path,
+                    open_error_path: &bucket_path,
+                },
+                scan,
+                stats,
                 deadline_mono,
-                scan.budget,
-                scan.stats,
             ) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    if Self::record_directory_error(
-                        stats,
-                        "compact_shard_read",
-                        &format!("receipts/{bucket_name}"),
-                        &error,
-                    ) {
-                        return;
-                    }
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::CompactReceipts,
-                        RecoveryHierarchyRetryKind::Enumerate,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("receipts/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
+                Descend::Entries(fd, entries) => (fd, entries),
+                Descend::Skip => continue,
+                Descend::Stop => return,
             };
-            shard_dirs.sort();
 
             for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some(cursor) = &self.recovery_cursor.compact_receipts {
-                    if bucket_entry.as_bytes() == cursor.first
-                        && shard_entry.as_bytes() < cursor.second.as_slice()
-                    {
-                        continue;
-                    }
-                }
-                let Some(shard_name) = shard_entry.as_ascii_str() else {
-                    Self::record_error(
-                        stats,
-                        "compact_shard_name",
-                        &raw_name_for_error(shard_entry),
-                        "shard directory name is not ASCII",
-                    );
-                    continue;
-                };
-                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
-                    Self::record_error(
-                        stats,
-                        "compact_shard_name",
-                        shard_name,
-                        "shard directory name is not canonical",
-                    );
-                    continue;
-                };
-                if shard >= self.format.shard_count() {
-                    Self::record_error(
-                        stats,
-                        "compact_shard_name",
-                        shard_name,
-                        "shard directory is outside the queue shard range",
-                    );
-                    continue;
-                }
-                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "compact_shard_open",
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error.to_string(),
-                        );
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::CompactReceipts,
-                            RecoveryHierarchyRetryKind::Open,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let mut entries = match read_recovery_directory(
-                    shard_fd.as_fd(),
-                    deadline_mono,
-                    scan.budget,
-                    scan.stats,
+                if directory_before_cursor(
+                    self.recovery_cursor
+                        .compact_receipts
+                        .as_ref()
+                        .map(ThreeLevelCursor::directories),
+                    &[bucket_entry.as_bytes()],
+                    shard_entry.as_bytes(),
                 ) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        if Self::record_directory_error(
-                            stats,
-                            "compact_entry_read",
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error,
-                        ) {
-                            return;
-                        }
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::CompactReceipts,
-                            RecoveryHierarchyRetryKind::Enumerate,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                let Some((shard_name, _)) = shard_directory_name(
+                    stats,
+                    "compact_shard_name",
+                    shard_entry,
+                    self.format.shard_count(),
+                ) else {
+                    continue;
                 };
-                entries.sort();
+                let shard_path = format!("receipts/{bucket_name}/{shard_name}");
+                let (shard_fd, entries) = match self.descend_level(
+                    bucket_fd.as_fd(),
+                    &Level {
+                        phase: RecoveryPhase::CompactReceipts,
+                        name: shard_name,
+                        components: &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                        open_operation: "compact_shard_open",
+                        read_operation: "compact_entry_read",
+                        path: &shard_path,
+                        open_error_path: &shard_path,
+                    },
+                    scan,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Descend::Entries(fd, entries) => (fd, entries),
+                    Descend::Skip => continue,
+                    Descend::Stop => return,
+                };
 
                 for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
@@ -773,37 +600,25 @@ impl Queue {
 
         for bucket_entry in &bucket_dirs {
             // Skip buckets already processed in a prior pass.
-            if let Some(cursor) = &self.recovery_cursor.delete_receipts {
-                if bucket_entry.as_bytes() < cursor.first.as_slice() {
-                    continue;
-                }
+            if directory_before_cursor(
+                self.recovery_cursor
+                    .delete_receipts
+                    .as_ref()
+                    .map(ThreeLevelCursor::directories),
+                &[],
+                bucket_entry.as_bytes(),
+            ) {
+                continue;
             }
 
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
-                Self::record_error(
-                    stats,
-                    "delete_bucket_name",
-                    &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not ASCII",
-                );
+            let Some((bucket_name, bucket_num)) =
+                bucket_directory_name(stats, "delete_bucket_name", bucket_entry)
+            else {
                 continue;
-            };
-
-            let bucket_num = match steadq_names::bucket_from_hex(bucket_name) {
-                Some(bucket) => bucket,
-                None => {
-                    Self::record_error(
-                        stats,
-                        "delete_bucket_name",
-                        bucket_name,
-                        "bucket directory name is not canonical",
-                    );
-                    continue;
-                }
             };
 
             let bucket_start = match bucket_num.checked_mul(self.format.terminal_bucket_width_ns())
@@ -827,150 +642,68 @@ impl Queue {
                 continue;
             }
 
-            let bucket_fd = match fs::open_directory(receipts_fd.as_fd(), bucket_name) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(
-                        stats,
-                        "delete_bucket_open",
-                        &format!("receipts/{bucket_name}"),
-                        &error.to_string(),
-                    );
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::DeleteReceipts,
-                        RecoveryHierarchyRetryKind::Open,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("receipts/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_fd(),
+            let bucket_path = format!("receipts/{bucket_name}");
+            let (bucket_fd, shard_dirs) = match self.descend_level(
+                receipts_fd.as_fd(),
+                &Level {
+                    phase: RecoveryPhase::DeleteReceipts,
+                    name: bucket_name,
+                    components: &[bucket_entry.as_bytes()],
+                    open_operation: "delete_bucket_open",
+                    read_operation: "delete_shard_read",
+                    path: &bucket_path,
+                    open_error_path: &bucket_path,
+                },
+                scan,
+                stats,
                 deadline_mono,
-                scan.budget,
-                scan.stats,
             ) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    if Self::record_directory_error(
-                        stats,
-                        "delete_shard_read",
-                        &format!("receipts/{bucket_name}"),
-                        &error,
-                    ) {
-                        return;
-                    }
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::DeleteReceipts,
-                        RecoveryHierarchyRetryKind::Enumerate,
-                        &[bucket_entry.as_bytes()],
-                        stats,
-                        &format!("receipts/{bucket_name}"),
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
+                Descend::Entries(fd, entries) => (fd, entries),
+                Descend::Skip => continue,
+                Descend::Stop => return,
             };
-            shard_dirs.sort();
             let mut absent_shards = 0usize;
 
             for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some(cursor) = &self.recovery_cursor.delete_receipts {
-                    if bucket_entry.as_bytes() == cursor.first
-                        && shard_entry.as_bytes() < cursor.second.as_slice()
-                    {
-                        continue;
-                    }
-                }
-                let Some(shard_name) = shard_entry.as_ascii_str() else {
-                    Self::record_error(
-                        stats,
-                        "delete_shard_name",
-                        &raw_name_for_error(shard_entry),
-                        "shard directory name is not ASCII",
-                    );
-                    continue;
-                };
-                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
-                    Self::record_error(
-                        stats,
-                        "delete_shard_name",
-                        shard_name,
-                        "shard directory name is not canonical",
-                    );
-                    continue;
-                };
-                if shard >= self.format.shard_count() {
-                    Self::record_error(
-                        stats,
-                        "delete_shard_name",
-                        shard_name,
-                        "shard directory is outside the queue shard range",
-                    );
-                    continue;
-                }
-                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "delete_shard_open",
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error.to_string(),
-                        );
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::DeleteReceipts,
-                            RecoveryHierarchyRetryKind::Open,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let mut entries = match read_recovery_directory(
-                    shard_fd.as_fd(),
-                    deadline_mono,
-                    scan.budget,
-                    scan.stats,
+                if directory_before_cursor(
+                    self.recovery_cursor
+                        .delete_receipts
+                        .as_ref()
+                        .map(ThreeLevelCursor::directories),
+                    &[bucket_entry.as_bytes()],
+                    shard_entry.as_bytes(),
                 ) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        if Self::record_directory_error(
-                            stats,
-                            "delete_entry_read",
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error,
-                        ) {
-                            return;
-                        }
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::DeleteReceipts,
-                            RecoveryHierarchyRetryKind::Enumerate,
-                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
-                            stats,
-                            &format!("receipts/{bucket_name}/{shard_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                let Some((shard_name, _)) = shard_directory_name(
+                    stats,
+                    "delete_shard_name",
+                    shard_entry,
+                    self.format.shard_count(),
+                ) else {
+                    continue;
                 };
-                entries.sort();
+                let shard_path = format!("receipts/{bucket_name}/{shard_name}");
+                let (shard_fd, entries) = match self.descend_level(
+                    bucket_fd.as_fd(),
+                    &Level {
+                        phase: RecoveryPhase::DeleteReceipts,
+                        name: shard_name,
+                        components: &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                        open_operation: "delete_shard_open",
+                        read_operation: "delete_entry_read",
+                        path: &shard_path,
+                        open_error_path: &shard_path,
+                    },
+                    scan,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Descend::Entries(fd, entries) => (fd, entries),
+                    Descend::Skip => continue,
+                    Descend::Stop => return,
+                };
                 let mut absent_entries = 0usize;
 
                 for raw_entry in &entries {
@@ -1136,46 +869,40 @@ impl Queue {
                 if !all_observed_children_absent(absent_entries, entries.len()) {
                     continue;
                 }
-                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
-                    stats.budget_exhausted = true;
-                    return;
-                }
-                stats.operations_attempted += 1;
-                let shard_path = format!("receipts/{bucket_name}/{shard_name}");
-                match remove_empty_directory_verified(bucket_fd.as_fd(), shard_name) {
-                    Ok(()) => {
+                match Self::prune_empty_directory(
+                    bucket_fd.as_fd(),
+                    shard_name,
+                    "receipt_shard_remove",
+                    &shard_path,
+                    budget,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Prune::Removed => {
                         stats.shards_removed += 1;
                         absent_shards += 1;
                     }
-                    Err(RemoveDirectoryFailure::SourceMissing) => absent_shards += 1,
-                    Err(RemoveDirectoryFailure::NotEmpty) => {}
-                    Err(failure) => Self::record_remove_directory_failure(
-                        stats,
-                        "receipt_shard_remove",
-                        &shard_path,
-                        failure,
-                    ),
+                    Prune::Missing => absent_shards += 1,
+                    Prune::Kept => {}
+                    Prune::Stop => return,
                 }
             }
 
             if !all_observed_children_absent(absent_shards, shard_dirs.len()) {
                 continue;
             }
-            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
-                stats.budget_exhausted = true;
-                return;
-            }
-            stats.operations_attempted += 1;
-            let bucket_path = format!("receipts/{bucket_name}");
-            match remove_empty_directory_verified(receipts_fd.as_fd(), bucket_name) {
-                Ok(()) => stats.buckets_removed += 1,
-                Err(RemoveDirectoryFailure::SourceMissing | RemoveDirectoryFailure::NotEmpty) => {}
-                Err(failure) => Self::record_remove_directory_failure(
-                    stats,
-                    "receipt_bucket_remove",
-                    &bucket_path,
-                    failure,
-                ),
+            match Self::prune_empty_directory(
+                receipts_fd.as_fd(),
+                bucket_name,
+                "receipt_bucket_remove",
+                &bucket_path,
+                budget,
+                stats,
+                deadline_mono,
+            ) {
+                Prune::Removed => stats.buckets_removed += 1,
+                Prune::Missing | Prune::Kept => {}
+                Prune::Stop => return,
             }
         }
 
