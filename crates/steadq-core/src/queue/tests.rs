@@ -8451,3 +8451,105 @@ fn receipt_reads_do_not_block_on_a_fifo() {
     let probe = without_blocking_on_fifo(&receipt, || queue.check_duplicate_ack(&lease));
     assert_eq!(probe, AckOutcome::LeaseLost);
 }
+
+// ===== Claim-verified payload reader =====
+fn claim_reader_payload() -> Vec<u8> {
+    (0..10_000u32).map(|i| (i % 251) as u8).collect()
+}
+
+fn lease_claim_reader(queue: &mut Queue) -> (LeaseInfo, VerifiedPayloadReader) {
+    queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: claim_reader_payload(),
+        ..Default::default()
+    });
+    match queue.lease_with_payload(0, 30_000_000_000) {
+        (LeaseOutcome::Leased(lease), Some(reader)) => (lease, reader),
+        (outcome, reader) => panic!("lease failed: {outcome:?}, reader {}", reader.is_some()),
+    }
+}
+
+fn read_all(reader: &VerifiedPayloadReader) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = reader.read_at(&mut buf, data.len() as u64).unwrap();
+        if n == 0 {
+            return data;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+}
+
+#[test]
+fn claim_reader_returns_exactly_the_payload_and_is_absent_when_empty() {
+    let (_tmp, mut queue) = create_test_queue();
+    let (lease, reader) = lease_claim_reader(&mut queue);
+    assert_eq!(lease.content_type, "text/plain");
+    assert_eq!(reader.payload_len(), 10_000);
+    assert_eq!(read_all(&reader), claim_reader_payload());
+    let (outcome, reader) = queue.lease_with_payload(0, 30_000_000_000);
+    assert!(matches!(outcome, LeaseOutcome::Empty));
+    assert!(reader.is_none());
+}
+
+#[test]
+fn claim_reader_survives_renew_rename() {
+    let (_tmp, mut queue) = create_test_queue();
+    let (lease, reader) = lease_claim_reader(&mut queue);
+    let renewed = match queue.renew(&lease, 60_000_000_000) {
+        RenewOutcome::Renewed(renewed) => renewed,
+        other => panic!("renew failed: {other:?}"),
+    };
+    assert_ne!(renewed.exact_source_path, lease.exact_source_path);
+    assert_eq!(read_all(&reader), claim_reader_payload());
+    assert!(matches!(queue.ack(&renewed), AckOutcome::Acked));
+}
+
+#[test]
+fn corruption_after_claim_is_caught_at_ack() {
+    let (tmp, mut queue) = create_test_queue();
+    let (lease, _reader) = lease_claim_reader(&mut queue);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp.path().join(&lease.exact_source_path))
+        .unwrap();
+    let last = file.metadata().unwrap().len() - 1;
+    file.write_all_at(&[0xFF], last).unwrap();
+    assert!(matches!(
+        queue.ack(&lease),
+        AckOutcome::NotCommitted(Error::PayloadCorrupt)
+    ));
+}
+
+#[test]
+fn claim_reader_fd_closes_with_the_job() {
+    let (tmp, mut queue) = create_test_queue();
+    let root = tmp.path().to_path_buf();
+    // Descriptors on queue objects, not on the queue's own directories.
+    let open_objects = || {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(&root) && target.is_file())
+            .count()
+    };
+    queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".into(),
+        payload: b"fd".to_vec(),
+        ..Default::default()
+    });
+    let baseline = open_objects();
+    let (outcome, reader) = queue.lease_with_payload(0, 30_000_000_000);
+    let LeaseOutcome::Leased(lease) = outcome else {
+        panic!("lease failed: {outcome:?}");
+    };
+    assert_eq!(open_objects(), baseline + 1);
+    drop(reader);
+    assert_eq!(open_objects(), baseline);
+    assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+    assert_eq!(open_objects(), baseline);
+}
