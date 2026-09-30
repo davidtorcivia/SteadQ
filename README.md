@@ -150,7 +150,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 811 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 838 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
