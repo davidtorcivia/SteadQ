@@ -1828,6 +1828,7 @@ fn recovery_cursor_validation_checks_every_component() {
         phase: RecoveryPhase::CompactReceipts,
         reap_leases: Some(valid_four),
         reap_colocated_shard: None,
+        reap_colocated_position: None,
         promote_delayed: Some(valid_three.clone()),
         cleanup_temp: Some(valid_three.clone()),
         compact_receipts: Some(valid_three.clone()),
@@ -5006,6 +5007,7 @@ fn colocated_reap_persists_the_shard_when_the_scan_budget_runs_out() {
     assert_eq!(first.leases_reaped, 0, "errors: {:?}", first.errors);
     assert!(first.budget_exhausted);
     assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+    assert_eq!(queue.recovery_cursor.reap_colocated_position, None);
 
     // Resuming at a saved shard skips leased/, so the one read reaches it.
     let second = reap_expired_with_scan_budget(&mut queue, &one_read);
@@ -5036,11 +5038,21 @@ fn stream_with(
     RecoveryScanStats,
 ) {
     let mut stats = RecoveryScanStats::default();
-    let result =
-        stream_recovery_directory(dir.as_fd(), deadline_mono, budget, &mut stats, |name| {
-            name.as_bytes().len() == 2
-        });
-    (result, stats)
+    let mut kept = Vec::new();
+    let result = stream_recovery_directory(
+        dir.as_fd(),
+        &mut 0,
+        deadline_mono,
+        budget,
+        &mut stats,
+        |name| {
+            if name.as_bytes().len() == 2 {
+                kept.push(name.clone());
+            }
+            ControlFlow::Continue(())
+        },
+    );
+    (result.map(|_| kept), stats)
 }
 
 #[test]
@@ -5130,17 +5142,81 @@ fn streamed_directory_classifies_clock_and_read_failures() {
     ));
 }
 
+/// Names streamed from `position`, stopping at `stop` or after `entries`.
+fn stream_names_from(
+    dir: &std::fs::File,
+    position: &mut i64,
+    entries: u64,
+    stop: &[u8],
+) -> (
+    Vec<Vec<u8>>,
+    Result<ControlFlow<()>, RecoveryDirectoryError>,
+) {
+    let budget = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: entries,
+        max_name_bytes_read: u64::MAX,
+    };
+    let mut names = Vec::new();
+    let result = stream_recovery_directory(
+        dir.as_fd(),
+        position,
+        u64::MAX,
+        &budget,
+        &mut RecoveryScanStats::default(),
+        |name| {
+            names.push(name.as_bytes().to_vec());
+            if name.as_bytes() == stop {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
+    (names, result)
+}
+
+#[test]
+fn streamed_directory_resumes_before_a_break_and_after_the_last_read() {
+    let (_tmp, dir) = stream_fixture();
+    let (all, _) = stream_names_from(&dir, &mut 0, u64::MAX, b"");
+    assert_eq!(all.len(), 3);
+
+    // A break leaves the position before the entry it broke at.
+    let mut position = 0;
+    let (first, result) = stream_names_from(&dir, &mut position, u64::MAX, &all[1]);
+    assert!(matches!(result, Ok(ControlFlow::Break(()))));
+    assert_eq!(first, all[..2]);
+    let (rest, result) = stream_names_from(&dir, &mut position, u64::MAX, b"");
+    assert!(matches!(result, Ok(ControlFlow::Continue(()))));
+    assert_eq!(rest, all[1..]);
+
+    // Running out of budget leaves it after the last entry read.
+    let mut position = 0;
+    let (first, result) = stream_names_from(&dir, &mut position, 1, b"");
+    assert!(matches!(
+        result,
+        Err(RecoveryDirectoryError::BudgetExhausted)
+    ));
+    assert_eq!(first, all[..1]);
+    assert_ne!(position, 0);
+    let (rest, _) = stream_names_from(&dir, &mut position, u64::MAX, b"");
+    assert_eq!(rest, all[1..]);
+}
+
 #[test]
 fn colocated_reap_streams_a_ready_shard_past_the_bounded_read_size() {
     let (tmp, mut queue) = lease_one_per_shard(1);
     for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
         enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
     }
-    // Three entries fit this budget; a bounded read would demand 65,537.
+    // Three entries, plus the reaped lease again if its ready name comes
+    // later in directory order, fit this budget; a bounded read would
+    // demand 65,537.
     queue.recovery_cursor.reap_colocated_shard = Some(0);
     let small = RecoveryScanBudget {
         max_directories_read: 1,
-        max_entries_read: 4,
+        max_entries_read: 5,
         max_name_bytes_read: u64::MAX,
     };
     let stats = reap_expired_with_scan_budget(&mut queue, &small);
@@ -5148,37 +5224,179 @@ fn colocated_reap_streams_a_ready_shard_past_the_bounded_read_size() {
     assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
 }
 
+fn reap_colocated_pass(
+    queue: &mut Queue,
+    budget: &WorkBudget,
+    scan_budget: &RecoveryScanBudget,
+) -> (RecoveryStats, RecoveryScanStats) {
+    // A saved shard skips leased/, so only the ready shard is read.
+    queue.recovery_cursor.reap_colocated_shard.get_or_insert(0);
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        budget,
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    (stats, scan_stats)
+}
+
+/// Run colocated passes until the shard scan finishes, returning the
+/// leases reaped and entries read.
+fn reap_colocated_until_done(
+    queue: &mut Queue,
+    budget: &WorkBudget,
+    scan_budget: &RecoveryScanBudget,
+) -> (u32, u64) {
+    let (mut passes, mut reaped, mut read) = (0, 0, 0);
+    loop {
+        let (stats, scan) = reap_colocated_pass(queue, budget, scan_budget);
+        assert!(!stats.phase_blocked, "errors: {:?}", stats.errors);
+        passes += 1;
+        reaped += stats.leases_reaped;
+        read += scan.entries_read;
+        if queue.recovery_cursor.reap_colocated_shard.is_none() {
+            assert_eq!(queue.recovery_cursor.reap_colocated_position, None);
+            return (reaped, read);
+        }
+        assert!(stats.budget_exhausted);
+        assert!(passes < 8, "the colocated scan stopped making progress");
+    }
+}
+
+/// Ready shard 0 names, and whether any of them is still a lease.
+fn ready_shard_names(tmp: &TempDir) -> (usize, bool) {
+    let names: Vec<String> = std::fs::read_dir(tmp.path().join("ready/0000"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let leased = names
+        .iter()
+        .any(|name| steadq_names::parse_leased(name).is_ok());
+    (names.len(), leased)
+}
+
 #[test]
-fn colocated_reap_skips_a_shard_that_outgrows_a_whole_pass() {
-    let (tmp, mut queue) = lease_one_per_shard(2);
-    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-a");
-    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-b");
-    // Shard 0 holds one entry and fits; shard 1 holds three and does not.
-    let small = RecoveryScanBudget {
-        max_directories_read: 2,
-        max_entries_read: 3,
+fn colocated_reap_resumes_mid_shard_when_the_scan_budget_runs_out() {
+    let (tmp, mut queue) = lease_one_per_shard(1);
+    for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
+        enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
+    }
+    let two_entries = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: 2,
         max_name_bytes_read: u64::MAX,
     };
-    queue.recovery_cursor.reap_colocated_shard = Some(0);
-    let first = reap_expired_with_scan_budget(&mut queue, &small);
-    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    let (first, scan) = reap_colocated_pass(&mut queue, &WorkBudget::default(), &two_entries);
     assert!(first.budget_exhausted);
     assert!(!first.phase_blocked);
-    assert_eq!(first.scan_skips, 1);
-    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+    assert_eq!(scan.entries_read, 2);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+    assert!(queue.recovery_cursor.reap_colocated_position.is_some());
 
-    // Resumed with a fresh budget, shard 1 still does not fit, so the phase
-    // moves on instead of stalling every later pass.
-    let second = reap_expired_with_scan_budget(&mut queue, &small);
-    assert_eq!(second.leases_reaped, 0, "errors: {:?}", second.errors);
+    let (reaped, read) =
+        reap_colocated_until_done(&mut queue, &WorkBudget::default(), &two_entries);
+    assert_eq!(first.leases_reaped + reaped, 1);
+    // Only the renamed lease can be read again; the scan never restarts.
+    assert!(2 + read <= 4, "entries read after resuming: {read}");
+    assert_eq!(ready_shard_names(&tmp), (3, false));
+}
+
+#[test]
+fn colocated_reap_rereads_only_the_lease_it_stopped_at() {
+    // Recovery used to reread the whole shard every pass; once that scan
+    // alone filled the pass, no lease was ever reaped. Resuming at the
+    // lease the work budget stopped at bounds each pass to new entries.
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    for _ in 0..2 {
+        lease_recovery_job(&mut queue, 3);
+    }
+    for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
+        enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
+    }
+    let one_operation = WorkBudget {
+        max_operations: 1,
+        max_duration_ms: 5_000,
+    };
+    let unbounded = RecoveryScanBudget::default();
+    let (first, scan) = reap_colocated_pass(&mut queue, &one_operation, &unbounded);
+    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    let stopped_at = queue.recovery_cursor.reap_colocated_position;
+    assert!(stopped_at.is_some());
+
+    let (second, rest) = reap_colocated_pass(&mut queue, &one_operation, &unbounded);
+    assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
     assert!(!second.budget_exhausted);
-    assert!(second.phase_blocked);
-    assert_eq!(second.scan_skips, 1);
-    assert!(second
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+    assert_eq!(queue.recovery_cursor.reap_colocated_position, None);
+    // Four entries and the lease stopped at, plus each reaped lease again if
+    // its ready name comes later in directory order. Rereading the shard
+    // from the start would read at least eight.
+    let read = scan.entries_read + rest.entries_read;
+    assert!((5..=7).contains(&read), "entries read: {read}");
+    assert_eq!(ready_shard_names(&tmp), (4, false));
+}
+
+#[test]
+fn colocated_reap_recovers_from_an_unusable_saved_position() {
+    for position in [-1, 1, 0x1234_5678, i64::MAX] {
+        let (tmp, mut queue) = lease_one_per_shard(1);
+        for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
+            enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
+        }
+        queue.recovery_cursor.reap_colocated_position = Some(position);
+        let mut reaped = 0;
+        let mut errors = Vec::new();
+        // A bad position costs at most the rest of this cycle.
+        for _ in 0..2 {
+            let (stats, _) = reap_colocated_pass(
+                &mut queue,
+                &WorkBudget::default(),
+                &RecoveryScanBudget::default(),
+            );
+            assert!(!stats.budget_exhausted, "position {position}");
+            reaped += stats.leases_reaped;
+            errors.extend(stats.errors);
+            assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+            assert_eq!(queue.recovery_cursor.reap_colocated_position, None);
+        }
+        assert_eq!(reaped, 1, "position {position}");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.operation == "reap_entry_read"),
+            "position {position}: {errors:?}"
+        );
+        assert_eq!(ready_shard_names(&tmp), (3, false), "position {position}");
+    }
+}
+
+#[test]
+fn colocated_reap_skips_the_shard_when_its_saved_position_cannot_be_opened() {
+    let (tmp, mut queue) = lease_one_per_shard(1);
+    queue.recovery_cursor.reap_colocated_position = Some(-1);
+    let (stats, scan) =
+        reap_colocated_pass(&mut queue, &WorkBudget::default(), &Default::default());
+    assert!(stats.phase_blocked);
+    assert!(!stats.budget_exhausted);
+    assert_eq!(stats.scan_skips, 1);
+    assert_eq!(stats.leases_reaped, 0);
+    assert_eq!(scan.entries_read, 0);
+    assert!(stats
         .errors
         .iter()
-        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0001"));
+        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0000"));
     assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+    assert_eq!(queue.recovery_cursor.reap_colocated_position, None);
+    assert_eq!(ready_shard_names(&tmp), (1, true));
 }
 
 #[test]

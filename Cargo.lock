@@ -728,6 +728,8 @@ dependencies = [
  "serde",
  "serde_json",
  "steadq-core",
+ "steadq-fs-linux",
+ "steadq-names",
  "tempfile",
 ]
 

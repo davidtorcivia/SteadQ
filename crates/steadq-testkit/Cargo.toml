@@ -15,3 +15,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+steadq-fs-linux = { path = "../steadq-fs-linux" }
+steadq-names = { path = "../steadq-names" }
