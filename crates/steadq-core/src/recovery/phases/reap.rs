@@ -82,6 +82,7 @@ impl Queue {
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
+            let boot_path = format!("leased/{boot_dir_name}");
             let (boot_dir_fd, bucket_dirs) = match self.descend_level(
                 leased_fd.as_fd(),
                 &Level {
@@ -90,8 +91,7 @@ impl Queue {
                     components: &[boot_dir_entry.as_bytes()],
                     open_operation: "reap_boot_open",
                     read_operation: "reap_bucket_read",
-                    path: boot_dir_name,
-                    open_error_path: boot_dir_name,
+                    path: &boot_path,
                 },
                 scan,
                 stats,
@@ -152,7 +152,6 @@ impl Queue {
                         open_operation: "reap_bucket_open",
                         read_operation: "reap_shard_read",
                         path: &bucket_path,
-                        open_error_path: &bucket_path,
                     },
                     scan,
                     stats,
@@ -196,7 +195,6 @@ impl Queue {
                             open_operation: "reap_shard_open",
                             read_operation: "reap_entry_read",
                             path: &shard_path,
-                            open_error_path: &shard_path,
                         },
                         scan,
                         stats,

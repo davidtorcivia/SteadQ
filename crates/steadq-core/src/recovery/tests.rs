@@ -3120,7 +3120,7 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
     assert!(first
         .errors
         .iter()
-        .any(|error| error.operation == "receipt_compact_invalid"));
+        .any(|error| error.operation == "receipt_compact_parse"));
     assert!(!malformed.exists());
     drop(queue);
 
@@ -5630,7 +5630,6 @@ fn descend_test_level<'a>(name: &'a str, components: &'a [&'a [u8]]) -> walk::Le
         open_operation: "test_open",
         read_operation: "test_read",
         path: "receipts/level",
-        open_error_path: "open/level",
     }
 }
 
@@ -5701,7 +5700,7 @@ fn descend_level_open_failure_remembers_an_open_retry() {
     assert_eq!(stats.scan_skips, 1);
     assert!(stats.phase_blocked);
     assert!(!stats.budget_exhausted);
-    assert_eq!(test_errors(&stats), [("test_open", "open/level")]);
+    assert_eq!(test_errors(&stats), [("test_open", "receipts/level")]);
     assert_eq!(scan.directories_read, 0);
     assert_eq!(
         queue.recovery_cursor.hierarchy_retries,
@@ -5766,7 +5765,7 @@ fn descend_level_stops_when_the_retry_cannot_be_recorded() {
     assert_eq!(
         test_errors(&stats),
         [
-            ("test_open", "open/level"),
+            ("test_open", "receipts/level"),
             ("hierarchy_retry_invalid", "receipts/level")
         ]
     );
@@ -5818,4 +5817,69 @@ fn prune_empty_directory_reports_each_outcome() {
         [("test_remove_not_committed", "prune/path")]
     );
     assert!(tmp.path().join("failing").exists());
+}
+
+#[test]
+fn directory_open_errors_record_the_queue_relative_path() {
+    let (tmp, mut queue) = create_test_queue();
+    let boot = "00000000-0000-0000-0000-000000000001";
+    std::fs::create_dir(tmp.path().join("leased").join(boot)).unwrap();
+    std::fs::create_dir(tmp.path().join("tmp").join(boot)).unwrap();
+    queue.ensure_dir("delayed/0000000000000000/0000").unwrap();
+
+    fs::fault::inject_errno_for("open_directory", boot, libc::EIO);
+    let reap = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    fs::fault::inject_errno_for("open_directory", boot, libc::EIO);
+    let temp = cleanup_temp_with_budget(&mut queue);
+    fs::fault::inject_errno_for("open_directory", "0000", libc::EIO);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let promote = promote_eligible_with_budget(&mut queue, wall_floor);
+    fs::fault::reset();
+
+    let leased_path = format!("leased/{boot}");
+    let tmp_path = format!("tmp/{boot}");
+    for (stats, operation, path) in [
+        (&reap, "reap_boot_open", leased_path.as_str()),
+        (&temp, "temp_boot_open", tmp_path.as_str()),
+        (
+            &promote,
+            "promote_shard_open",
+            "delayed/0000000000000000/0000",
+        ),
+    ] {
+        assert!(
+            stats
+                .errors
+                .iter()
+                .any(|error| error.operation == operation && error.relative_path == path),
+            "errors: {:?}",
+            stats.errors
+        );
+    }
+}
+
+#[test]
+fn compaction_quarantines_an_unparsed_receipt_name_as_retention_does() {
+    let (tmp, mut queue) = create_test_queue();
+    queue.ensure_dir("receipts/0000000000000000/0000").unwrap();
+    let stray = tmp
+        .path()
+        .join("receipts/0000000000000000/0000/garbage.rct");
+    std::fs::write(&stray, b"garbage").unwrap();
+    let stats = compact_receipts_with_budget(&mut queue);
+    assert_eq!(
+        test_errors(&stats),
+        [(
+            "receipt_compact_parse",
+            "receipts/0000000000000000/0000/garbage.rct"
+        )]
+    );
+    assert_eq!(stats.quarantined.len(), 1);
+    assert!(!stray.exists());
+    let quarantined = queue.list_quarantine().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        quarantined[0].reason,
+        crate::QuarantineReason::FilenameParseFailed as u16
+    );
 }

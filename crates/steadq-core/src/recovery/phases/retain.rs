@@ -62,6 +62,7 @@ impl Queue {
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
+            let boot_path = format!("tmp/{boot_dir_name}");
             let (boot_dir_fd, shard_dirs) = match self.descend_level(
                 tmp_fd.as_fd(),
                 &Level {
@@ -70,8 +71,7 @@ impl Queue {
                     components: &[boot_entry.as_bytes()],
                     open_operation: "temp_boot_open",
                     read_operation: "temp_shard_read",
-                    path: boot_dir_name,
-                    open_error_path: boot_dir_name,
+                    path: &boot_path,
                 },
                 scan,
                 stats,
@@ -111,7 +111,6 @@ impl Queue {
                         open_operation: "temp_shard_open",
                         read_operation: "temp_entry_read",
                         path: &shard_path,
-                        open_error_path: &shard_path,
                     },
                     scan,
                     stats,
@@ -257,7 +256,6 @@ impl Queue {
                     open_operation: "compact_bucket_open",
                     read_operation: "compact_shard_read",
                     path: &bucket_path,
-                    open_error_path: &bucket_path,
                 },
                 scan,
                 stats,
@@ -298,7 +296,6 @@ impl Queue {
                         open_operation: "compact_shard_open",
                         read_operation: "compact_entry_read",
                         path: &shard_path,
-                        open_error_path: &shard_path,
                     },
                     scan,
                     stats,
@@ -356,6 +353,21 @@ impl Queue {
 
                     if !entry.ends_with(".rct") {
                         continue;
+                    }
+                    match self.quarantine_unparsed_receipt(
+                        shard_fd.as_fd(),
+                        entry,
+                        &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                        "receipt_compact_parse",
+                        stats,
+                        budget,
+                    ) {
+                        Some(true) => continue,
+                        Some(false) => {
+                            self.recovery_cursor.compact_receipts = previous_entry_cursor;
+                            return;
+                        }
+                        None => {}
                     }
 
                     let receipt_fd = match open_locked_receipt(shard_fd.as_fd(), entry) {
@@ -652,7 +664,6 @@ impl Queue {
                     open_operation: "delete_bucket_open",
                     read_operation: "delete_shard_read",
                     path: &bucket_path,
-                    open_error_path: &bucket_path,
                 },
                 scan,
                 stats,
@@ -694,7 +705,6 @@ impl Queue {
                         open_operation: "delete_shard_open",
                         read_operation: "delete_entry_read",
                         path: &shard_path,
-                        open_error_path: &shard_path,
                     },
                     scan,
                     stats,
@@ -740,31 +750,20 @@ impl Queue {
                     if !entry.ends_with(".rct") {
                         continue;
                     }
-                    // A receipt name that does not parse can never pass the
-                    // retention check, so it is quarantined like any other
-                    // malformed object instead of staying forever.
-                    if steadq_names::parse_receipt(entry).is_err() {
-                        let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
-                        Self::record_error(
-                            stats,
-                            "receipt_delete_parse",
-                            &relative_path,
-                            "receipt filename does not parse",
-                        );
-                        if !self.quarantine_recovery_object(
-                            RecoveryQuarantineCandidate {
-                                source_directory_fd: shard_fd.as_fd(),
-                                filename: entry,
-                                relative_path: &relative_path,
-                                reason: crate::QuarantineReason::FilenameParseFailed,
-                            },
-                            stats,
-                            budget,
-                        ) {
+                    match self.quarantine_unparsed_receipt(
+                        shard_fd.as_fd(),
+                        entry,
+                        &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                        "receipt_delete_parse",
+                        stats,
+                        budget,
+                    ) {
+                        Some(true) => continue,
+                        Some(false) => {
                             self.recovery_cursor.delete_receipts = previous_entry_cursor;
                             return;
                         }
-                        continue;
+                        None => {}
                     }
 
                     let receipt_fd = match open_locked_receipt(shard_fd.as_fd(), entry) {
@@ -908,6 +907,38 @@ impl Queue {
 
         // All buckets processed, reset cursor for next full pass.
         self.recovery_cursor.delete_receipts = None;
+    }
+
+    /// Quarantine a receipt whose name does not parse: it can never verify
+    /// or pass retention, so it would otherwise stay forever. Returns None
+    /// for a name that parses and `Some(false)` when the quarantine ran out
+    /// of budget, so the caller retries the entry on the next pass.
+    fn quarantine_unparsed_receipt(
+        &self,
+        shard_fd: BorrowedFd<'_>,
+        entry: &str,
+        relative_path: &str,
+        operation: &str,
+        stats: &mut RecoveryStats,
+        budget: &WorkBudget,
+    ) -> Option<bool> {
+        steadq_names::parse_receipt(entry).err()?;
+        Self::record_error(
+            stats,
+            operation,
+            relative_path,
+            "receipt filename does not parse",
+        );
+        Some(self.quarantine_recovery_object(
+            RecoveryQuarantineCandidate {
+                source_directory_fd: shard_fd,
+                filename: entry,
+                relative_path,
+                reason: crate::QuarantineReason::FilenameParseFailed,
+            },
+            stats,
+            budget,
+        ))
     }
 }
 

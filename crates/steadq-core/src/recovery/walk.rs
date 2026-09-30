@@ -20,10 +20,8 @@ pub(super) struct Level<'a> {
     pub(super) components: &'a [&'a [u8]],
     pub(super) open_operation: &'a str,
     pub(super) read_operation: &'a str,
-    /// Path recorded with read errors and hierarchy retry blocks.
+    /// Queue-relative path recorded with errors and retry blocks.
     pub(super) path: &'a str,
-    /// Path recorded with the open error.
-    pub(super) open_error_path: &'a str,
 }
 
 /// Result of removing a directory whose observed children are all gone.
@@ -141,12 +139,7 @@ impl Queue {
             Ok(fd) => fd,
             Err(error) => {
                 stats.scan_skips += 1;
-                Self::block_phase(
-                    stats,
-                    level.open_operation,
-                    level.open_error_path,
-                    &error.to_string(),
-                );
+                Self::block_phase(stats, level.open_operation, level.path, &error.to_string());
                 return self.remember_level_retry(level, RecoveryHierarchyRetryKind::Open, stats);
             }
         };
