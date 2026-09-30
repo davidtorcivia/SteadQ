@@ -463,7 +463,7 @@ fn execute_run(
     Ok(())
 }
 
-fn teardown_run_resources(run: &RegistryRun) {
+pub(super) fn teardown_run_resources(run: &RegistryRun) {
     if let Some(pool) = &run.pool {
         let _ = std::process::Command::new("zpool")
             .args(["export", "-f", pool])
@@ -575,7 +575,7 @@ fn zpool_export_retry(pool: &str) -> Result<(), String> {
     Err(format!("zpool export {pool} still busy after retries"))
 }
 
-fn allocate_image(path: &Path, size_mb: u64) -> Result<(), String> {
+pub(super) fn allocate_image(path: &Path, size_mb: u64) -> Result<(), String> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -588,7 +588,7 @@ fn allocate_image(path: &Path, size_mb: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn attach_loop(backing: &Path) -> Result<String, String> {
+pub(super) fn attach_loop(backing: &Path) -> Result<String, String> {
     let out = run_cmd(
         "losetup",
         &["--find", "--show", "--direct-io=on"],
@@ -628,7 +628,7 @@ fn attach_loop_explicit(dev: &str, backing: &Path) -> Result<(), String> {
 
 /// Detach a loop device, retrying: the kernel releases the loop reference
 /// asynchronously after umount, so an immediate detach can fail with EBUSY.
-fn detach_loop(dev: &str) {
+pub(super) fn detach_loop(dev: &str) {
     for attempt in 0..20 {
         let ok = std::process::Command::new("losetup")
             .args(["-d", dev])
@@ -665,7 +665,7 @@ fn detach_loop_quiet(dev: &str) {
 /// Unmount without failing the caller: used on paths where the state's
 /// verdict has already been decided and a leftover mount is cleaned by
 /// teardown.
-fn umount_if_mounted(mount_dir: &Path) {
+pub(super) fn umount_if_mounted(mount_dir: &Path) {
     let target = mount_dir.to_string_lossy();
     let _ = std::process::Command::new("umount").arg(&*target).output();
 }
@@ -673,7 +673,7 @@ fn umount_if_mounted(mount_dir: &Path) {
 /// Unmount, retrying briefly: a just-exited checker's file handles can take
 /// a moment to release. Returns Err when the mount is still busy so callers
 /// fail the state loudly instead of corrupting the next one.
-fn umount_retry(mount_dir: &Path) -> Result<(), String> {
+pub(super) fn umount_retry(mount_dir: &Path) -> Result<(), String> {
     let target = mount_dir.to_string_lossy();
     for _attempt in 0..20 {
         let ok = std::process::Command::new("umount")
@@ -689,7 +689,7 @@ fn umount_retry(mount_dir: &Path) -> Result<(), String> {
     Err(format!("umount {target} still busy after retries"))
 }
 
-fn sectors_of(dev: &str) -> Result<String, String> {
+pub(super) fn sectors_of(dev: &str) -> Result<String, String> {
     let out = run_cmd("blockdev", &["--getsz", dev], &[])?;
     let n: u64 = out
         .trim()
@@ -698,7 +698,7 @@ fn sectors_of(dev: &str) -> Result<String, String> {
     Ok(n.to_string())
 }
 
-fn kernel_version() -> String {
+pub(super) fn kernel_version() -> String {
     std::process::Command::new("uname")
         .arg("-r")
         .output()
@@ -706,7 +706,7 @@ fn kernel_version() -> String {
         .unwrap_or_default()
 }
 
-fn is_root() -> bool {
+pub(super) fn is_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
         .output()

@@ -5,6 +5,7 @@
 // created over allowlisted image stores); registry tracks resources for
 // teardown after interrupted runs.
 
+pub mod flakey;
 pub mod guards;
 pub mod registry;
 pub mod tier0;
@@ -46,14 +47,15 @@ pub fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> 
     .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Build (if needed) and return the two crash-lab binaries. Skips the build
-/// when both already exist so the orchestrator can run under sudo without
-/// root-owned build artifacts.
+/// Build (if needed) and return the workload and checker binaries. Skips
+/// the build when every crash-lab binary (including crashlab-concurrent,
+/// the flakey workload next to them) already exists, so the orchestrator
+/// can run under sudo without root-owned build artifacts.
 pub fn ensure_bins(root: &Path) -> Result<(PathBuf, PathBuf), String> {
     let dir = root.join("target/debug");
     let workload = dir.join("crashlab-workload");
     let check = dir.join("crashlab-check");
-    if workload.is_file() && check.is_file() {
+    if workload.is_file() && check.is_file() && dir.join("crashlab-concurrent").is_file() {
         return Ok((workload, check));
     }
     let status = std::process::Command::new(cargo_bin())
@@ -98,6 +100,7 @@ pub fn dispatch(root: &Path, sub: &str, args: &[String]) -> Result<(), String> {
         "doctor" => doctor(root),
         "tier0" => tier0::run(root, args),
         "tier1" => tier1::run(root, args),
+        "flakey" => flakey::run(root, args),
         "teardown" => {
             let store = args
                 .first()
@@ -112,11 +115,14 @@ pub fn dispatch(root: &Path, sub: &str, args: &[String]) -> Result<(), String> {
         }
         "help" | "-h" | "--help" => {
             eprintln!(
-                "usage: cargo xtask crashlab <doctor|tier0|tier1|teardown> [args]\n\
+                "usage: cargo xtask crashlab <doctor|tier0|tier1|flakey|teardown> [args]\n\
                  \n\
                  tier0 [--runs N] [--ops N] [--seed N] [--store DIR]  SIGKILL lane, no root\n\
                  tier1 --fs ext4|xfs|btrfs|f2fs [--ops N] [--seed N] [--size-mb N]\n\
                        [--store DIR] [--max-marks N] [--keep-images]   dm-log-writes replay, root\n\
+                 flakey [--cuts N] [--seed N] [--workers N] [--mode drop_writes|error_writes]\n\
+                       [--mount-opts OPTS] [--min-ops N] [--max-ops N] [--size-mb N]\n\
+                       [--store DIR]                     dm-flakey power cuts on ext4, root\n\
                  teardown [STORE]                                       recover a crashed run\n\
                  \n\
                  Safety: only loop devices over images in allowlisted stores\n\

@@ -61,6 +61,13 @@ pub fn teardown_active(store: &Path) -> Result<usize, String> {
     let mut torn = 0;
     for run in runs.iter_mut().filter(|r| r.status == "active") {
         eprintln!("tearing down run {}", run.id);
+        // A run interrupted mid-cut can leave its device suspended, which
+        // blocks umount and remove; resuming an active device is a no-op.
+        for dm in &run.dm_names {
+            let _ = std::process::Command::new("dmsetup")
+                .args(["resume", dm])
+                .output();
+        }
         if let Some(mount) = &run.mount {
             let _ = std::process::Command::new("umount").arg(mount).output();
         }

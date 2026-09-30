@@ -2,13 +2,18 @@
 // after a crash. Runs recovery, fsck, and the A-015 acceptance gates:
 //
 //   G1 no returned-committed enqueue is lost
-//   G2 no acknowledged job is active (must be terminal)
+//   G2 no acknowledged or buried job is active (must be terminal)
 //   G3 no phantom job is delivered
 //   G4 recovery completes without errors
 //   G5 fsck reports no Error-severity findings
+//   G6 no enqueue that returned NotCommitted is visible
+//   G7 no job is in more than one state
 //
 // A written op-log line is a completed fact; the surviving prefix defines
-// the expectations. Any payload corruption must surface as quarantine, never
+// the expectations. A `{"op":"cut"}` line (written by the dm-flakey runner
+// before it drops writes) ends the prefix: lines after it returned after the
+// cut and set no durability expectation, though NotCommitted still means
+// the job must not exist. Any payload corruption must surface as quarantine, never
 // as delivery.
 //
 // Usage: crashlab-check --queue DIR --oplog FILE --out VERDICT.json
@@ -53,6 +58,7 @@ struct OpLine {
     op: String,
     job: String,
     result: String,
+    post_cut: bool,
 }
 
 fn unhex(s: &str) -> Option<[u8; 16]> {
@@ -82,16 +88,22 @@ fn read_oplog(path: &Path) -> Result<Vec<OpLine>, String> {
         None => "",
     };
     let mut lines = Vec::new();
+    let mut post_cut = false;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let v: serde_json::Value =
             serde_json::from_str(line).map_err(|e| format!("bad oplog line: {e}"))?;
+        if v["op"] == "cut" {
+            post_cut = true;
+            continue;
+        }
         lines.push(OpLine {
             op: v["op"].as_str().unwrap_or("").to_string(),
             job: v["job"].as_str().unwrap_or("").to_string(),
             result: v["result"].as_str().unwrap_or("").to_string(),
+            post_cut,
         });
     }
     Ok(lines)
@@ -127,7 +139,8 @@ fn main() {
 }
 
 /// The oplog's durable prefix: jobs whose enqueue committed and jobs whose
-/// ack completed. Damage to anything else is legal power-loss loss.
+/// ack or bury completed (`acked` holds both: each must be terminal).
+/// Damage to anything else is legal power-loss loss.
 struct DurablePrefix {
     committed: Vec<[u8; 16]>,
     acked: Vec<[u8; 16]>,
@@ -137,14 +150,15 @@ struct DurablePrefix {
 
 impl DurablePrefix {
     fn from_ops(ops: &[OpLine]) -> Self {
-        let committed: Vec<[u8; 16]> = ops
-            .iter()
+        let ops = || ops.iter().filter(|l| !l.post_cut);
+        let committed: Vec<[u8; 16]> = ops()
             .filter(|l| l.op == "enqueue" && l.result.starts_with("committed"))
             .filter_map(|l| unhex(&l.job))
             .collect();
-        let acked: Vec<[u8; 16]> = ops
-            .iter()
-            .filter(|l| l.op == "ack" && l.result == "acked")
+        let acked: Vec<[u8; 16]> = ops()
+            .filter(|l| {
+                (l.op == "ack" && l.result == "acked") || (l.op == "bury" && l.result == "buried")
+            })
             .filter_map(|l| unhex(&l.job))
             .collect();
         let committed_hex = committed.iter().map(|j| hex(j)).collect();
@@ -269,6 +283,34 @@ fn check_prefix_jobs(queue: &Queue, prefix: &DurablePrefix) -> (Vec<String>, Vec
     (missing, acked_bad)
 }
 
+/// G6 and G7: an enqueue that returned NotCommitted never linearized, so
+/// its job must not exist; and no job may be in two states at once.
+/// Returns (visible_not_committed, duplicated).
+fn check_visibility(queue: &Queue, ops: &[OpLine]) -> (Vec<String>, Vec<String>) {
+    let mut visible = Vec::new();
+    let mut duplicated = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in ops {
+        let Some(job) = unhex(&line.job) else {
+            continue;
+        };
+        if line.op == "enqueue" && line.result == "not_committed" {
+            let snapshots = queue.inspect(&job).expect("inspect the queue");
+            if !snapshots.is_empty() {
+                visible.push(format!("{}:{}", line.job, snapshots[0].state));
+            }
+        }
+        if seen.insert(job) {
+            let snapshots = queue.inspect(&job).expect("inspect the queue");
+            if snapshots.len() > 1 {
+                let states: Vec<&str> = snapshots.iter().map(|s| s.state.as_str()).collect();
+                duplicated.push(format!("{}:{}", line.job, states.join("+")));
+            }
+        }
+    }
+    (visible, duplicated)
+}
+
 struct DeliveryProbe {
     delivered: Vec<String>,
     phantom: Vec<String>,
@@ -342,6 +384,7 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     let recovery = recover_to_quiescence(&mut queue, &prefix);
     let fsck = fsck_gate(&queue, &prefix);
     let (missing, acked_bad) = check_prefix_jobs(&queue, &prefix);
+    let (visible_not_committed, duplicated) = check_visibility(&queue, &ops);
     let probe = probe_deliveries(&mut queue, &prefix);
 
     let fsck_warnings = fsck.report.findings.len() - fsck.errors - fsck.beyond_prefix;
@@ -376,12 +419,15 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     let gates_pass = missing.is_empty()
         && acked_bad.is_empty()
         && probe.phantom.is_empty()
+        && visible_not_committed.is_empty()
+        && duplicated.is_empty()
         && recovery.errors == 0
         && fsck.errors == 0;
 
     Ok(json!({
         "pass": gates_pass,
         "ops": ops.len(),
+        "ops_before_cut": ops.iter().filter(|l| !l.post_cut).count(),
         "oplog_tail": oplog_tail,
         "committed": prefix.committed.len(),
         "acked": prefix.acked.len(),
@@ -389,6 +435,8 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
             "committed_not_lost": { "checked": prefix.committed.len(), "missing": missing },
             "acked_terminal": { "checked": prefix.acked.len(), "violations": acked_bad },
             "no_phantom_or_acked_delivery": { "violations": probe.phantom, "delivered_probe": probe.delivered.len() },
+            "not_committed_invisible": { "violations": visible_not_committed },
+            "single_state": { "violations": duplicated },
             "recovery_clean": {
                 "passes": recovery.passes,
                 "errors": recovery.errors,
