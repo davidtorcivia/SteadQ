@@ -1,6 +1,16 @@
 // Expired lease reaping to ready or dead.
 use super::*;
 
+/// A lease found in a ready shard by the colocated scan.
+#[derive(Clone, Copy)]
+struct ColocatedLease<'a> {
+    shard_fd: BorrowedFd<'a>,
+    shard_name: &'a str,
+    entry: &'a str,
+    relative_path: &'a str,
+    parsed: &'a steadq_names::LeasedName,
+}
+
 impl Queue {
     pub(crate) fn reap_expired_leases(
         &mut self,
@@ -398,8 +408,15 @@ impl Queue {
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
-        let resumed_shard = self.recovery_cursor.reap_colocated_shard;
-        let first_shard = resumed_shard.unwrap_or(0);
+        // A ready shard holds the whole ready backlog, so its scan resumes at
+        // a saved directory position instead of rereading the shard every
+        // pass: a pass that runs out of budget saves the position before the
+        // lease it stopped at, or after the last entry it read, and the next
+        // pass starts there. Reaping renames by exact name with NOREPLACE and
+        // a missing source is benign, so a stale or invalid position can only
+        // reread entries or skip some until the scan starts over from 0 next
+        // cycle; it never moves the wrong object.
+        let first_shard = self.recovery_cursor.reap_colocated_shard.unwrap_or(0);
         for shard in first_shard..self.format.shard_count() {
             // Every early return below resumes at this shard.
             self.recovery_cursor.reap_colocated_shard = Some(shard);
@@ -407,6 +424,11 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let mut position = self
+                .recovery_cursor
+                .reap_colocated_position
+                .take()
+                .unwrap_or(0);
             let ready_dir = self.layout().ready_shard_dir(shard);
             let shard_fd = match open_relative(self.root_fd(), &ready_dir) {
                 Ok(fd) => fd,
@@ -416,146 +438,151 @@ impl Queue {
                     continue;
                 }
             };
-            // A ready shard holds the whole ready backlog, so it is streamed
-            // and only lease names are kept.
-            let mut entries = match stream_recovery_directory(
+            let shard_name = steadq_names::shard_hex(shard);
+            let result = stream_recovery_directory(
                 shard_fd.as_fd(),
+                &mut position,
                 deadline_mono,
                 scan.budget,
                 scan.stats,
-                |name| {
-                    name.as_ascii_str()
-                        .is_some_and(|name| steadq_names::parse_leased(name).is_ok())
-                },
-            ) {
-                Ok(entries) => entries,
-                // A shard that exhausts the pass it was resumed in would
-                // stall every later pass, so it is skipped for this cycle.
-                Err(RecoveryDirectoryError::BudgetExhausted) if resumed_shard == Some(shard) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(
+                |raw_entry| {
+                    let Some(entry) = raw_entry.as_ascii_str() else {
+                        return ControlFlow::Continue(());
+                    };
+                    let Ok(parsed) = steadq_names::parse_leased(entry) else {
+                        return ControlFlow::Continue(());
+                    };
+                    self.reap_colocated_lease(
+                        &ColocatedLease {
+                            shard_fd: shard_fd.as_fd(),
+                            shard_name: &shard_name,
+                            entry,
+                            relative_path: &format!("{ready_dir}/{entry}"),
+                            parsed: &parsed,
+                        },
+                        boottime_now,
+                        wall_floor,
+                        budget,
                         stats,
-                        "reap_entry_read",
-                        &ready_dir,
-                        "ready shard does not fit in one recovery pass's scan and time budget",
-                    );
-                    continue;
-                }
+                        deadline_mono,
+                    )
+                },
+            );
+            let stop = match result {
+                Ok(flow) => flow.is_break(),
                 Err(error) => {
                     stats.scan_skips += 1;
-                    if Self::record_directory_error(stats, "reap_entry_read", &ready_dir, &error) {
-                        return;
-                    }
-                    continue;
+                    Self::record_directory_error(stats, "reap_entry_read", &ready_dir, &error)
                 }
             };
-            entries.sort();
-            let shard_name = steadq_names::shard_hex(shard);
-            for raw_entry in entries {
-                let Some(entry) = raw_entry.as_ascii_str() else {
-                    continue;
-                };
-                let Ok(parsed) = steadq_names::parse_leased(entry) else {
-                    continue;
-                };
-                let relative_path = format!("{ready_dir}/{entry}");
-                let boot_id = steadq_names::format_boot_id(&parsed.boot_id);
-                let Some(bucket) = steadq_math::lease_bucket(
-                    parsed.boottime_deadline_ns,
-                    self.format.lease_bucket_width_ns(),
-                ) else {
-                    Self::record_error(
-                        stats,
-                        "reap_bucket_check",
-                        &relative_path,
-                        "invalid lease bucket width",
-                    );
-                    continue;
-                };
-                let bucket_name = steadq_names::bucket_hex(bucket);
-                if !parsed.authenticate_tag(
-                    self.format.queue_id(),
-                    &boot_id,
-                    &bucket_name,
-                    &shard_name,
-                ) {
-                    Self::record_error(stats, "reap_parse", &relative_path, "name tag mismatch");
-                    continue;
-                }
-                let current_boot = boot_id == self.boot_id;
-                if current_boot && parsed.boottime_deadline_ns > boottime_now {
-                    continue;
-                }
-                let leased_ctx = crate::ActivePathContext::Leased {
-                    boot_id: boot_id.clone(),
-                    bucket: bucket_name.clone(),
-                    shard: shard_name.clone(),
-                };
-                if let Err(error) =
-                    self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
-                {
-                    Self::record_error(stats, "reap_validate", &relative_path, &format!("{error}"));
-                    if matches!(error, Error::QueueCorrupt(_))
-                        && !self.quarantine_recovery_object(
-                            RecoveryQuarantineCandidate {
-                                source_directory_fd: shard_fd.as_fd(),
-                                filename: entry,
-                                relative_path: &relative_path,
-                                reason: crate::QuarantineReason::EnvelopeCorrupt,
-                            },
-                            stats,
-                            budget,
-                        )
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
-                    stats.budget_exhausted = true;
-                    return;
-                }
-                if parsed.common.attempt >= parsed.common.maximum_attempts {
-                    let Some(wall_floor) = wall_floor else {
-                        Self::record_error(
-                            stats,
-                            "reap_to_dead",
-                            &relative_path,
-                            "authenticated wall floor unavailable",
-                        );
-                        continue;
-                    };
-                    stats.operations_attempted += 1;
-                    match self.reap_to_dead(
-                        shard_fd.as_fd(),
-                        entry,
-                        &parsed.common,
-                        DeadReason::AttemptsExhausted,
-                        wall_floor,
-                    ) {
-                        Ok(()) => stats.leases_to_dead += 1,
-                        Err(failure) => Self::record_move_failure(
-                            stats,
-                            "reap_to_dead",
-                            &relative_path,
-                            failure,
-                        ),
-                    }
-                } else {
-                    stats.operations_attempted += 1;
-                    match self.reap_colocated_to_ready(shard_fd.as_fd(), entry, &parsed.common) {
-                        Ok(()) => stats.leases_reaped += 1,
-                        Err(failure) => Self::record_move_failure(
-                            stats,
-                            "reap_to_ready",
-                            &relative_path,
-                            failure,
-                        ),
-                    }
-                }
+            if stop {
+                self.recovery_cursor.reap_colocated_position = (position != 0).then_some(position);
+                return;
             }
         }
         self.recovery_cursor.reap_colocated_shard = None;
+    }
+
+    /// Reap one lease found in a ready shard. Breaks, leaving the lease for
+    /// the next pass, when the work budget runs out.
+    fn reap_colocated_lease(
+        &self,
+        lease: &ColocatedLease<'_>,
+        boottime_now: u64,
+        wall_floor: Option<WallFloor>,
+        budget: &WorkBudget,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) -> ControlFlow<()> {
+        let ColocatedLease {
+            shard_fd,
+            shard_name,
+            entry,
+            relative_path,
+            parsed,
+        } = *lease;
+        let boot_id = steadq_names::format_boot_id(&parsed.boot_id);
+        let Some(bucket) = steadq_math::lease_bucket(
+            parsed.boottime_deadline_ns,
+            self.format.lease_bucket_width_ns(),
+        ) else {
+            Self::record_error(
+                stats,
+                "reap_bucket_check",
+                relative_path,
+                "invalid lease bucket width",
+            );
+            return ControlFlow::Continue(());
+        };
+        let bucket_name = steadq_names::bucket_hex(bucket);
+        if !parsed.authenticate_tag(self.format.queue_id(), &boot_id, &bucket_name, shard_name) {
+            Self::record_error(stats, "reap_parse", relative_path, "name tag mismatch");
+            return ControlFlow::Continue(());
+        }
+        let current_boot = boot_id == self.boot_id;
+        if current_boot && parsed.boottime_deadline_ns > boottime_now {
+            return ControlFlow::Continue(());
+        }
+        let leased_ctx = crate::ActivePathContext::Leased {
+            boot_id,
+            bucket: bucket_name,
+            shard: shard_name.to_string(),
+        };
+        if let Err(error) = self.validate_active_object(shard_fd, entry, &leased_ctx) {
+            Self::record_error(stats, "reap_validate", relative_path, &format!("{error}"));
+            if matches!(error, Error::QueueCorrupt(_))
+                && !self.quarantine_recovery_object(
+                    RecoveryQuarantineCandidate {
+                        source_directory_fd: shard_fd,
+                        filename: entry,
+                        relative_path,
+                        reason: crate::QuarantineReason::EnvelopeCorrupt,
+                    },
+                    stats,
+                    budget,
+                )
+            {
+                return ControlFlow::Break(());
+            }
+            return ControlFlow::Continue(());
+        }
+        if Self::work_budget_exhausted(stats, budget, deadline_mono) {
+            stats.budget_exhausted = true;
+            return ControlFlow::Break(());
+        }
+        if parsed.common.attempt >= parsed.common.maximum_attempts {
+            let Some(wall_floor) = wall_floor else {
+                Self::record_error(
+                    stats,
+                    "reap_to_dead",
+                    relative_path,
+                    "authenticated wall floor unavailable",
+                );
+                return ControlFlow::Continue(());
+            };
+            stats.operations_attempted += 1;
+            match self.reap_to_dead(
+                shard_fd,
+                entry,
+                &parsed.common,
+                DeadReason::AttemptsExhausted,
+                wall_floor,
+            ) {
+                Ok(()) => stats.leases_to_dead += 1,
+                Err(failure) => {
+                    Self::record_move_failure(stats, "reap_to_dead", relative_path, failure)
+                }
+            }
+        } else {
+            stats.operations_attempted += 1;
+            match self.reap_colocated_to_ready(shard_fd, entry, &parsed.common) {
+                Ok(()) => stats.leases_reaped += 1,
+                Err(failure) => {
+                    Self::record_move_failure(stats, "reap_to_ready", relative_path, failure)
+                }
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     pub(crate) fn reap_colocated_to_ready(

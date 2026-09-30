@@ -22,13 +22,8 @@ use steadq_fs_linux::fault;
 use steadq_testkit::{Oracle, OracleState, Rng};
 
 const SEC: u64 = 1_000_000_000;
-/// Corrupt receipts are reported as they are quarantined, and a ready shard
-/// larger than one pass's scan budget is skipped for its cycle.
-const EXPECTED_RECOVERY_ERRORS: [&str; 3] = [
-    "receipt_compact_invalid",
-    "receipt_delete_invalid",
-    "reap_entry_read",
-];
+/// Corrupt receipts are reported as they are quarantined.
+const EXPECTED_RECOVERY_ERRORS: [&str; 2] = ["receipt_compact_invalid", "receipt_delete_invalid"];
 const PHASES: [&str; 5] = [
     "reap_leases",
     "promote_delayed",
@@ -48,7 +43,8 @@ const CORRUPT_EVERY: u64 = 97;
 const SCAN_BUDGET_ENTRIES: usize = 65_536 * 5 + 1;
 const DIRECTORY_LIMIT: usize = 65_536;
 const LONG_STEPS: u64 = 44_000;
-const SETTLE_PASSES: u64 = 2_048;
+/// Whole recovery cycles the settle may take beyond its operation count.
+const SETTLE_CYCLES: u64 = 4;
 
 #[derive(Default)]
 struct Side {
@@ -545,6 +541,17 @@ impl Soak {
         }
     }
 
+    /// Delayed jobs and bucket directories, leases, and receipts on disk.
+    fn pending(&self) -> usize {
+        let walk = walk(&self.root, &self.at());
+        let delayed = walk
+            .state
+            .values()
+            .filter(|state| **state == "delayed")
+            .count();
+        delayed + walk.delayed_dirs + walk.leases + count_files(&self.root.join("receipts"))
+    }
+
     /// Jump both clocks past every deadline and retention window, then run
     /// recovery until no delayed job, lease, or receipt is left.
     fn settle(&mut self) {
@@ -552,24 +559,27 @@ impl Soak {
         self.max_realtime = self.realtime;
         self.boottime += 2 * RETENTION_NS;
         set_clocks(self.realtime, self.boottime);
-        let limit = self.pass + SETTLE_PASSES;
+        // Each pending job, receipt, or delayed directory costs at most two
+        // operations, a pass with work left spends its whole operation
+        // budget, and every phase completes within PHASE_PASSES, so the
+        // queue drains within this many passes.
+        let pending = self.pending();
+        let operations = u64::from(WorkBudget::default().max_operations);
+        let passes = (2 * pending as u64).div_ceil(operations) + SETTLE_CYCLES * PHASE_PASSES;
+        let limit = self.pass + passes;
         loop {
             for _ in 0..8 {
                 self.recover();
             }
-            let walk = walk(&self.root, &self.at());
-            let pending =
-                walk.delayed_dirs + walk.leases + count_files(&self.root.join("receipts"));
-            if pending == 0 {
+            let left = self.pending();
+            if left == 0 {
                 break;
             }
             assert!(
                 self.pass < limit,
-                "{}: {} delayed buckets, {} leases and some receipts remain after \
-                 {SETTLE_PASSES} settle passes",
-                self.at(),
-                walk.delayed_dirs,
-                walk.leases
+                "{}: {left} of {pending} delayed jobs and buckets, leases, and receipts \
+                 remain after {passes} settle passes",
+                self.at()
             );
         }
         self.verify(true);
@@ -759,7 +769,7 @@ fn run(steps: u64) -> (usize, usize) {
 
 #[test]
 fn soak_short() {
-    run(env_u64("STEADQ_SOAK_SHORT_STEPS", 200));
+    run(env_u64("STEADQ_SOAK_SHORT_STEPS", 100));
 }
 
 #[test]

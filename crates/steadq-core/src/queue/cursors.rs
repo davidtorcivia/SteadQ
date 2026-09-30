@@ -138,6 +138,9 @@ pub(crate) struct RecoveryCursor {
     /// exhaustion, so earlier shards are not rescanned every pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reap_colocated_shard: Option<u32>,
+    /// Directory position inside that shard at which the scan resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reap_colocated_position: Option<i64>,
     pub(crate) promote_delayed: Option<ThreeLevelCursor>,
     pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
     pub(crate) compact_receipts: Option<ThreeLevelCursor>,

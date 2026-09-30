@@ -1152,16 +1152,24 @@ impl DirectoryEnumerationProgressError {
 }
 
 /// Streaming, byte-preserving directory enumeration.
-pub struct DirectoryStream(NonNull<libc::DIR>);
+pub struct DirectoryStream {
+    dir: NonNull<libc::DIR>,
+    position: i64,
+}
 
 impl DirectoryStream {
     fn from_owned(fd: OwnedFd) -> io::Result<Self> {
+        Self::from_owned_at(fd, 0)
+    }
+
+    /// `position` is the descriptor's current directory offset.
+    fn from_owned_at(fd: OwnedFd, position: i64) -> io::Result<Self> {
         let raw_fd = fd.into_raw_fd();
         // SAFETY: `raw_fd` is a live directory descriptor. `fdopendir`
         // takes ownership on success and leaves ownership with the caller on failure.
         let dir = unsafe { libc::fdopendir(raw_fd) };
         match NonNull::new(dir) {
-            Some(dir) => Ok(Self(dir)),
+            Some(dir) => Ok(Self { dir, position }),
             None => {
                 let error = io::Error::last_os_error();
                 // SAFETY: `fdopendir` failed, so `raw_fd` remains caller-owned.
@@ -1173,6 +1181,25 @@ impl DirectoryStream {
 
     pub fn open(dir_fd: BorrowedFd<'_>) -> io::Result<Self> {
         Self::from_owned(reopen_directory(dir_fd)?)
+    }
+
+    /// Open positioned at `position`, a value [`Self::position`] returned for
+    /// this directory, or 0 for the start. The stream continues with the
+    /// entry after the one that position was taken at, even across a close
+    /// and reopen.
+    pub fn open_at(dir_fd: BorrowedFd<'_>, position: i64) -> io::Result<Self> {
+        let fd = reopen_directory(dir_fd)?;
+        fault_check!("directory_stream_seek");
+        // SAFETY: `fd` is a live directory descriptor owned by this call.
+        if unsafe { libc::lseek(fd.as_raw_fd(), position, libc::SEEK_SET) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::from_owned_at(fd, position)
+    }
+
+    /// Directory position after the last entry read, `.` and `..` included.
+    pub fn position(&self) -> i64 {
+        self.position
     }
 
     pub fn next_entry(&mut self) -> io::Result<Option<DirEntryName>> {
@@ -1190,8 +1217,8 @@ impl DirectoryStream {
     fn next_raw(&mut self) -> io::Result<Option<DirEntryName>> {
         // SAFETY: the thread-local errno location is writable for this thread.
         unsafe { *libc::__errno_location() = 0 };
-        // SAFETY: `self.0` is a live DIR stream owned by this value.
-        let entry = unsafe { libc::readdir(self.0.as_ptr()) };
+        // SAFETY: `self.dir` is a live DIR stream owned by this value.
+        let entry = unsafe { libc::readdir(self.dir.as_ptr()) };
         if entry.is_null() {
             // SAFETY: the thread-local errno location remains valid.
             let errno = unsafe { *libc::__errno_location() };
@@ -1204,6 +1231,7 @@ impl DirectoryStream {
         // SAFETY: `entry` is valid until the next directory-stream operation.
         // The name bytes are copied before returning.
         let name = unsafe {
+            self.position = (*entry).d_off;
             let name_ptr = (*entry).d_name.as_ptr();
             let len = libc::strlen(name_ptr);
             std::slice::from_raw_parts(name_ptr.cast::<u8>(), len)
@@ -1215,7 +1243,7 @@ impl DirectoryStream {
 impl Drop for DirectoryStream {
     fn drop(&mut self) {
         // SAFETY: this value uniquely owns the live DIR stream.
-        unsafe { libc::closedir(self.0.as_ptr()) };
+        unsafe { libc::closedir(self.dir.as_ptr()) };
     }
 }
 
@@ -2001,6 +2029,65 @@ mod tests {
         };
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
         assert_fd_released(file_fd, file_stat.st_dev, file_stat.st_ino);
+    }
+
+    #[test]
+    fn directory_stream_resumes_at_a_position_after_reopening() {
+        let directory = test_dir("directory-stream-position");
+        let expected: std::collections::BTreeSet<Vec<u8>> = (0..3000)
+            .map(|index| format!("entry-{index:05}").into_bytes())
+            .collect();
+        for name in &expected {
+            std::fs::write(
+                directory.path().join(std::str::from_utf8(name).unwrap()),
+                b"",
+            )
+            .unwrap();
+        }
+        let dir = std::fs::File::open(directory.path()).unwrap();
+
+        let started = DirectoryStream::open_at(dir.as_fd(), 0).unwrap();
+        assert_eq!(started.position(), 0);
+        drop(started);
+
+        let mut seen = Vec::new();
+        let mut first = DirectoryStream::open(dir.as_fd()).unwrap();
+        while seen.len() < expected.len() / 2 {
+            seen.push(first.next_entry().unwrap().unwrap().as_bytes().to_vec());
+        }
+        let position = first.position();
+        drop(first);
+
+        let mut rest = DirectoryStream::open_at(dir.as_fd(), position).unwrap();
+        assert_eq!(rest.position(), position);
+        while let Some(name) = rest.next_entry().unwrap() {
+            seen.push(name.as_bytes().to_vec());
+        }
+        assert_eq!(seen.len(), expected.len(), "no entry is read twice");
+        assert_eq!(
+            seen.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn directory_stream_rejects_an_unseekable_position() {
+        let directory = test_dir("directory-stream-bad-position");
+        let dir = std::fs::File::open(directory.path()).unwrap();
+        let error = match DirectoryStream::open_at(dir.as_fd(), -1) {
+            Ok(_) => panic!("a negative directory position was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+
+        fault::reset();
+        fault::inject_errno("directory_stream_seek", 1, libc::EIO);
+        let error = match DirectoryStream::open_at(dir.as_fd(), 0) {
+            Ok(_) => panic!("the seek fault did not fire"),
+            Err(error) => error,
+        };
+        fault::reset();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     #[test]
