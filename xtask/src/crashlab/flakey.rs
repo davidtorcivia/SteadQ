@@ -207,8 +207,16 @@ fn execute(
             .and_then(|mut f| f.write_all(b"{\"op\":\"cut\"}\n"))
             .map_err(|e| format!("{tag}: cut marker: {e}"))
             .and_then(|()| run_cmd("dmsetup", &["suspend", "--nolockfs", dm_name], &[]))
-            .and_then(|_| run_cmd("dmsetup", &["load", dm_name, "--table", &cut], &[]))
-            .and_then(|_| run_cmd("dmsetup", &["resume", dm_name], &[]));
+            .and_then(|_| {
+                run_cmd("dmsetup", &["load", dm_name, "--table", &cut], &[])
+                    .and_then(|_| run_cmd("dmsetup", &["resume", dm_name], &[]))
+                    .inspect_err(|_| {
+                        // Suspended with a failed load or resume: resume the
+                        // live table, or the workload's I/O never completes
+                        // and the kill below waits forever.
+                        let _ = run_cmd("dmsetup", &["resume", dm_name], &[]);
+                    })
+            });
         if cut_result.is_ok() {
             std::thread::sleep(Duration::from_millis(100 + rng % 200));
         }

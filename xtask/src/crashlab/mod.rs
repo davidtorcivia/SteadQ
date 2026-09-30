@@ -47,14 +47,15 @@ pub fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> 
     .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Build (if needed) and return the two crash-lab binaries. Skips the build
-/// when both already exist so the orchestrator can run under sudo without
-/// root-owned build artifacts.
+/// Build (if needed) and return the workload and checker binaries. Skips
+/// the build when every crash-lab binary (including crashlab-concurrent,
+/// the flakey workload next to them) already exists, so the orchestrator
+/// can run under sudo without root-owned build artifacts.
 pub fn ensure_bins(root: &Path) -> Result<(PathBuf, PathBuf), String> {
     let dir = root.join("target/debug");
     let workload = dir.join("crashlab-workload");
     let check = dir.join("crashlab-check");
-    if workload.is_file() && check.is_file() {
+    if workload.is_file() && check.is_file() && dir.join("crashlab-concurrent").is_file() {
         return Ok((workload, check));
     }
     let status = std::process::Command::new(cargo_bin())
