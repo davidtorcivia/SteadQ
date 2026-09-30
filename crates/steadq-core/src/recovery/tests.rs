@@ -5883,3 +5883,86 @@ fn compaction_quarantines_an_unparsed_receipt_name_as_retention_does() {
         crate::QuarantineReason::FilenameParseFailed as u16
     );
 }
+
+#[test]
+fn temp_cleanup_deletes_other_boot_temps_and_current_boot_temps_past_the_ttl() {
+    let (tmp, mut queue) = create_test_queue();
+    let ttl = queue.options.temporary_file_ttl_ns;
+    let now = ttl * 4;
+    let random = "0".repeat(32);
+    let current = tmp.path().join("tmp").join(queue.boot_id()).join("0000");
+    let other = tmp
+        .path()
+        .join("tmp/00000000-0000-0000-0000-000000000001/0000");
+    std::fs::create_dir_all(&current).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let at_ttl = format!("{:016x}.{random}.tmp", now - ttl);
+    let past_ttl = format!("{:016x}.{random}.tmp", now - ttl - 1);
+    for name in [at_ttl.as_str(), past_ttl.as_str(), "junk.tmp"] {
+        std::fs::write(current.join(name), b"").unwrap();
+    }
+    std::fs::write(other.join(&at_ttl), b"").unwrap();
+    std::fs::write(other.join("junk.tmp"), b"").unwrap();
+
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut stats = RecoveryStats::default();
+    queue.cleanup_temp_files(
+        now,
+        &WorkBudget::default(),
+        &mut RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        },
+        &mut stats,
+        u64::MAX,
+    );
+
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.temp_files_deleted, 3);
+    assert!(current.join(&at_ttl).exists());
+    assert!(!current.join(&past_ttl).exists());
+    assert!(current.join("junk.tmp").exists());
+    assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
+}
+
+#[test]
+fn compaction_counts_a_stale_compaction_temp_removal() {
+    let (tmp, mut queue) = create_test_queue();
+    queue.ensure_dir("receipts/0000000000000000/0000").unwrap();
+    let stale = tmp.path().join(format!(
+        "receipts/0000000000000000/0000/.compact-{}.tmp",
+        "0".repeat(32)
+    ));
+    std::fs::write(&stale, b"").unwrap();
+    let stats = compact_receipts_with_budget(&mut queue);
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.operations_attempted, 1);
+    assert!(!stale.exists());
+}
+
+#[test]
+fn retention_counts_a_missing_shard_as_absent_before_removing_its_bucket() {
+    let (tmp, mut queue) = create_test_queue();
+    enqueue_and_ack(&mut queue);
+    let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+    let shard_dir = receipt.parent().unwrap().to_path_buf();
+    let bucket_dir = shard_dir.parent().unwrap().to_path_buf();
+    let wall_floor = expire_receipts(&tmp, &queue, &receipt);
+    let shards = std::fs::read_dir(&bucket_dir).unwrap().count();
+    let shard = shard_dir.file_name().unwrap().to_str().unwrap();
+    fs::fault::inject_errno_for("unlinkat_dir", shard, libc::ENOENT);
+    let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+    fs::fault::reset();
+
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.receipts_expired, 1);
+    assert_eq!(stats.shards_removed as usize, shards - 1);
+    assert_eq!(stats.buckets_removed, 0);
+    // Receipt unlink, one rmdir per shard, then the bucket rmdir that the
+    // missing shard allowed, which finds that shard still there.
+    assert_eq!(stats.operations_attempted as usize, shards + 2);
+    assert!(!receipt.exists());
+    assert!(shard_dir.exists());
+    assert!(bucket_dir.exists());
+}
