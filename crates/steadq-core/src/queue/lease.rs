@@ -1,5 +1,6 @@
 // Ready-shard scan, claim, and exhausted-attempt dead-letter.
 use super::*;
+use crate::quarantine::QuarantinePublishFailure;
 
 impl Queue {
     /// Claim a ready job, returning a lease. Empty scans and transient watermark
@@ -311,15 +312,27 @@ impl Queue {
                     // A corrupt object is never delivered. Move it aside as
                     // recovery would and keep scanning for a deliverable job.
                     Err(Error::QueueCorrupt(_)) => {
-                        if self
-                            .publish_quarantine_object(
-                                shard_fd.as_fd(),
-                                entry,
-                                QuarantineReason::EnvelopeCorrupt,
-                            )
-                            .is_err()
-                        {
-                            scan_had_error = true;
+                        let reason = fs::fstatat(shard_fd.as_fd(), entry)
+                            .map_or(QuarantineReason::EnvelopeCorrupt, |stat| {
+                                corrupt_ready_reason(stat.st_mode, stat.st_nlink)
+                            });
+                        match self.publish_quarantine_object(shard_fd.as_fd(), entry, reason) {
+                            // Another actor moved it first; nothing is wrong.
+                            Ok(_)
+                            | Err(QuarantinePublishFailure::Move {
+                                failure: engine::MoveFailure::SourceMissing,
+                                ..
+                            }) => {}
+                            Err(QuarantinePublishFailure::Move {
+                                failure: engine::MoveFailure::OutcomeUnknown { phase, source },
+                                ..
+                            }) => {
+                                self.poison(PoisonReason::PostLinearizationStateUnknown);
+                                return LeaseOutcome::NotCommitted(Error::IoFailure(format!(
+                                    "corrupt ready object quarantine indeterminate at {phase:?}: {source}"
+                                )));
+                            }
+                            Err(_) => scan_had_error = true,
                         }
                         continue;
                     }
@@ -524,6 +537,20 @@ impl Queue {
         } else {
             LeaseOutcome::Empty
         }
+    }
+}
+
+/// Quarantine reason for a ready object that failed claim validation.
+pub(super) fn corrupt_ready_reason(
+    mode: libc::mode_t,
+    link_count: libc::nlink_t,
+) -> QuarantineReason {
+    if mode & libc::S_IFMT != libc::S_IFREG {
+        QuarantineReason::NonRegularFile
+    } else if link_count != 1 {
+        QuarantineReason::UnexpectedHardLink
+    } else {
+        QuarantineReason::EnvelopeCorrupt
     }
 }
 

@@ -150,6 +150,7 @@ pub(crate) fn receipt_read_open_flags() -> i32 {
     libc::O_RDONLY
         .checked_add(libc::O_CLOEXEC)
         .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .and_then(|flags| flags.checked_add(libc::O_NONBLOCK))
         .expect("receipt read flags are disjoint")
 }
 
@@ -914,7 +915,7 @@ mod tests {
     fn receipt_open_flags_are_exact() {
         assert_eq!(
             receipt_read_open_flags(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
         );
         assert_eq!(
             receipt_write_open_flags(),

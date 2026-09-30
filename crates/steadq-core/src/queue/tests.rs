@@ -7887,8 +7887,9 @@ fn mkfifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 }
 
-/// Run `op` against a FIFO at `path`. If a reader is still blocked in open(2)
-/// after 2 s, a writer open releases it and the test fails instead of hanging.
+/// Run `op` against a FIFO at `path`. If an open(2) of the FIFO is still
+/// blocked after 2 s, an O_RDWR open releases it and the test fails instead
+/// of hanging.
 fn without_blocking_on_fifo<T>(path: &Path, op: impl FnOnce() -> T) -> T {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -7898,8 +7899,11 @@ fn without_blocking_on_fifo<T>(path: &Path, op: impl FnOnce() -> T) -> T {
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !stop.load(Ordering::SeqCst) {
+                // O_RDWR on a FIFO never blocks and releases a blocked
+                // opener of either direction.
                 if std::time::Instant::now() >= deadline
                     && std::fs::OpenOptions::new()
+                        .read(true)
                         .write(true)
                         .custom_flags(libc::O_NONBLOCK)
                         .open(&path)
@@ -8342,4 +8346,107 @@ fn inspect_skips_a_receipt_that_vanishes_and_reports_one_it_cannot_open() {
     let failed = queue.inspect(&lease.job_id);
     fs::fault::reset();
     assert!(matches!(failed, Err(Error::IoFailure(_))), "{failed:?}");
+}
+
+#[test]
+fn lease_skips_a_corrupt_object_another_actor_quarantined_first() {
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject_errno("renameat2_noreplace", 1, libc::ENOENT);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert!(!queue.is_poisoned());
+}
+
+#[test]
+fn lease_poisons_when_a_corrupt_object_quarantine_is_indeterminate() {
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    let (outcome, calls) = count_calls("fsync_dir_fd", || queue.lease(0, 30_000_000_000));
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+
+    let (tmp, mut queue) = create_test_queue();
+    corrupt_ready_job(&tmp, &mut queue);
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", calls);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+    assert!(
+        matches!(outcome, LeaseOutcome::NotCommitted(Error::IoFailure(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        queue.poison_reason(),
+        Some(PoisonReason::PostLinearizationStateUnknown)
+    );
+    assert_eq!(quarantine_count(&tmp), 1);
+}
+
+#[test]
+fn corrupt_ready_reason_names_the_cause() {
+    for (mode, links, reason) in [
+        (libc::S_IFIFO | 0o600, 1, QuarantineReason::NonRegularFile),
+        (libc::S_IFDIR | 0o700, 2, QuarantineReason::NonRegularFile),
+        (
+            libc::S_IFREG | 0o600,
+            2,
+            QuarantineReason::UnexpectedHardLink,
+        ),
+        (libc::S_IFREG | 0o600, 1, QuarantineReason::EnvelopeCorrupt),
+    ] {
+        assert_eq!(super::lease::corrupt_ready_reason(mode, links), reason);
+    }
+}
+
+#[test]
+fn lease_quarantines_hard_linked_and_fifo_ready_objects_by_cause() {
+    let reasons = |queue: &Queue| {
+        queue
+            .list_quarantine()
+            .into_iter()
+            .map(|entry| entry.reason)
+            .collect::<Vec<_>>()
+    };
+
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    add_hard_link(&tmp, &format!("{dir}/{name}"), "extra");
+    assert!(matches!(
+        queue.lease(0, 30_000_000_000),
+        LeaseOutcome::Empty
+    ));
+    assert_eq!(
+        reasons(&queue),
+        vec![QuarantineReason::UnexpectedHardLink as u16]
+    );
+
+    let (tmp, mut queue) = create_test_queue();
+    let (dir, name) = first_ready_job(&tmp, &mut queue);
+    let path = tmp.path().join(dir).join(name);
+    std::fs::remove_file(&path).unwrap();
+    mkfifo(&path);
+    let outcome = without_blocking_on_fifo(&path, || queue.lease(0, 30_000_000_000));
+    assert!(matches!(outcome, LeaseOutcome::Empty), "{outcome:?}");
+    assert_eq!(
+        reasons(&queue),
+        vec![QuarantineReason::NonRegularFile as u16]
+    );
+}
+
+#[test]
+fn receipt_reads_do_not_block_on_a_fifo() {
+    let (tmp, mut queue) = create_test_queue();
+    let lease = enqueue_and_lease(&mut queue);
+    queue.verify_lease_payload(&lease).unwrap();
+    assert_eq!(queue.ack(&lease), AckOutcome::Acked);
+    let receipt = find_file_with_suffix(&tmp.path().join("receipts"), ".rct").unwrap();
+    std::fs::remove_file(&receipt).unwrap();
+    mkfifo(&receipt);
+
+    let inspected = without_blocking_on_fifo(&receipt, || queue.inspect(&lease.job_id));
+    assert_eq!(inspected, Ok(Vec::new()));
+    let probe = without_blocking_on_fifo(&receipt, || queue.check_duplicate_ack(&lease));
+    assert_eq!(probe, AckOutcome::LeaseLost);
 }
