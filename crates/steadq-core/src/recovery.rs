@@ -21,8 +21,8 @@ const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
 const RECOVERY_CURSOR_VERSION: u16 = 1;
 const RECOVERY_CURSOR_FILE: &str = "recovery-cursor.json";
 const RECOVERY_CURSOR_MAX_BYTES: u64 = 16 * 1024;
-const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_NONBLOCK;
-const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_RDWR;
+const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDWR;
 const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
@@ -104,6 +104,45 @@ fn read_recovery_directory(
                 RecoveryDirectoryError::Io(error)
             }
         })
+}
+
+/// Stream a directory of any size and keep only the names `keep` accepts.
+///
+/// Every entry read is charged to the scan budget, so memory is bounded by
+/// the kept names. A caller resuming at directory granularity must skip a
+/// directory that does not finish inside a whole pass's budget, or it never
+/// gets past it.
+fn stream_recovery_directory(
+    dir_fd: BorrowedFd<'_>,
+    deadline_mono: u64,
+    budget: &RecoveryScanBudget,
+    stats: &mut RecoveryScanStats,
+    mut keep: impl FnMut(&fs::DirEntryName) -> bool,
+) -> Result<Vec<fs::DirEntryName>, RecoveryDirectoryError> {
+    if stats.directories_read >= budget.max_directories_read {
+        return Err(RecoveryDirectoryError::BudgetExhausted);
+    }
+    stats.directories_read = stats.directories_read.saturating_add(1);
+    let mut stream = fs::DirectoryStream::open(dir_fd).map_err(RecoveryDirectoryError::Io)?;
+    let mut kept = Vec::new();
+    loop {
+        if stats.entries_read >= budget.max_entries_read
+            || stats.name_bytes_read >= budget.max_name_bytes_read
+            || Queue::budget_time_exceeded(deadline_mono).map_err(RecoveryDirectoryError::Clock)?
+        {
+            return Err(RecoveryDirectoryError::BudgetExhausted);
+        }
+        let Some(name) = stream.next_entry().map_err(RecoveryDirectoryError::Io)? else {
+            return Ok(kept);
+        };
+        stats.entries_read = stats.entries_read.saturating_add(1);
+        stats.name_bytes_read = stats
+            .name_bytes_read
+            .saturating_add(u64::try_from(name.as_bytes().len()).unwrap_or(u64::MAX));
+        if keep(&name) {
+            kept.push(name);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -245,6 +284,35 @@ fn cursor_file_is_absent(error: &io::Error) -> bool {
 fn compaction_temporary_name(name: &str) -> bool {
     let Some(random_hex) = name
         .strip_prefix(".compact-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    random_hex.len() == 32
+        && random_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A receipt that fails verification as corrupt can never pass it later, so
+/// it is quarantined; an I/O failure may be transient and is only recorded.
+fn receipt_quarantine_reason(
+    error: &crate::queue::verified::VerificationError,
+) -> Option<crate::QuarantineReason> {
+    match error {
+        crate::queue::verified::VerificationError::Io(_) => None,
+        crate::queue::verified::VerificationError::Corrupt(_) => {
+            Some(crate::QuarantineReason::EnvelopeCorrupt)
+        }
+        crate::queue::verified::VerificationError::PayloadCorrupt => {
+            Some(crate::QuarantineReason::PayloadCorrupt)
+        }
+    }
+}
+
+fn recovery_cursor_temporary_name(name: &str) -> bool {
+    let Some(random_hex) = name
+        .strip_prefix(".recovery-cursor.")
         .and_then(|name| name.strip_suffix(".tmp"))
     else {
         return false;
@@ -477,6 +545,48 @@ impl Queue {
         Ok(lock_fd)
     }
 
+    /// Remove cursor temporary files a crashed pass left behind. Only a pass
+    /// holding recovery.lock writes them, so every one found under the lock
+    /// is orphaned. Failures are recorded and do not stop recovery.
+    fn sweep_cursor_temporary_files(&self, stats: &mut RecoveryStats) {
+        let names = fs::open_directory(self.root_fd(), "control").and_then(|control_fd| {
+            let mut stream = fs::DirectoryStream::open(control_fd.as_fd())?;
+            let mut names = Vec::new();
+            while let Some(entry) = stream.next_entry()? {
+                if let Some(name) = entry
+                    .as_ascii_str()
+                    .filter(|name| recovery_cursor_temporary_name(name))
+                {
+                    names.push(name.to_string());
+                }
+            }
+            Ok((control_fd, names))
+        });
+        let (control_fd, names) = match names {
+            Ok(found) => found,
+            Err(error) => {
+                Self::record_error(
+                    stats,
+                    "recovery_cursor_sweep",
+                    "control",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        for name in names {
+            match unlink_verified(control_fd.as_fd(), &name) {
+                Ok(()) | Err(UnlinkFailure::SourceMissing) => {}
+                Err(failure) => Self::record_unlink_failure(
+                    stats,
+                    "recovery_cursor_sweep",
+                    &format!("control/{name}"),
+                    failure,
+                ),
+            }
+        }
+    }
+
     fn persist_recovery_cursor(&self) -> Result<(), Error> {
         let record = RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.to_string(),
@@ -624,6 +734,7 @@ impl Queue {
                 };
             }
         };
+        self.sweep_cursor_temporary_files(&mut stats);
         self.recovery_cursor = match load_recovery_cursor(self.root_fd(), self.format.queue_id()) {
             Ok(cursor) => cursor,
             Err(error) => {

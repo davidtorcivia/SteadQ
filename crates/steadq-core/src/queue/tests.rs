@@ -5992,7 +5992,7 @@ fn p0_01_lease_rejects_corrupt_payload_before_delivery() {
             remaining.is_none(),
             "corrupt object should not remain in ready after lease attempt, found {remaining:?}"
         );
-        let q = queue.list_quarantine();
+        let q = queue.list_quarantine().unwrap();
         assert!(
             q.iter()
                 .any(|e| e.reason == QuarantineReason::PayloadCorrupt as u16),
@@ -8405,6 +8405,7 @@ fn lease_quarantines_hard_linked_and_fifo_ready_objects_by_cause() {
     let reasons = |queue: &Queue| {
         queue
             .list_quarantine()
+            .unwrap()
             .into_iter()
             .map(|entry| entry.reason)
             .collect::<Vec<_>>()

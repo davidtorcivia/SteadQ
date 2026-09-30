@@ -5,10 +5,13 @@ use std::os::unix::io::{AsFd, BorrowedFd};
 use steadq_fs_linux as fs;
 use steadq_names;
 
-use crate::queue::engine::{move_verified_noreplace, MoveFailure};
+use crate::queue::engine::{move_verified_noreplace, unlink_verified, MoveFailure, UnlinkFailure};
 use crate::queue::Queue;
 
 const QUARANTINE_NAME_ATTEMPTS: usize = 8;
+/// Quarantine objects are published flat; older trees nested them as
+/// `quarantine/<bucket>/<shard>/<file>`, so listing descends two levels.
+const MAX_QUARANTINE_LIST_DEPTH: usize = 2;
 
 fn quarantine_destination_collision(failure: &MoveFailure) -> bool {
     matches!(failure, MoveFailure::AlreadyExists)
@@ -356,7 +359,6 @@ impl Queue {
     /// header/filename consistency, envelope digest, file size, name tag,
     /// and shard placement. In Deep mode, also hashes the payload.
     /// In Repair mode, quarantines objects that fail any structural check.
-    #[allow(clippy::too_many_arguments)]
     fn fsck_file(
         &self,
         shard_fd: BorrowedFd<'_>,
@@ -372,32 +374,32 @@ impl Queue {
         // Extract job_id, generation, attempt, max_attempts, tag from the parsed result.
         let parsed = match state_name {
             "ready" => match steadq_names::parse_ready(filename) {
-                Ok(p) => Some((p.common, p.tag, None)),
+                Ok(p) => Some((p.common, p.tag)),
                 Err(_) => match steadq_names::parse_leased(filename) {
-                    Ok(p) => Some((p.common, p.tag, Some(p.token))),
+                    Ok(p) => Some((p.common, p.tag)),
                     Err(_) => None,
                 },
             },
             "leased" => match steadq_names::parse_leased(filename) {
-                Ok(p) => Some((p.common, p.tag, Some(p.token))),
+                Ok(p) => Some((p.common, p.tag)),
                 Err(_) => None,
             },
             "delayed" => match steadq_names::parse_delayed(filename) {
-                Ok(p) => Some((p.common, p.tag, None)),
+                Ok(p) => Some((p.common, p.tag)),
                 Err(_) => None,
             },
             "dead" => match steadq_names::parse_dead(filename) {
-                Ok(p) => Some((p.common, p.tag, None)),
+                Ok(p) => Some((p.common, p.tag)),
                 Err(_) => None,
             },
             "receipts" => match steadq_names::parse_receipt(filename) {
-                Ok(p) => Some((p.common, p.tag, Some(p.token))),
+                Ok(p) => Some((p.common, p.tag)),
                 Err(_) => None,
             },
             _ => None,
         };
 
-        let (common, parsed_tag, token) = match parsed {
+        let (common, parsed_tag) = match parsed {
             Some(v) => v,
             None => {
                 report.findings.push(CorruptionFinding {
@@ -421,14 +423,17 @@ impl Queue {
         };
 
         // Stat the file.
+        // A live queue renames objects during the scan; a vanished object
+        // was moved to another state, not lost.
         let stat = match fs::fstatat(shard_fd, filename) {
             Ok(s) => s,
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
                 report.findings.push(CorruptionFinding {
                     relative_path: full_path.to_string(),
                     finding_type: "stat_failed".into(),
                     severity: FindingSeverity::Error,
-                    details: "cannot stat file".into(),
+                    details: format!("cannot stat file: {error}"),
                 });
                 return;
             }
@@ -485,12 +490,13 @@ impl Queue {
         };
         let file_fd = match fs::openat(shard_fd, filename, open_flags, 0) {
             Ok(f) => f,
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
                 report.findings.push(CorruptionFinding {
                     relative_path: full_path.to_string(),
                     finding_type: "open_failed".into(),
                     severity: FindingSeverity::Error,
-                    details: "cannot open file for reading".into(),
+                    details: format!("cannot open file for reading: {error}"),
                 });
                 return;
             }
@@ -792,14 +798,8 @@ impl Queue {
 
         // Verify name tag using path-derived context.
         let path_parts: Vec<&str> = full_path.split('/').collect();
-        let tag_ok = self.fsck_verify_name_tag(
-            state_name,
-            &path_parts,
-            &common,
-            parsed_tag,
-            token,
-            queue_id,
-        );
+        let tag_ok =
+            self.fsck_verify_name_tag(state_name, &path_parts, &common, parsed_tag, queue_id);
         if !tag_ok {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -891,7 +891,6 @@ impl Queue {
         path_parts: &[&str],
         common: &steadq_names::CommonFields,
         parsed_tag: [u8; 8],
-        _token: Option<[u8; 16]>,
         queue_id: &[u8; 16],
     ) -> bool {
         // Use canonical authentication from steadq-names instead of
@@ -1228,32 +1227,55 @@ impl Queue {
     /// List all quarantined objects under the queue root.
     ///
     /// Quarantine objects live as `quarantine/q{id}.x{reason}.raw` (flat).
-    /// Nested layouts are also scanned for compatibility with older trees.
+    /// Two nested levels are also scanned for compatibility with older trees.
     /// Every step is fd-relative with `O_NOFOLLOW`, like the rest of the
-    /// queue: a symlink under `quarantine/` is never followed.
-    pub fn list_quarantine(&self) -> Vec<QuarantineEntry> {
+    /// queue: a symlink under `quarantine/` is never followed. A missing
+    /// `quarantine/` lists as empty; any other read failure is an error, so
+    /// an unreadable directory never reads as an empty quarantine.
+    pub fn list_quarantine(&self) -> std::io::Result<Vec<QuarantineEntry>> {
         let mut out = Vec::new();
-        if let Ok(fd) = fs::open_directory(self.root_fd(), "quarantine") {
-            collect_quarantine_entries(fd.as_fd(), "quarantine", &mut out);
+        match fs::open_directory(self.root_fd(), "quarantine") {
+            Ok(fd) => collect_quarantine_entries(
+                fd.as_fd(),
+                "quarantine",
+                MAX_QUARANTINE_LIST_DEPTH,
+                &mut out,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        out
+        Ok(out)
     }
 
     /// Find a quarantined object by quarantine id.
-    pub fn find_quarantine(&self, quarantine_id: &[u8; 16]) -> Option<QuarantineEntry> {
-        self.list_quarantine()
+    pub fn find_quarantine(
+        &self,
+        quarantine_id: &[u8; 16],
+    ) -> std::io::Result<Option<QuarantineEntry>> {
+        Ok(self
+            .list_quarantine()?
             .into_iter()
-            .find(|e| e.quarantine_id == *quarantine_id)
+            .find(|e| e.quarantine_id == *quarantine_id))
     }
 
     /// Remove a quarantined object by id. Returns true if a file was removed.
     pub fn remove_quarantine(&self, quarantine_id: &[u8; 16]) -> Result<bool, std::io::Error> {
-        let Some(entry) = self.find_quarantine(quarantine_id) else {
+        let Some(entry) = self.find_quarantine(quarantine_id)? else {
             return Ok(false);
         };
         let (dir_fd, name) = self.open_quarantine_parent(&entry)?;
-        fs::unlinkat(dir_fd.as_fd(), name)?;
-        Ok(true)
+        match unlink_verified(dir_fd.as_fd(), name) {
+            Ok(()) => Ok(true),
+            Err(UnlinkFailure::SourceMissing) => Ok(false),
+            Err(UnlinkFailure::NotCommitted { phase, source }) => Err(std::io::Error::new(
+                source.kind(),
+                format!("quarantine removal not committed at phase={phase:?}: {source}"),
+            )),
+            Err(UnlinkFailure::OutcomeUnknown { phase, source }) => Err(std::io::Error::new(
+                source.kind(),
+                format!("quarantine removal outcome unknown at phase={phase:?}: {source}"),
+            )),
+        }
     }
 
     /// Copy a quarantined object's raw bytes to `output`. Returns bytes written.
@@ -1262,7 +1284,7 @@ impl Queue {
         quarantine_id: &[u8; 16],
         output: &std::path::Path,
     ) -> Result<u64, std::io::Error> {
-        let Some(entry) = self.find_quarantine(quarantine_id) else {
+        let Some(entry) = self.find_quarantine(quarantine_id)? else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "quarantine object not found",
@@ -1296,12 +1318,11 @@ pub struct QuarantineEntry {
 fn collect_quarantine_entries(
     dir_fd: BorrowedFd<'_>,
     relative_dir: &str,
+    depth: usize,
     out: &mut Vec<QuarantineEntry>,
-) {
-    let Ok(entries) = fs::read_dir_entries(dir_fd) else {
-        return;
-    };
-    for entry in &entries {
+) -> std::io::Result<()> {
+    let mut entries = fs::DirectoryStream::open(dir_fd)?;
+    while let Some(entry) = entries.next_entry()? {
         let Some(name) = entry.as_ascii_str() else {
             continue;
         };
@@ -1314,10 +1335,29 @@ fn collect_quarantine_entries(
             });
             continue;
         }
-        if let Ok(child_fd) = fs::open_directory(dir_fd, name) {
-            collect_quarantine_entries(child_fd.as_fd(), &format!("{relative_dir}/{name}"), out);
+        if depth == 0 {
+            continue;
+        }
+        match fs::open_directory(dir_fd, name) {
+            Ok(child_fd) => collect_quarantine_entries(
+                child_fd.as_fd(),
+                &format!("{relative_dir}/{name}"),
+                depth - 1,
+                out,
+            )?,
+            // Stray files, symlinks, and entries removed during the scan.
+            Err(error) if quarantine_list_skips(&error) => {}
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+fn quarantine_list_skips(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTDIR | libc::ELOOP | libc::ENOENT)
+    )
 }
 
 #[cfg(test)]
@@ -1437,6 +1477,163 @@ mod tests {
     }
 
     #[test]
+    fn fsck_ignores_an_object_moved_during_the_scan() {
+        for (fault, count, finding_type) in
+            [("fstatat", 1, "stat_failed"), ("openat", 1, "open_failed")]
+        {
+            for errno in [libc::ENOENT, libc::EIO] {
+                let tmp = TempDir::new().unwrap();
+                init_test_queue(tmp.path());
+                let mut queue = open_test_queue(tmp.path());
+                assert!(matches!(
+                    queue.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"moving".to_vec(),
+                        ..Default::default()
+                    }),
+                    crate::EnqueueOutcome::Committed(_)
+                ));
+                fs::fault::reset();
+                fs::fault::inject_errno(fault, count, errno);
+                let report = queue.fsck(&FsckOptions::default());
+                fs::fault::reset();
+                if errno == libc::ENOENT {
+                    assert!(report.findings.is_empty(), "{fault}: {:?}", report.findings);
+                } else {
+                    assert_eq!(report.findings.len(), 1, "{fault}: {:?}", report.findings);
+                    assert_eq!(report.findings[0].finding_type, finding_type);
+                    assert!(
+                        report.findings[0].details.contains("os error 5"),
+                        "{:?}",
+                        report.findings
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_listing_fails_instead_of_reading_empty() {
+        for (fault, count) in [("open_directory", 1), ("directory_stream_next", 1)] {
+            let tmp = TempDir::new().unwrap();
+            init_test_queue(tmp.path());
+            let name = steadq_names::quarantine_filename(&[0x42; 16], 0x0001);
+            std::fs::write(tmp.path().join("quarantine").join(&name), b"q").unwrap();
+            let queue = open_test_queue(tmp.path());
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let listed = queue.list_quarantine();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let removed = queue.remove_quarantine(&[0x42; 16]);
+            fs::fault::reset();
+            assert_eq!(
+                listed.unwrap_err().raw_os_error(),
+                Some(libc::EIO),
+                "{fault}"
+            );
+            assert_eq!(
+                removed.unwrap_err().raw_os_error(),
+                Some(libc::EIO),
+                "{fault}"
+            );
+            assert!(tmp.path().join("quarantine").join(&name).exists());
+        }
+    }
+
+    #[test]
+    fn quarantine_listing_fails_when_a_legacy_subdirectory_cannot_open() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        std::fs::create_dir(tmp.path().join("quarantine/legacy")).unwrap();
+        let queue = open_test_queue(tmp.path());
+        fs::fault::reset();
+        fs::fault::track();
+        queue.list_quarantine().unwrap();
+        // The scan's last two open_directory calls are the subdirectory open
+        // and the stream's reopen of it.
+        let child_open = fs::fault::call_count("open_directory") - 1;
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", child_open, libc::EIO);
+        let listed = queue.list_quarantine();
+        fs::fault::reset();
+        assert_eq!(listed.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn quarantine_listing_treats_a_missing_directory_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let queue = open_test_queue(tmp.path());
+        std::fs::remove_dir(tmp.path().join("quarantine")).unwrap();
+        assert!(queue.list_quarantine().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quarantine_listing_descends_only_the_legacy_depth() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let root = tmp.path().join("quarantine");
+        let shallow = root.join("0000000000000000/0000");
+        let deep = shallow.join("extra");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("stray.txt"), b"stray").unwrap();
+        std::os::unix::fs::symlink(tmp.path(), root.join("link")).unwrap();
+        let listed_name = steadq_names::quarantine_filename(&[0x01; 16], 0x0001);
+        let hidden_name = steadq_names::quarantine_filename(&[0x02; 16], 0x0001);
+        std::fs::write(shallow.join(&listed_name), b"listed").unwrap();
+        std::fs::write(deep.join(&hidden_name), b"hidden").unwrap();
+        let queue = open_test_queue(tmp.path());
+        let listed = queue.list_quarantine().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(
+            listed[0].relative_path,
+            format!("quarantine/0000000000000000/0000/{listed_name}")
+        );
+    }
+
+    #[test]
+    fn quarantine_listing_skips_only_non_directory_entries() {
+        for (errno, skipped) in [
+            (libc::ENOTDIR, true),
+            (libc::ELOOP, true),
+            (libc::ENOENT, true),
+            (libc::EIO, false),
+            (libc::EACCES, false),
+        ] {
+            assert_eq!(
+                quarantine_list_skips(&std::io::Error::from_raw_os_error(errno)),
+                skipped,
+                "errno={errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_removal_reports_unsynced_unlink() {
+        let tmp = TempDir::new().unwrap();
+        init_test_queue(tmp.path());
+        let name = steadq_names::quarantine_filename(&[0x42; 16], 0x0001);
+        std::fs::write(tmp.path().join("quarantine").join(&name), b"q").unwrap();
+        let queue = open_test_queue(tmp.path());
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let removed = queue.remove_quarantine(&[0x42; 16]);
+        fs::fault::reset();
+        let error = removed.unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"), "{error}");
+        assert!(!tmp.path().join("quarantine").join(&name).exists());
+
+        std::fs::write(tmp.path().join("quarantine").join(&name), b"q").unwrap();
+        fs::fault::inject_errno("unlinkat", 1, libc::EIO);
+        let removed = queue.remove_quarantine(&[0x42; 16]);
+        fs::fault::reset();
+        let error = removed.unwrap_err();
+        assert!(error.to_string().contains("not committed"), "{error}");
+        assert!(tmp.path().join("quarantine").join(&name).exists());
+    }
+
+    #[test]
     fn fsck_ignores_a_directory_removed_during_the_scan() {
         let tmp = TempDir::new().unwrap();
         init_test_queue(tmp.path());
@@ -1492,14 +1689,14 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         let queue = open_test_queue(tmp.path());
 
-        let entry = queue.find_quarantine(&[0x42; 16]).unwrap();
+        let entry = queue.find_quarantine(&[0x42; 16]).unwrap().unwrap();
         assert_eq!(entry.relative_path, format!("quarantine/{name}"));
         let export = queue.export_quarantine(&[0x42; 16], &tmp.path().join("export.raw"));
         assert!(export.is_err(), "export followed the symlink");
         assert!(queue.remove_quarantine(&[0x42; 16]).unwrap());
         assert!(!link.exists() && !link.is_symlink());
         assert_eq!(std::fs::read(&victim).unwrap(), b"outside the queue");
-        assert!(queue.find_quarantine(&[0x42; 16]).is_none());
+        assert!(queue.find_quarantine(&[0x42; 16]).unwrap().is_none());
     }
     use crate::queue::{CreateOptions, EnqueueInput, OpenOptions, Queue};
     use tempfile::TempDir;
@@ -2000,12 +2197,12 @@ mod tests {
         let payload = b"quarantined-bytes";
         std::fs::write(qdir.join(&name), payload).unwrap();
 
-        let listed = queue.list_quarantine();
+        let listed = queue.list_quarantine().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].quarantine_id, qid);
         assert_eq!(listed[0].reason, reason);
 
-        let found = queue.find_quarantine(&qid).unwrap();
+        let found = queue.find_quarantine(&qid).unwrap().unwrap();
         assert_eq!(found.filename, name);
 
         let out = tmp.path().join("export.raw");
@@ -2014,7 +2211,7 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), payload);
 
         assert!(queue.remove_quarantine(&qid).unwrap());
-        assert!(queue.list_quarantine().is_empty());
+        assert!(queue.list_quarantine().unwrap().is_empty());
         assert!(!queue.remove_quarantine(&qid).unwrap());
     }
 
@@ -2282,7 +2479,7 @@ mod tests {
         assert_eq!(std::fs::read(&candidate).unwrap(), b"replacement");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"corrupt");
         assert!(report.quarantined.is_empty());
-        assert!(queue.list_quarantine().is_empty());
+        assert!(queue.list_quarantine().unwrap().is_empty());
     }
 
     #[test]
@@ -2352,7 +2549,7 @@ mod tests {
 
         assert!(!candidate.exists());
         assert_eq!(report.quarantined.len(), 1);
-        assert_eq!(queue.list_quarantine().len(), 1);
+        assert_eq!(queue.list_quarantine().unwrap().len(), 1);
         assert!(!report
             .findings
             .iter()

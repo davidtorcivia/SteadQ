@@ -529,7 +529,7 @@ fn cmd_quarantine_inspect(path: PathBuf, quarantine_id: String) -> ExitCode {
         Err(code) => return code,
     };
     match queue.find_quarantine(&qid) {
-        Some(entry) => {
+        Ok(Some(entry)) => {
             let abs = path.join(&entry.relative_path);
             let meta = std::fs::metadata(&abs).ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -541,9 +541,13 @@ fn cmd_quarantine_inspect(path: PathBuf, quarantine_id: String) -> ExitCode {
             );
             exit(EXIT_SUCCESS)
         }
-        None => {
+        Ok(None) => {
             eprintln!("not found");
             exit(EXIT_ORDINARY)
+        }
+        Err(e) => {
+            eprintln!("inspect failed: {e}");
+            exit_io(&e)
         }
     }
 }
@@ -553,7 +557,14 @@ fn cmd_quarantine_list(path: PathBuf) -> ExitCode {
         Ok(q) => q,
         Err(code) => return code,
     };
-    for entry in queue.list_quarantine() {
+    let entries = match queue.list_quarantine() {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("list failed: {e}");
+            return exit_io(&e);
+        }
+    };
+    for entry in entries {
         println!(
             "{} reason=0x{:04x} {}",
             steadq_names::hex_encode(&entry.quarantine_id),

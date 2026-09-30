@@ -1469,24 +1469,33 @@ fn readdir_permutations_preserve_promotion_budget_boundaries() {
     drop(queue);
     assert!(delayed.iter().all(|path| path.exists()));
 
-    for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+    for (pass, &(rotation, reversed)) in RECOVERY_READ_PERMUTATIONS.iter().enumerate() {
         let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
-        let scan_budget = RecoveryScanBudget::default();
-        let mut scan_stats = RecoveryScanStats::default();
-        let mut scan = RecoveryScanContext {
-            budget: &scan_budget,
-            stats: &mut scan_stats,
-        };
-        let mut stats = RecoveryStats::default();
-        let wall_floor = queue.authenticated_wall_floor().unwrap();
-        queue.promote_delayed(wall_floor, &budget, &mut scan, &mut stats, u64::MAX);
-        fs::fault::reset();
-        assert_eq!(stats.operations_attempted, 1, "pass={pass}");
-        assert_eq!(
-            stats.delayed_promoted, 1,
-            "pass={pass} errors={:?}",
-            stats.errors
-        );
+        // Removing a drained shard or bucket spends the one operation too.
+        for attempt in 0.. {
+            fs::fault::permute_readdir(rotation, reversed);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            queue.promote_delayed(wall_floor, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            if stats.delayed_promoted == 1 {
+                break;
+            }
+            assert_eq!(
+                stats.shards_removed + stats.buckets_removed,
+                1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            assert!(attempt < 3, "pass={pass} made no promotion progress");
+        }
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
         assert_removed_prefix(&delayed, pass);
@@ -3103,13 +3112,16 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
         max_duration_ms: 5_000,
     };
 
+    // The malformed receipt sorts first and its quarantine spends the one
+    // operation; the valid receipt is compacted on the next pass.
     let first = queue.recover(&budget);
-    assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+    assert_eq!(first.receipts_compacted, 0, "errors: {:?}", first.errors);
+    assert_eq!(first.quarantined.len(), 1, "errors: {:?}", first.errors);
     assert!(first
         .errors
         .iter()
         .any(|error| error.operation == "receipt_compact_invalid"));
-    assert!(queue.recovery_cursor.compact_receipts.is_none());
+    assert!(!malformed.exists());
     drop(queue);
 
     let mut reopened = Queue::open(
@@ -3122,9 +3134,8 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
     .unwrap();
     let second = reopened.recover(&budget);
 
-    assert_eq!(second.receipts_compacted, 0, "errors: {:?}", second.errors);
+    assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
     assert_eq!(std::fs::metadata(receipt).unwrap().len(), 128);
-    assert!(malformed.exists());
 }
 
 #[test]
@@ -3270,6 +3281,7 @@ fn recovery_quarantines_malformed_leased_filename() {
     );
     assert!(queue
         .list_quarantine()
+        .unwrap()
         .iter()
         .any(|entry| entry.reason == crate::QuarantineReason::FilenameParseFailed as u16));
     assert!(!dir.join("not-a-leased-name.sqj").exists());
@@ -3528,7 +3540,7 @@ fn reap_to_dead_uses_phase_aware_move_executor() {
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
         let shard_fd = open_relative(queue.root_fd(), &format!("ready/{}", parts[1])).unwrap();
-        let result = queue.reap_colocated_to_dead(
+        let result = queue.reap_to_dead(
             shard_fd.as_fd(),
             parts[2],
             &common,
@@ -4021,6 +4033,71 @@ fn compaction_temporary_name_is_strict() {
 }
 
 #[test]
+fn recovery_cursor_temporary_name_is_strict() {
+    assert!(recovery_cursor_temporary_name(
+        ".recovery-cursor.0123456789abcdef0123456789abcdef.tmp"
+    ));
+    for invalid in [
+        ".recovery-cursor.0123456789abcdef0123456789abcde.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdef0.tmp",
+        ".recovery-cursor.0123456789ABCDEF0123456789ABCDEF.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdeg.tmp",
+        "recovery-cursor.0123456789abcdef0123456789abcdef.tmp",
+        ".recovery-cursor.0123456789abcdef0123456789abcdef.json",
+        "recovery-cursor.json",
+    ] {
+        assert!(!recovery_cursor_temporary_name(invalid), "{invalid}");
+    }
+}
+
+#[test]
+fn recovery_sweeps_orphaned_cursor_temporary_files() {
+    let (tmp, mut queue) = create_test_queue();
+    let control = tmp.path().join("control");
+    let orphan = control.join(".recovery-cursor.0123456789abcdef0123456789abcdef.tmp");
+    let unrelated = control.join(".recovery-cursor.unrelated.tmp");
+    std::fs::write(&orphan, b"{}").unwrap();
+    std::fs::write(&unrelated, b"{}").unwrap();
+    let stats = queue.recover(&WorkBudget::default());
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert!(!orphan.exists());
+    assert!(unrelated.exists());
+    assert!(control.join(RECOVERY_CURSOR_FILE).exists());
+}
+
+#[test]
+fn recovery_cursor_sweep_failures_are_recorded_and_recovery_continues() {
+    for (fault, count, operation, orphan_remains) in [
+        ("open_directory", 2, "recovery_cursor_sweep", true),
+        ("unlinkat", 1, "recovery_cursor_sweep_not_committed", true),
+        (
+            "fsync_dir_fd",
+            1,
+            "recovery_cursor_sweep_outcome_unknown",
+            false,
+        ),
+    ] {
+        let (tmp, mut queue) = create_test_queue();
+        let orphan = tmp
+            .path()
+            .join("control/.recovery-cursor.0123456789abcdef0123456789abcdef.tmp");
+        std::fs::write(&orphan, b"{}").unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, count, libc::EIO);
+        let stats = queue.recover(&WorkBudget::default());
+        fs::fault::reset();
+        assert_eq!(stats.errors.len(), 1, "{fault}: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, operation);
+        assert_eq!(orphan.exists(), orphan_remains, "{fault}");
+        assert!(tmp
+            .path()
+            .join("control")
+            .join(RECOVERY_CURSOR_FILE)
+            .exists());
+    }
+}
+
+#[test]
 fn recovery_compaction_fault_matrix_preserves_receipt_and_replays() {
     for (fault, count, errno, expected_operation, expected_phase, replaced) in [
         (
@@ -4234,26 +4311,26 @@ fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
         .iter()
         .any(|snapshot| snapshot.state == "receipt"));
 
-    let stats = queue.recover(&WorkBudget::default());
-    assert_eq!(stats.receipts_compacted, 0);
-    assert!(stats
-        .errors
-        .iter()
-        .any(|error| error.operation == "receipt_compact_invalid"));
-    assert!(std::fs::metadata(&receipt).unwrap().len() > 128);
-
     let report = queue.fsck(&crate::FsckOptions::default());
     assert!(report
         .findings
         .iter()
         .any(|finding| finding.finding_type == "receipt_verification_failed"));
 
-    let repair = queue.fsck(&crate::FsckOptions {
-        mode: crate::FsckMode::Repair,
-        depth: crate::FsckDepth::Structural,
-    });
-    assert_eq!(repair.quarantined.len(), 1);
+    let stats = queue.recover(&WorkBudget::default());
+    assert_eq!(stats.receipts_compacted, 0);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "receipt_compact_invalid"));
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
     assert!(!receipt.exists());
+    let quarantined = queue.list_quarantine().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        quarantined[0].reason,
+        crate::QuarantineReason::PayloadCorrupt as u16
+    );
 }
 
 #[test]
@@ -4799,6 +4876,7 @@ fn recovery_does_not_invent_terminal_bucket_without_wall_floor() {
     );
 
     assert_eq!(stats.leases_to_dead, 0);
+    assert_eq!(stats.operations_attempted, 0);
     assert!(stats
         .errors
         .iter()
@@ -4858,7 +4936,7 @@ fn promote_quarantines_a_malformed_delayed_name() {
         stats.errors
     );
     assert!(!stray.exists());
-    assert_eq!(queue.list_quarantine().len(), 1);
+    assert_eq!(queue.list_quarantine().unwrap().len(), 1);
 }
 
 #[test]
@@ -4880,5 +4958,528 @@ fn receipt_retention_quarantines_a_malformed_receipt_name() {
         stats.errors
     );
     assert!(!stray.exists());
-    assert_eq!(queue.list_quarantine().len(), 1);
+    assert_eq!(queue.list_quarantine().unwrap().len(), 1);
+}
+
+fn reap_expired_with_scan_budget(
+    queue: &mut Queue,
+    scan_budget: &RecoveryScanBudget,
+) -> RecoveryStats {
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    stats
+}
+
+fn lease_one_per_shard(shard_count: u32) -> (TempDir, Queue) {
+    let (tmp, mut queue) = create_test_queue_with_shards(shard_count);
+    for shard in 0..shard_count {
+        enqueue_for_shard(&mut queue, &tmp, shard, None, b"colocated");
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+    }
+    (tmp, queue)
+}
+
+#[test]
+fn colocated_reap_persists_the_shard_when_the_scan_budget_runs_out() {
+    let (_tmp, mut queue) = lease_one_per_shard(2);
+    let one_read = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let first = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(first.leases_reaped, 0, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(0));
+
+    // Resuming at a saved shard skips leased/, so the one read reaches it.
+    let second = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+
+    let third = reap_expired_with_scan_budget(&mut queue, &one_read);
+    assert_eq!(third.leases_reaped, 1, "errors: {:?}", third.errors);
+    assert!(!third.budget_exhausted);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+fn stream_fixture() -> (TempDir, std::fs::File) {
+    let tmp = TempDir::new().unwrap();
+    for name in ["a", "bb", "ccc"] {
+        std::fs::write(tmp.path().join(name), b"x").unwrap();
+    }
+    let dir = std::fs::File::open(tmp.path()).unwrap();
+    (tmp, dir)
+}
+
+fn stream_with(
+    dir: &std::fs::File,
+    budget: &RecoveryScanBudget,
+    deadline_mono: u64,
+) -> (
+    Result<Vec<fs::DirEntryName>, RecoveryDirectoryError>,
+    RecoveryScanStats,
+) {
+    let mut stats = RecoveryScanStats::default();
+    let result =
+        stream_recovery_directory(dir.as_fd(), deadline_mono, budget, &mut stats, |name| {
+            name.as_bytes().len() == 2
+        });
+    (result, stats)
+}
+
+#[test]
+fn streamed_directory_charges_every_entry_and_keeps_only_matches() {
+    let (_tmp, dir) = stream_fixture();
+    let unbounded = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let (result, stats) = stream_with(&dir, &unbounded, u64::MAX);
+    let kept = result.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].as_bytes(), b"bb");
+    assert_eq!(
+        stats,
+        RecoveryScanStats {
+            directories_read: 1,
+            entries_read: 3,
+            name_bytes_read: 6,
+        }
+    );
+
+    // The end of the stream is only observed with budget left over.
+    for (entries, name_bytes, completes) in [
+        (3, u64::MAX, false),
+        (4, u64::MAX, true),
+        (u64::MAX, 6, false),
+        (u64::MAX, 7, true),
+    ] {
+        let budget = RecoveryScanBudget {
+            max_directories_read: 1,
+            max_entries_read: entries,
+            max_name_bytes_read: name_bytes,
+        };
+        let (result, _) = stream_with(&dir, &budget, u64::MAX);
+        match result {
+            Ok(_) => assert!(completes, "entries={entries} bytes={name_bytes}"),
+            Err(RecoveryDirectoryError::BudgetExhausted) => {
+                assert!(!completes, "entries={entries} bytes={name_bytes}")
+            }
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn streamed_directory_refuses_without_read_or_time_budget() {
+    let (_tmp, dir) = stream_fixture();
+    let no_reads = RecoveryScanBudget {
+        max_directories_read: 0,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let (result, stats) = stream_with(&dir, &no_reads, u64::MAX);
+    assert!(matches!(
+        result,
+        Err(RecoveryDirectoryError::BudgetExhausted)
+    ));
+    assert_eq!(stats, RecoveryScanStats::default());
+
+    let (result, stats) = stream_with(&dir, &RecoveryScanBudget::default(), 0);
+    assert!(matches!(
+        result,
+        Err(RecoveryDirectoryError::BudgetExhausted)
+    ));
+    assert_eq!(stats.directories_read, 1);
+    assert_eq!(stats.entries_read, 0);
+}
+
+#[test]
+fn streamed_directory_classifies_clock_and_read_failures() {
+    let (_tmp, dir) = stream_fixture();
+    fs::fault::reset();
+    fs::fault::inject_errno("clock_monotonic_ns", 1, libc::EIO);
+    let (clock, _) = stream_with(&dir, &RecoveryScanBudget::default(), u64::MAX);
+    fs::fault::inject_errno("directory_stream_next", 1, libc::EIO);
+    let (read, _) = stream_with(&dir, &RecoveryScanBudget::default(), u64::MAX);
+    fs::fault::reset();
+    assert!(matches!(
+        clock,
+        Err(RecoveryDirectoryError::Clock(ref error)) if error.raw_os_error() == Some(libc::EIO)
+    ));
+    assert!(matches!(
+        read,
+        Err(RecoveryDirectoryError::Io(ref error)) if error.raw_os_error() == Some(libc::EIO)
+    ));
+}
+
+#[test]
+fn colocated_reap_streams_a_ready_shard_past_the_bounded_read_size() {
+    let (tmp, mut queue) = lease_one_per_shard(1);
+    for payload in [b"backlog-a" as &[u8], b"backlog-b"] {
+        enqueue_for_shard(&mut queue, &tmp, 0, None, payload);
+    }
+    // Three entries fit this budget; a bounded read would demand 65,537.
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let small = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: 4,
+        max_name_bytes_read: u64::MAX,
+    };
+    let stats = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn colocated_reap_skips_a_shard_that_outgrows_a_whole_pass() {
+    let (tmp, mut queue) = lease_one_per_shard(2);
+    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-a");
+    enqueue_for_shard(&mut queue, &tmp, 1, None, b"backlog-b");
+    // Shard 0 holds one entry and fits; shard 1 holds three and does not.
+    let small = RecoveryScanBudget {
+        max_directories_read: 2,
+        max_entries_read: 3,
+        max_name_bytes_read: u64::MAX,
+    };
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let first = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    assert!(!first.phase_blocked);
+    assert_eq!(first.scan_skips, 1);
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, Some(1));
+
+    // Resumed with a fresh budget, shard 1 still does not fit, so the phase
+    // moves on instead of stalling every later pass.
+    let second = reap_expired_with_scan_budget(&mut queue, &small);
+    assert_eq!(second.leases_reaped, 0, "errors: {:?}", second.errors);
+    assert!(!second.budget_exhausted);
+    assert!(second.phase_blocked);
+    assert_eq!(second.scan_skips, 1);
+    assert!(second
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0001"));
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn colocated_ready_stream_failure_blocks_and_moves_to_the_next_shard() {
+    let (_tmp, mut queue) = lease_one_per_shard(2);
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    fs::fault::reset();
+    fs::fault::inject_errno("directory_stream_next", 1, libc::EIO);
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    fs::fault::reset();
+    assert!(stats.phase_blocked);
+    assert_eq!(stats.scan_skips, 1);
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_entry_read" && error.relative_path == "ready/0000"));
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+fn corrupt_header(path: &Path) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(&[0xff; 4], 0).unwrap();
+}
+
+#[test]
+fn colocated_reap_quarantines_a_corrupt_expired_lease() {
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    let lease = lease_recovery_job(&mut queue, 3);
+    let source = tmp.path().join(&lease.exact_source_path);
+    corrupt_header(&source);
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    assert_eq!(stats.leases_reaped, 0);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.quarantined[0].relative_path, lease.exact_source_path);
+    assert!(!source.exists());
+    assert_eq!(queue.recovery_cursor.reap_colocated_shard, None);
+}
+
+#[test]
+fn colocated_reap_does_not_quarantine_on_validation_io_failure() {
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    let lease = lease_recovery_job(&mut queue, 3);
+    let source = tmp.path().join(&lease.exact_source_path);
+    queue.recovery_cursor.reap_colocated_shard = Some(0);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    fs::fault::reset();
+    fs::fault::inject_errno("fstat", 1, libc::EIO);
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(wall_floor),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    fs::fault::reset();
+    assert!(stats.quarantined.is_empty());
+    assert_eq!(stats.leases_reaped, 0);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "reap_validate"));
+    assert!(source.exists());
+}
+
+fn enqueue_delayed_next_bucket(queue: &mut Queue, tmp: &TempDir) -> (PathBuf, u64) {
+    let not_before = queue
+        .authenticated_wall_floor()
+        .unwrap()
+        .unix_ns()
+        .checked_add(queue.format.delayed_bucket_width_ns())
+        .unwrap();
+    let ticket = enqueue_for_shard(queue, tmp, 0, Some(not_before), b"delayed cleanup");
+    let bucket_name = ticket.expected_relative_path.split('/').nth(1).unwrap();
+    let bucket = steadq_names::bucket_from_hex(bucket_name).unwrap();
+    (tmp.path().join("delayed").join(bucket_name), bucket)
+}
+
+#[test]
+fn promotion_removes_a_bucket_once_its_end_has_passed() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+    write_wall_watermark(&tmp, bucket + 1);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 2);
+    assert_eq!(stats.buckets_removed, 1);
+    assert_eq!(stats.operations_attempted, 4);
+    assert!(!bucket_dir.exists());
+}
+
+#[test]
+fn promotion_treats_only_a_missing_source_as_drained() {
+    // ENOENT reads as a vanished source, so the shard removal is attempted
+    // and finds the injected survivor; EIO leaves the shard alone.
+    for (errno, operations) in [(libc::ENOENT, 2), (libc::EIO, 1)] {
+        let (tmp, mut queue) = create_test_queue_with_shards(1);
+        let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+        write_wall_watermark(&tmp, bucket + 1);
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+        let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+        fs::fault::reset();
+        assert_eq!(stats.delayed_promoted, 0);
+        assert_eq!(stats.operations_attempted, operations, "errno={errno}");
+        assert_eq!(stats.shards_removed, 0);
+        assert!(bucket_dir.join("0000").exists());
+    }
+}
+
+#[test]
+fn promotion_keeps_the_current_bucket() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let (bucket_dir, bucket) = enqueue_delayed_next_bucket(&mut queue, &tmp);
+    write_wall_watermark(&tmp, bucket);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 0);
+    assert_eq!(stats.buckets_removed, 0);
+    assert!(bucket_dir.join("0000").exists());
+}
+
+#[test]
+fn promotion_keeps_a_drained_shard_that_still_holds_an_entry() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let bucket = tmp.path().join("delayed/0000000000000000");
+    std::fs::create_dir_all(bucket.join("0000")).unwrap();
+    std::fs::create_dir_all(bucket.join("0001")).unwrap();
+    std::fs::write(bucket.join("0000/stray.txt"), b"stray").unwrap();
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 1);
+    assert_eq!(stats.buckets_removed, 0);
+    assert_eq!(stats.operations_attempted, 1);
+    assert!(bucket.join("0000/stray.txt").exists());
+    assert!(!bucket.join("0001").exists());
+}
+
+#[test]
+fn promotion_directory_removal_preserves_phase() {
+    for (fixture, fault, phase, outcome_unknown) in [
+        (
+            "0000000000000000/0000",
+            "unlinkat_dir",
+            crate::queue::engine::RemoveDirectoryPhase::Remove,
+            false,
+        ),
+        (
+            "0000000000000000/0000",
+            "fsync_dir_fd",
+            crate::queue::engine::RemoveDirectoryPhase::ParentFsync,
+            true,
+        ),
+        (
+            "0000000000000000",
+            "unlinkat_dir",
+            crate::queue::engine::RemoveDirectoryPhase::Remove,
+            false,
+        ),
+    ] {
+        let (tmp, mut queue) = create_test_queue_with_shards(1);
+        std::fs::create_dir_all(tmp.path().join("delayed").join(fixture)).unwrap();
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, 1, libc::EIO);
+        let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+        fs::fault::reset();
+        let operation = if fixture.contains('/') {
+            "promote_shard_remove"
+        } else {
+            "promote_bucket_remove"
+        };
+        assert_recorded_remove_directory_failure(
+            &stats,
+            operation,
+            &format!("delayed/{fixture}"),
+            phase,
+            outcome_unknown,
+        );
+        assert!(tmp.path().join("delayed/0000000000000000").exists());
+    }
+}
+
+#[test]
+fn receipt_quarantine_reason_skips_only_io_failures() {
+    use crate::queue::verified::VerificationError;
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::Io("eio".into())),
+        None
+    );
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::Corrupt("bad".into())),
+        Some(crate::QuarantineReason::EnvelopeCorrupt)
+    );
+    assert_eq!(
+        receipt_quarantine_reason(&VerificationError::PayloadCorrupt),
+        Some(crate::QuarantineReason::PayloadCorrupt)
+    );
+}
+
+/// Acks two jobs, corrupts the payload of the receipt that sorts first, and
+/// returns (corrupt, valid).
+fn two_receipts_first_corrupt(tmp: &TempDir, queue: &mut Queue) -> (PathBuf, PathBuf) {
+    enqueue_and_ack(queue);
+    enqueue_and_ack(queue);
+    let mut receipts = Vec::new();
+    find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+    receipts.sort();
+    assert_eq!(receipts.len(), 2);
+    let mut bytes = std::fs::read(&receipts[0]).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&receipts[0], &bytes).unwrap();
+    (receipts[0].clone(), receipts[1].clone())
+}
+
+fn expire_receipts(tmp: &TempDir, queue: &Queue, receipt: &Path) -> WallFloor {
+    let receipt_bucket = receipt
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(steadq_names::bucket_from_hex)
+        .unwrap();
+    let expiration_floor = (receipt_bucket + 2) * queue.format.terminal_bucket_width_ns();
+    write_wall_watermark(
+        tmp,
+        steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns())
+            .unwrap(),
+    );
+    queue.authenticated_wall_floor().unwrap()
+}
+
+#[test]
+fn receipt_compaction_quarantines_a_corrupt_receipt_and_continues() {
+    let (tmp, mut queue) = create_test_queue();
+    let (corrupt, valid) = two_receipts_first_corrupt(&tmp, &mut queue);
+    let stats = compact_receipts_with_budget(&mut queue);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.receipts_compacted, 1, "errors: {:?}", stats.errors);
+    assert!(!corrupt.exists());
+    assert_eq!(std::fs::metadata(valid).unwrap().len(), 128);
+}
+
+#[test]
+fn receipt_deletion_quarantines_a_corrupt_receipt_and_continues() {
+    let (tmp, mut queue) = create_test_queue();
+    let (corrupt, valid) = two_receipts_first_corrupt(&tmp, &mut queue);
+    let wall_floor = expire_receipts(&tmp, &queue, &valid);
+    let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+    assert_eq!(stats.quarantined.len(), 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.receipts_expired, 1, "errors: {:?}", stats.errors);
+    assert!(stats
+        .errors
+        .iter()
+        .any(|error| error.operation == "receipt_delete_invalid"));
+    assert!(!corrupt.exists());
+    assert!(!valid.exists());
+}
+
+#[test]
+fn receipt_verification_io_failure_is_recorded_without_quarantine() {
+    for compact in [true, false] {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let wall_floor = expire_receipts(&tmp, &queue, &receipt);
+        fs::fault::reset();
+        fs::fault::inject_errno("fstat", 1, libc::EIO);
+        let stats = if compact {
+            compact_receipts_with_budget(&mut queue)
+        } else {
+            delete_receipts_with_budget(&mut queue, wall_floor)
+        };
+        fs::fault::reset();
+        let operation = if compact {
+            "receipt_compact_invalid"
+        } else {
+            "receipt_delete_invalid"
+        };
+        assert!(
+            stats
+                .errors
+                .iter()
+                .any(|error| error.operation == operation),
+            "errors: {:?}",
+            stats.errors
+        );
+        assert!(stats.quarantined.is_empty());
+        assert!(receipt.exists());
+    }
 }

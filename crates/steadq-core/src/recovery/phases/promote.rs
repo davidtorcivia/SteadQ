@@ -150,6 +150,11 @@ impl Queue {
                 }
             };
             shard_dirs.sort();
+            // A producer only targets a bucket ending after its own wall
+            // floor, so a bucket whose end has passed by a full width is
+            // drained for good and its directories can be removed.
+            let bucket_is_drained = bucket_num < current_wall_bucket;
+            let mut absent_shards = 0usize;
 
             for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
@@ -240,6 +245,7 @@ impl Queue {
                     }
                 };
                 entries.sort();
+                let mut absent_entries = 0usize;
 
                 for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
@@ -344,15 +350,68 @@ impl Queue {
                     let relative_path = format!("delayed/{bucket_name}/{shard_name}/{entry}");
                     match self.promote_to_ready(shard_fd.as_fd(), shard_name, entry, &parsed.common)
                     {
-                        Ok(()) => stats.delayed_promoted += 1,
-                        Err(failure) => Self::record_move_failure(
-                            stats,
-                            "promote_delayed",
-                            &relative_path,
-                            failure,
-                        ),
+                        Ok(()) => {
+                            stats.delayed_promoted += 1;
+                            absent_entries += 1;
+                        }
+                        Err(failure) => {
+                            if matches!(failure, MoveFailure::SourceMissing) {
+                                absent_entries += 1;
+                            }
+                            Self::record_move_failure(
+                                stats,
+                                "promote_delayed",
+                                &relative_path,
+                                failure,
+                            )
+                        }
                     }
                 }
+
+                if !bucket_is_drained
+                    || !all_observed_children_absent(absent_entries, entries.len())
+                {
+                    continue;
+                }
+                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
+                    stats.budget_exhausted = true;
+                    return;
+                }
+                stats.operations_attempted += 1;
+                match remove_empty_directory_verified(bucket_fd.as_fd(), shard_name) {
+                    Ok(()) => {
+                        stats.shards_removed += 1;
+                        absent_shards += 1;
+                    }
+                    Err(RemoveDirectoryFailure::SourceMissing) => absent_shards += 1,
+                    Err(RemoveDirectoryFailure::NotEmpty) => {}
+                    Err(failure) => Self::record_remove_directory_failure(
+                        stats,
+                        "promote_shard_remove",
+                        &format!("delayed/{bucket_name}/{shard_name}"),
+                        failure,
+                    ),
+                }
+            }
+
+            if !bucket_is_drained || !all_observed_children_absent(absent_shards, shard_dirs.len())
+            {
+                continue;
+            }
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
+                stats.budget_exhausted = true;
+                return;
+            }
+            stats.operations_attempted += 1;
+            match remove_empty_directory_verified(delayed_fd.as_fd(), bucket_name) {
+                Ok(()) => stats.buckets_removed += 1,
+                Err(RemoveDirectoryFailure::SourceMissing | RemoveDirectoryFailure::NotEmpty) => {}
+                Err(failure) => Self::record_remove_directory_failure(
+                    stats,
+                    "promote_bucket_remove",
+                    &format!("delayed/{bucket_name}"),
+                    failure,
+                ),
             }
         }
 
