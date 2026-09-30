@@ -174,7 +174,8 @@ fn worker(
             return 0;
         }
         let wait_ns = if once { 0 } else { SCAN_WAIT_NS };
-        let lease = match queue.lease(wait_ns, lease_duration_ns) {
+        let (outcome, reader) = queue.lease_with_payload(wait_ns, lease_duration_ns);
+        let lease = match outcome {
             LeaseOutcome::Leased(lease) => lease,
             LeaseOutcome::Empty if once => return 0,
             LeaseOutcome::Empty => continue,
@@ -196,7 +197,8 @@ fn worker(
         if STOP.load(Ordering::SeqCst) && lease.attempt < lease.maximum_attempts {
             return requeue(&mut queue, &lease);
         }
-        let code = run_one(&mut queue, lease, lease_duration_ns, &command);
+        let reader = reader.expect("a leased outcome carries its payload reader");
+        let code = run_one(&mut queue, lease, reader, lease_duration_ns, &command);
         if once {
             return code;
         }
@@ -206,21 +208,10 @@ fn worker(
 fn run_one(
     queue: &mut Queue,
     mut lease: LeaseInfo,
+    reader: VerifiedPayloadReader,
     lease_duration_ns: u64,
     command: &[String],
 ) -> u8 {
-    let reader = match queue.open_verified_payload_reader(&lease) {
-        Ok(Some(reader)) => reader,
-        Ok(None) => {
-            eprintln!("lease source vanished");
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("payload verification failed: {e}");
-            return crate::core_exit_code(&e);
-        }
-    };
-
     let worker_pid = std::process::id() as libc::pid_t;
     let mut command_line = Command::new(&command[0]);
     command_line

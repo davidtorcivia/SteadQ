@@ -6,7 +6,21 @@ impl Queue {
     /// Claim a ready job, returning a lease. Empty scans and transient watermark
     /// lock contention retry with bounded exponential backoff until `max_wait_ns`.
     pub fn lease(&mut self, max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
-        self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, None)
+        self.lease_with_payload(max_wait_ns, lease_duration_ns).0
+    }
+
+    /// `lease`, plus a reader over the payload the claim already verified,
+    /// so delivery does not hash it again. The reader is `Some` exactly when
+    /// the outcome is `Leased`; dropping it closes its descriptor.
+    pub fn lease_with_payload(
+        &mut self,
+        max_wait_ns: u64,
+        lease_duration_ns: u64,
+    ) -> (LeaseOutcome, Option<VerifiedPayloadReader>) {
+        let mut payload = None;
+        let outcome =
+            self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, None, &mut payload);
+        (outcome, payload)
     }
 
     pub(super) fn lease_batched(
@@ -15,7 +29,7 @@ impl Queue {
         lease_duration_ns: u64,
         dirty: &mut engine::DirtySet,
     ) -> LeaseOutcome {
-        self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, Some(dirty))
+        self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, Some(dirty), &mut None)
     }
 
     pub(super) fn lease_inner_with_dirty(
@@ -23,6 +37,7 @@ impl Queue {
         max_wait_ns: u64,
         lease_duration_ns: u64,
         mut dirty: Option<&mut engine::DirtySet>,
+        payload: &mut Option<VerifiedPayloadReader>,
     ) -> LeaseOutcome {
         let started = std::time::Instant::now();
         let wait = std::time::Duration::from_nanos(max_wait_ns);
@@ -30,7 +45,8 @@ impl Queue {
         let max_backoff = std::time::Duration::from_millis(10);
 
         loop {
-            let outcome = self.lease_once_with_dirty(lease_duration_ns, dirty.as_deref_mut());
+            let outcome =
+                self.lease_once_with_dirty(lease_duration_ns, dirty.as_deref_mut(), payload);
             let retryable = matches!(
                 outcome,
                 LeaseOutcome::Empty | LeaseOutcome::NotCommitted(Error::MaintenanceBusy)
@@ -85,6 +101,7 @@ impl Queue {
         &mut self,
         lease_duration_ns: u64,
         mut dirty: Option<&mut engine::DirtySet>,
+        payload: &mut Option<VerifiedPayloadReader>,
     ) -> LeaseOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return LeaseOutcome::NotCommitted(e);
@@ -506,7 +523,15 @@ impl Queue {
                             expected_inode: leased_object.inode(),
                             exact_source_path: format!("{leased_dir}/{}", lease_target.filename),
                         };
-
+                        // Published objects are immutable, and this fd holds
+                        // the inode just verified, witnessed across the claim
+                        // rename. Reads through it cannot reach another inode,
+                        // even after renew renames the leased name.
+                        *payload = Some(VerifiedPayloadReader {
+                            file_fd: leased_file,
+                            payload_start: 128 + u64::from(header.extension_header_length),
+                            payload_len: header.payload_length,
+                        });
                         return LeaseOutcome::Leased(lease_info);
                     }
                     Err(engine::MoveFailure::SourceMissing) => continue,
