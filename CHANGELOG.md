@@ -141,6 +141,7 @@
 
 ### Testing
 
+- `cargo xtask crashlab flakey` cuts power on ext4 over dm-flakey (`drop_writes` or `error_writes`) under a multi-threaded workload of strict, deferred, and group-commit operations, then remounts and checks the op-log lines that returned before the cut; `crashlab-check` also fails a visible NotCommitted enqueue, a job in two states, and an active buried job. 1,350 cuts on kernel 6.8.0-117 passed (docs/crash-lab.md)
 - 760 tests: unit, fault injection, differential, and formal model checking
 - The verifier follow-up passed 759 tests with one ignored, Clippy, formatting, and generated-artifact checks. Read-count regressions verify early rejection; manually removing payload hashing makes the payload tests fail. Its three generated mutations were unviable because verified witness types deliberately have no `Default` implementation.
 - This fix pass passed the workspace format, Clippy, protocol/generated-artifact, and C-header checks, with 758 tests passing and one ignored. Diff-scoped core mutation testing caught all 16 viable mutations; two additional mutations did not compile. AddressSanitizer smoke runs completed 1,000 operation sequences, 1,000 queue-corruption inputs, and 2,000 resolver inputs; leak detection was disabled because the sandbox blocks LeakSanitizer's process inspection.

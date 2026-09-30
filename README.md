@@ -159,6 +159,7 @@ SteadQ has 855 tests across unit, integration, conformance, and formal model che
 - Mutation testing (cargo-mutants) runs on every pull request, scoped to the changed lines
 - Fuzz testing covers format parsing, filename parsing, CBOR decoding, and arithmetic
 - Crash lab replays persistence-barrier crash states on real filesystem images: 761 states on kernel 6.8.0-137 and 793 states on kernel 7.0.0-28, all five profiles passing on both hosts ([docs/crash-lab.md](docs/crash-lab.md))
+- dm-flakey power cuts on ext4 under a concurrent workload: 1,350 cut points (dropped and failed writes, default and `data=journal` mounts), all passing
 
 ## Performance
 

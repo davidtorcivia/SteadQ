@@ -32,7 +32,7 @@ fn dispatch_command(command: Option<&str>, root: &Path) -> Result<(), String> {
         Some("generate") => generate(root),
         Some("crashlab") => {
             let sub = args.next().ok_or_else(|| {
-                "usage: cargo xtask crashlab <doctor|tier0|tier1|teardown|help>".to_string()
+                "usage: cargo xtask crashlab <doctor|tier0|tier1|flakey|teardown|help>".to_string()
             })?;
             let rest: Vec<String> = args.collect();
             crashlab::dispatch(root, &sub, &rest)

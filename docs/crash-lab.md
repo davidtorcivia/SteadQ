@@ -6,7 +6,7 @@ The crash lab records every block write issued by a workload on a real
 filesystem, replays the log up to each persistence barrier (fsync, FUA),
 and verifies each resulting on-disk state against the queue contract.
 
-Two lanes:
+Three lanes:
 
 - **tier0** (no root required): SIGKILL lane. A workload process is killed
   after a target number of completed operations; the surviving operation
@@ -14,14 +14,21 @@ Two lanes:
 - **tier1** (root required): dm-log-writes lane. Every crash state at every
   persistence barrier is mounted and checked. Exhaustive over crash states
   reachable at persistence boundaries, for the recorded workload.
+- **flakey** (root required): dm-flakey power-cut lane. A multi-threaded
+  workload runs on ext4 over a dm-flakey target; at a random point every
+  later write is dropped (or failed), the workload is killed, and the
+  remounted filesystem is checked. Sampled, not exhaustive, but it reaches
+  live concurrent kernel states that a single recorded write log does not.
 
 ## Gates
 
 Each crash state must satisfy:
 
 - No committed enqueue is lost.
-- No acknowledged job is active.
+- No acknowledged or buried job is active.
 - No phantom job is delivered.
+- No enqueue that returned NotCommitted is visible.
+- No job is in more than one state.
 - Recovery completes without errors.
 - fsck reports no error-severity findings.
 - Corrupt payloads are quarantined, never delivered.
@@ -32,6 +39,7 @@ Each crash state must satisfy:
 cargo xtask crashlab doctor                 # tool and device preflight
 cargo xtask crashlab tier0 --runs 24        # SIGKILL lane
 sudo cargo xtask crashlab tier1 --fs ext4   # also xfs, btrfs, f2fs, zfs
+sudo target/debug/xtask crashlab flakey --cuts 200   # dm-flakey power cuts
 cargo xtask crashlab teardown               # release resources after an interrupted run
 ```
 
@@ -43,6 +51,64 @@ recovered by force-importing the run's pool from exactly the run's loop
 device (never a bare `zpool import`, which scans every host device), and
 states that predate pool creation are vacuous passes. Pools use
 `cachefile=none` so runs never touch the host pool cache.
+
+## Power-cut lane (dm-flakey)
+
+Run it on a disposable root VM, never in PR CI. It needs `losetup`,
+`dmsetup`, `mkfs.ext4`, and the `dm-flakey` module (`modprobe dm-flakey`).
+Build as the normal user first so root finds the binaries and leaves no
+root-owned build output, then run the xtask binary under sudo:
+
+```sh
+cargo build -p steadq-testkit --bins -p xtask
+sudo target/debug/xtask crashlab flakey --cuts 200 --seed 1
+sudo target/debug/xtask crashlab flakey --cuts 100 --mount-opts data=journal
+sudo target/debug/xtask crashlab flakey --cuts 100 --mode error_writes
+```
+
+Flags: `--cuts N` cut points (default 20), `--seed N`, `--workers N`
+(default 4, at least 3), `--mode drop_writes|error_writes`, `--mount-opts`
+(passed to `mount -o`), `--min-ops`/`--max-ops` (the cut lands after a
+uniformly chosen number of completed operations, default 20 to 2000),
+`--size-mb` (image size, default 1024), `--store DIR`.
+
+Each cut point:
+
+1. `mkfs.ext4` (default options) on a loop device over an image in the
+   store, then a dm-flakey table that passes every write, and mount.
+2. Start `crashlab-concurrent`: worker 0 enqueues with `deferred_dir_sync`
+   and calls `sync()`, worker 1 runs group-commit batches (enqueue batch,
+   then lease and ack batch), and the rest run strict enqueue, lease (some
+   with 1 s leases so recovery reaps them), ack, retry, bury, and bounded
+   recovery. Every returned outcome, including the job id of a
+   NotCommitted enqueue, is appended to an op log in the store, off the
+   tested device. Deferred and batched enqueues and batched acks are logged
+   as committed only after their `sync()` or `commit()` returns.
+3. After the chosen number of op-log lines, append a cut marker to the op
+   log, then `dmsetup suspend --nolockfs`, load the `drop_writes` (or
+   `error_writes`) table, and resume. No freeze, so nothing is flushed on
+   the way into the cut. The workload keeps running 100 to 300 ms against
+   the lying device, then gets SIGKILL.
+4. Unmount, remove the dm device (dropping its page cache), recreate it with
+   the pass-through table, and mount (journal replay).
+5. `crashlab-check` recovers to quiescence, runs deep fsck, and applies the
+   gates. Lines before the marker returned before any write was dropped, so
+   they set the durability expectations; lines after it set none, except
+   that a NotCommitted enqueue must stay invisible whenever it returned.
+
+The first failing cut stops the run and keeps the op log, verdict, and a
+copy of the image in the store. The run summary records the kernel, mode,
+mount options, and how many operations of each type returned after the
+cut.
+
+The model: writes that reached the loop device before the switch survive
+and later writes vanish, which is what a power cut does to data that was
+never flushed. It does not reorder writes inside the device; tier 1 covers
+every persistence-barrier prefix of a recorded log.
+
+A negative control (logging `acked` before calling `ack`) failed at the
+12th cut with the acked job still leased, so the gates catch a violated
+durability promise.
 
 ## Device safety
 
@@ -107,6 +173,28 @@ reaped that lease after expiry, and drained the rest. Final stats:
 evidence on real storage, not a tier1 replay.
 
 Tier 0 (SIGKILL): 84 runs across five seeds on the first host, all passed.
+
+Power-cut lane (dm-flakey), boat.dev KVM VMs (4 vCPU, 8 GB), kernel
+6.8.0-117-generic, mke2fs 1.47.0 default options, 1 GiB image in
+`/dev/shm`, 1,350 cut points, all passed:
+
+| Mode | Mount options | Workers | Ops before cut | Cuts | Result |
+|---|---|---:|---|---:|---|
+| drop_writes | default | 4 | 20 to 3,000 | 200 | all passed |
+| drop_writes | default | 4 | 3,000 to 20,000 | 100 | all passed |
+| drop_writes | default | 8 | 20 to 5,000 | 200 | all passed |
+| drop_writes | default | 3 | 20 to 3,000 | 100 | all passed |
+| drop_writes | default | 12 | 20 to 8,000 | 150 | all passed |
+| drop_writes | data=journal | 4 | 20 to 3,000 | 200 | all passed |
+| drop_writes | data=journal | 4 | 3,000 to 15,000 | 100 | all passed |
+| error_writes | default | 4 | 20 to 3,000 | 200 | all passed |
+| error_writes | data=journal | 4 | 20 to 3,000 | 100 | all passed |
+
+Under drop_writes about 2,000 to 2,700 operations per cut returned after
+the switch (every type: enqueue, deferred sync, lease, ack, retry, bury,
+recovery) and set no expectation. Under error_writes the post-cut
+operations failed fast, and no enqueue that returned NotCommitted was
+visible after remount.
 
 Scope: one workload shape and seed per profile, two kernels, no hardware
 power-cut testing, no second-crash-after-resolution lane. State verdicts

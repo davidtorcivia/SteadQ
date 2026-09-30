@@ -5,6 +5,7 @@
 // created over allowlisted image stores); registry tracks resources for
 // teardown after interrupted runs.
 
+pub mod flakey;
 pub mod guards;
 pub mod registry;
 pub mod tier0;
@@ -98,6 +99,7 @@ pub fn dispatch(root: &Path, sub: &str, args: &[String]) -> Result<(), String> {
         "doctor" => doctor(root),
         "tier0" => tier0::run(root, args),
         "tier1" => tier1::run(root, args),
+        "flakey" => flakey::run(root, args),
         "teardown" => {
             let store = args
                 .first()
@@ -112,11 +114,14 @@ pub fn dispatch(root: &Path, sub: &str, args: &[String]) -> Result<(), String> {
         }
         "help" | "-h" | "--help" => {
             eprintln!(
-                "usage: cargo xtask crashlab <doctor|tier0|tier1|teardown> [args]\n\
+                "usage: cargo xtask crashlab <doctor|tier0|tier1|flakey|teardown> [args]\n\
                  \n\
                  tier0 [--runs N] [--ops N] [--seed N] [--store DIR]  SIGKILL lane, no root\n\
                  tier1 --fs ext4|xfs|btrfs|f2fs [--ops N] [--seed N] [--size-mb N]\n\
                        [--store DIR] [--max-marks N] [--keep-images]   dm-log-writes replay, root\n\
+                 flakey [--cuts N] [--seed N] [--workers N] [--mode drop_writes|error_writes]\n\
+                       [--mount-opts OPTS] [--min-ops N] [--max-ops N] [--size-mb N]\n\
+                       [--store DIR]                     dm-flakey power cuts on ext4, root\n\
                  teardown [STORE]                                       recover a crashed run\n\
                  \n\
                  Safety: only loop devices over images in allowlisted stores\n\
