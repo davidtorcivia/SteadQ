@@ -2519,11 +2519,11 @@ fn recovery_cursor_without_retry_ledger_remains_compatible() {
 fn recovery_cursor_record_boundary_table() {
     assert_eq!(RECOVERY_CURSOR_MAX_BYTES, 16_384);
     assert_eq!(
-        RECOVERY_CURSOR_OPEN_FLAGS,
+        recovery_cursor_open_flags(),
         libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
     );
     assert_eq!(
-        RECOVERY_LOCK_OPEN_FLAGS,
+        recovery_lock_open_flags(),
         libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW
     );
     for (size, expected) in [

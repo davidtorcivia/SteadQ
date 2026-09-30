@@ -21,8 +21,6 @@ const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
 const RECOVERY_CURSOR_VERSION: u16 = 1;
 const RECOVERY_CURSOR_FILE: &str = "recovery-cursor.json";
 const RECOVERY_CURSOR_MAX_BYTES: u64 = 16 * 1024;
-const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDWR;
 const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
@@ -45,6 +43,17 @@ struct RecoveryCursorRecord {
     version: u16,
     queue_id: String,
     cursor: RecoveryCursor,
+}
+
+/// Read-only open of the recovery cursor: never through a symlink, never
+/// blocking on a FIFO, never inherited by a child process.
+fn recovery_cursor_open_flags() -> i32 {
+    libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+}
+
+/// Read-write open of an existing recovery lock, never through a symlink.
+fn recovery_lock_open_flags() -> i32 {
+    libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDWR
 }
 
 fn cursor_component_is_valid(component: &[u8]) -> bool {
@@ -335,7 +344,7 @@ pub(crate) fn load_recovery_cursor(
     let cursor_fd = match fs::openat(
         control_fd.as_fd(),
         RECOVERY_CURSOR_FILE,
-        RECOVERY_CURSOR_OPEN_FLAGS,
+        recovery_cursor_open_flags(),
         0,
     ) {
         Ok(fd) => fd,
@@ -533,7 +542,7 @@ impl Queue {
             Err(error) if recovery_lock_exists(&error) => fs::openat(
                 control_fd.as_fd(),
                 "recovery.lock",
-                RECOVERY_LOCK_OPEN_FLAGS,
+                recovery_lock_open_flags(),
                 0,
             )
             .map_err(Error::from)?,
