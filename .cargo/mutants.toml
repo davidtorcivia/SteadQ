@@ -58,7 +58,8 @@ exclude_re = [
     # Read-only open flags: |->^ is equivalent on the disjoint constants
     # O_RDONLY (0), O_NOFOLLOW, O_CLOEXEC, and O_NONBLOCK.
     "raw_read_open_flags",
-    # Recovery cursor and lock open flag constants: |->^ is equivalent on
-    # the disjoint O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, and O_RDWR bits.
-    "src/recovery\\.rs:2[45]:\\d+: replace \\| with \\^$",
+    # Recovery cursor and lock open flags: |->^ is equivalent on the
+    # disjoint O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, and O_RDWR bits.
+    "recovery_cursor_open_flags",
+    "recovery_lock_open_flags",
 ]

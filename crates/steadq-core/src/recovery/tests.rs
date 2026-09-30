@@ -2519,11 +2519,11 @@ fn recovery_cursor_without_retry_ledger_remains_compatible() {
 fn recovery_cursor_record_boundary_table() {
     assert_eq!(RECOVERY_CURSOR_MAX_BYTES, 16_384);
     assert_eq!(
-        RECOVERY_CURSOR_OPEN_FLAGS,
+        recovery_cursor_open_flags(),
         libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
     );
     assert_eq!(
-        RECOVERY_LOCK_OPEN_FLAGS,
+        recovery_lock_open_flags(),
         libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW
     );
     for (size, expected) in [
@@ -3120,7 +3120,7 @@ fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
     assert!(first
         .errors
         .iter()
-        .any(|error| error.operation == "receipt_compact_invalid"));
+        .any(|error| error.operation == "receipt_compact_parse"));
     assert!(!malformed.exists());
     drop(queue);
 
@@ -5482,4 +5482,404 @@ fn receipt_verification_io_failure_is_recorded_without_quarantine() {
         assert!(stats.quarantined.is_empty());
         assert!(receipt.exists());
     }
+}
+
+fn directory_entries(names: &[&[u8]]) -> (TempDir, Vec<fs::DirEntryName>) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new().unwrap();
+    for name in names {
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
+    }
+    let fd = fs::open_dir_absolute(dir.path()).unwrap();
+    let mut entries = fs::read_dir_entries(fd.as_fd()).unwrap();
+    entries.sort();
+    (dir, entries)
+}
+
+fn entry<'a>(entries: &'a [fs::DirEntryName], name: &[u8]) -> &'a fs::DirEntryName {
+    entries
+        .iter()
+        .find(|entry| entry.as_bytes() == name)
+        .unwrap()
+}
+
+#[test]
+fn cursor_directories_are_the_saved_parent_names() {
+    assert_eq!(
+        ThreeLevelCursor::new(b"a", b"b", b"c").directories(),
+        [b"a", b"b"]
+    );
+    assert_eq!(
+        FourLevelCursor::new(b"a", b"b", b"c", b"d").directories(),
+        [b"a", b"b", b"c"]
+    );
+}
+
+#[test]
+fn directory_before_cursor_compares_only_under_the_saved_parents() {
+    let cursor = Some([b"b" as &[u8], b"x"]);
+    assert!(!walk::directory_before_cursor::<2>(None, &[], b"a"));
+    assert!(walk::directory_before_cursor(cursor, &[], b"a"));
+    assert!(!walk::directory_before_cursor(cursor, &[], b"b"));
+    assert!(!walk::directory_before_cursor(cursor, &[], b"c"));
+    assert!(walk::directory_before_cursor(cursor, &[b"b"], b"w"));
+    assert!(!walk::directory_before_cursor(cursor, &[b"b"], b"x"));
+    assert!(!walk::directory_before_cursor(cursor, &[b"b"], b"y"));
+    assert!(!walk::directory_before_cursor(cursor, &[b"a"], b"w"));
+    assert!(!walk::directory_before_cursor(cursor, &[b"c"], b"w"));
+}
+
+#[test]
+fn directory_name_checks_record_each_rejection() {
+    let boot = "00000000-0000-0000-0000-000000000001";
+    let (_dir, entries) = directory_entries(&[
+        "\u{e9}".as_bytes(),
+        b"0000000000000002",
+        b"0003",
+        b"0004",
+        boot.as_bytes(),
+        b"zz",
+    ]);
+    let non_ascii = entry(&entries, "\u{e9}".as_bytes());
+    let junk = entry(&entries, b"zz");
+
+    let mut stats = RecoveryStats::default();
+    assert_eq!(
+        walk::boot_directory_name(&mut stats, "op", entry(&entries, boot.as_bytes())),
+        Some(boot)
+    );
+    assert_eq!(
+        walk::bucket_directory_name(&mut stats, "op", entry(&entries, b"0000000000000002")),
+        Some(("0000000000000002", 2))
+    );
+    assert_eq!(
+        walk::shard_directory_name(&mut stats, "op", entry(&entries, b"0003"), 4),
+        Some(("0003", 3))
+    );
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+
+    assert_eq!(
+        walk::boot_directory_name(&mut stats, "boot_op", non_ascii),
+        None
+    );
+    assert_eq!(walk::boot_directory_name(&mut stats, "boot_op", junk), None);
+    assert_eq!(
+        walk::bucket_directory_name(&mut stats, "bucket_op", non_ascii),
+        None
+    );
+    assert_eq!(
+        walk::bucket_directory_name(&mut stats, "bucket_op", junk),
+        None
+    );
+    assert_eq!(
+        walk::shard_directory_name(&mut stats, "shard_op", non_ascii, 4),
+        None
+    );
+    assert_eq!(
+        walk::shard_directory_name(&mut stats, "shard_op", junk, 4),
+        None
+    );
+    assert_eq!(
+        walk::shard_directory_name(&mut stats, "shard_op", entry(&entries, b"0004"), 4),
+        None
+    );
+    let recorded = stats
+        .errors
+        .iter()
+        .map(|error| {
+            (
+                error.operation.as_str(),
+                error.relative_path.as_str(),
+                error.error.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let raw = format!("{non_ascii:?}");
+    assert_eq!(
+        recorded,
+        [
+            ("boot_op", raw.as_str(), "boot directory name is not ASCII"),
+            ("boot_op", "zz", "boot directory name is not canonical"),
+            (
+                "bucket_op",
+                raw.as_str(),
+                "bucket directory name is not ASCII"
+            ),
+            ("bucket_op", "zz", "bucket directory name is not canonical"),
+            (
+                "shard_op",
+                raw.as_str(),
+                "shard directory name is not ASCII"
+            ),
+            ("shard_op", "zz", "shard directory name is not canonical"),
+            (
+                "shard_op",
+                "0004",
+                "shard directory is outside the queue shard range"
+            ),
+        ]
+    );
+}
+
+fn descend_test_level<'a>(name: &'a str, components: &'a [&'a [u8]]) -> walk::Level<'a> {
+    walk::Level {
+        phase: RecoveryPhase::DeleteReceipts,
+        name,
+        components,
+        open_operation: "test_open",
+        read_operation: "test_read",
+        path: "receipts/level",
+    }
+}
+
+fn descend(
+    queue: &mut Queue,
+    level: &walk::Level<'_>,
+    scan_budget: &RecoveryScanBudget,
+) -> (walk::Descend, RecoveryStats, RecoveryScanStats) {
+    let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut stats = RecoveryStats::default();
+    let outcome = queue.descend_level(
+        receipts.as_fd(),
+        level,
+        &mut RecoveryScanContext {
+            budget: scan_budget,
+            stats: &mut scan_stats,
+        },
+        &mut stats,
+        u64::MAX,
+    );
+    fs::fault::reset();
+    (outcome, stats, scan_stats)
+}
+
+fn test_errors(stats: &RecoveryStats) -> Vec<(&str, &str)> {
+    stats
+        .errors
+        .iter()
+        .map(|error| (error.operation.as_str(), error.relative_path.as_str()))
+        .collect()
+}
+
+#[test]
+fn descend_level_returns_the_sorted_directory() {
+    let (tmp, mut queue) = create_test_queue();
+    let level_dir = tmp.path().join("receipts/0000000000000001");
+    std::fs::create_dir(&level_dir).unwrap();
+    for name in ["b", "a", "c"] {
+        std::fs::write(level_dir.join(name), b"").unwrap();
+    }
+    fs::fault::permute_readdir(1, true);
+    let level = descend_test_level("0000000000000001", &[b"0000000000000001"]);
+    let (outcome, stats, scan) = descend(&mut queue, &level, &RecoveryScanBudget::default());
+    let walk::Descend::Entries(fd, entries) = outcome else {
+        panic!("expected entries");
+    };
+    let names = entries
+        .iter()
+        .map(|entry| entry.as_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(names, [b"a", b"b", b"c"]);
+    assert_eq!(fs::read_dir_entries(fd.as_fd()).unwrap().len(), 3);
+    assert_eq!(stats.scan_skips, 0);
+    assert!(!stats.phase_blocked);
+    assert!(stats.errors.is_empty());
+    assert_eq!(scan.directories_read, 1);
+}
+
+#[test]
+fn descend_level_open_failure_remembers_an_open_retry() {
+    let (tmp, mut queue) = create_test_queue();
+    std::fs::create_dir(tmp.path().join("receipts/0000000000000001")).unwrap();
+    let level = descend_test_level("0000000000000001", &[b"0000000000000001"]);
+    fs::fault::inject_errno_for("open_directory", "0000000000000001", libc::EIO);
+    let (outcome, stats, scan) = descend(&mut queue, &level, &RecoveryScanBudget::default());
+    assert!(matches!(outcome, walk::Descend::Skip));
+    assert_eq!(stats.scan_skips, 1);
+    assert!(stats.phase_blocked);
+    assert!(!stats.budget_exhausted);
+    assert_eq!(test_errors(&stats), [("test_open", "receipts/level")]);
+    assert_eq!(scan.directories_read, 0);
+    assert_eq!(
+        queue.recovery_cursor.hierarchy_retries,
+        [RecoveryHierarchyRetry {
+            phase: RecoveryPhase::DeleteReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000001".into()],
+        }]
+    );
+}
+
+#[test]
+fn descend_level_read_failure_remembers_an_enumerate_retry() {
+    let (tmp, mut queue) = create_test_queue();
+    std::fs::create_dir(tmp.path().join("receipts/0000000000000001")).unwrap();
+    let level = descend_test_level("0000000000000001", &[b"0000000000000001"]);
+    // A bounded read reopens the directory as ".".
+    fs::fault::inject_errno_for("open_directory", ".", libc::EIO);
+    let (outcome, stats, scan) = descend(&mut queue, &level, &RecoveryScanBudget::default());
+    assert!(matches!(outcome, walk::Descend::Skip));
+    assert_eq!(stats.scan_skips, 1);
+    assert!(stats.phase_blocked);
+    assert!(!stats.budget_exhausted);
+    assert_eq!(test_errors(&stats), [("test_read", "receipts/level")]);
+    assert_eq!(scan.directories_read, 1);
+    assert_eq!(
+        queue.recovery_cursor.hierarchy_retries,
+        [RecoveryHierarchyRetry {
+            phase: RecoveryPhase::DeleteReceipts,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec!["0000000000000001".into()],
+        }]
+    );
+}
+
+#[test]
+fn descend_level_stops_when_the_scan_budget_is_spent() {
+    let (tmp, mut queue) = create_test_queue();
+    std::fs::create_dir(tmp.path().join("receipts/0000000000000001")).unwrap();
+    let level = descend_test_level("0000000000000001", &[b"0000000000000001"]);
+    let spent = RecoveryScanBudget {
+        max_directories_read: 0,
+        ..RecoveryScanBudget::default()
+    };
+    let (outcome, stats, _) = descend(&mut queue, &level, &spent);
+    assert!(matches!(outcome, walk::Descend::Stop));
+    assert_eq!(stats.scan_skips, 1);
+    assert!(stats.budget_exhausted);
+    assert!(!stats.phase_blocked);
+    assert!(stats.errors.is_empty());
+    assert!(queue.recovery_cursor.hierarchy_retries.is_empty());
+}
+
+#[test]
+fn descend_level_stops_when_the_retry_cannot_be_recorded() {
+    let (_tmp, mut queue) = create_test_queue();
+    // The directory is missing, and a non-UTF-8 component cannot be recorded.
+    let level = descend_test_level("0000000000000001", &[b"\xff"]);
+    let (outcome, stats, _) = descend(&mut queue, &level, &RecoveryScanBudget::default());
+    assert!(matches!(outcome, walk::Descend::Stop));
+    assert_eq!(stats.scan_skips, 1);
+    assert_eq!(
+        test_errors(&stats),
+        [
+            ("test_open", "receipts/level"),
+            ("hierarchy_retry_invalid", "receipts/level")
+        ]
+    );
+    assert!(queue.recovery_cursor.hierarchy_retries.is_empty());
+}
+
+#[test]
+fn prune_empty_directory_reports_each_outcome() {
+    let tmp = TempDir::new().unwrap();
+    for name in ["empty", "full", "failing"] {
+        std::fs::create_dir(tmp.path().join(name)).unwrap();
+    }
+    std::fs::write(tmp.path().join("full/file"), b"").unwrap();
+    let parent_fd = fs::open_dir_absolute(tmp.path()).unwrap();
+    let prune = |name: &str, max_operations: u32, stats: &mut RecoveryStats| {
+        Queue::prune_empty_directory(
+            parent_fd.as_fd(),
+            name,
+            "test_remove",
+            "prune/path",
+            &WorkBudget {
+                max_operations,
+                max_duration_ms: 5_000,
+            },
+            stats,
+            u64::MAX,
+        )
+    };
+
+    let mut stats = RecoveryStats::default();
+    assert_eq!(prune("empty", 0, &mut stats), walk::Prune::Stop);
+    assert!(stats.budget_exhausted);
+    assert_eq!(stats.operations_attempted, 0);
+    assert!(tmp.path().join("empty").exists());
+
+    let mut stats = RecoveryStats::default();
+    assert_eq!(prune("empty", 10, &mut stats), walk::Prune::Removed);
+    assert!(!tmp.path().join("empty").exists());
+    assert_eq!(prune("empty", 10, &mut stats), walk::Prune::Missing);
+    assert_eq!(prune("full", 10, &mut stats), walk::Prune::Kept);
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    fs::fault::inject_errno_for("unlinkat_dir", "failing", libc::EIO);
+    assert_eq!(prune("failing", 10, &mut stats), walk::Prune::Kept);
+    fs::fault::reset();
+    assert_eq!(stats.operations_attempted, 4);
+    assert!(!stats.budget_exhausted);
+    assert_eq!(
+        test_errors(&stats),
+        [("test_remove_not_committed", "prune/path")]
+    );
+    assert!(tmp.path().join("failing").exists());
+}
+
+#[test]
+fn directory_open_errors_record_the_queue_relative_path() {
+    let (tmp, mut queue) = create_test_queue();
+    let boot = "00000000-0000-0000-0000-000000000001";
+    std::fs::create_dir(tmp.path().join("leased").join(boot)).unwrap();
+    std::fs::create_dir(tmp.path().join("tmp").join(boot)).unwrap();
+    queue.ensure_dir("delayed/0000000000000000/0000").unwrap();
+
+    fs::fault::inject_errno_for("open_directory", boot, libc::EIO);
+    let reap = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    fs::fault::inject_errno_for("open_directory", boot, libc::EIO);
+    let temp = cleanup_temp_with_budget(&mut queue);
+    fs::fault::inject_errno_for("open_directory", "0000", libc::EIO);
+    let wall_floor = queue.authenticated_wall_floor().unwrap();
+    let promote = promote_eligible_with_budget(&mut queue, wall_floor);
+    fs::fault::reset();
+
+    let leased_path = format!("leased/{boot}");
+    let tmp_path = format!("tmp/{boot}");
+    for (stats, operation, path) in [
+        (&reap, "reap_boot_open", leased_path.as_str()),
+        (&temp, "temp_boot_open", tmp_path.as_str()),
+        (
+            &promote,
+            "promote_shard_open",
+            "delayed/0000000000000000/0000",
+        ),
+    ] {
+        assert!(
+            stats
+                .errors
+                .iter()
+                .any(|error| error.operation == operation && error.relative_path == path),
+            "errors: {:?}",
+            stats.errors
+        );
+    }
+}
+
+#[test]
+fn compaction_quarantines_an_unparsed_receipt_name_as_retention_does() {
+    let (tmp, mut queue) = create_test_queue();
+    queue.ensure_dir("receipts/0000000000000000/0000").unwrap();
+    let stray = tmp
+        .path()
+        .join("receipts/0000000000000000/0000/garbage.rct");
+    std::fs::write(&stray, b"garbage").unwrap();
+    let stats = compact_receipts_with_budget(&mut queue);
+    assert_eq!(
+        test_errors(&stats),
+        [(
+            "receipt_compact_parse",
+            "receipts/0000000000000000/0000/garbage.rct"
+        )]
+    );
+    assert_eq!(stats.quarantined.len(), 1);
+    assert!(!stray.exists());
+    let quarantined = queue.list_quarantine().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        quarantined[0].reason,
+        crate::QuarantineReason::FilenameParseFailed as u16
+    );
 }

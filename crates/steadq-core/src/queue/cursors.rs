@@ -18,6 +18,11 @@ impl ThreeLevelCursor {
         }
     }
 
+    /// Saved directory names, root first.
+    pub(crate) fn directories(&self) -> [&[u8]; 2] {
+        [&self.first, &self.second]
+    }
+
     pub(crate) fn should_skip(&self, first: &[u8], second: &[u8], entry: &[u8]) -> bool {
         (first, second, entry)
             <= (
@@ -46,6 +51,11 @@ impl FourLevelCursor {
             third: third.to_vec(),
             resume_after: resume_after.to_vec(),
         }
+    }
+
+    /// Saved directory names, root first.
+    pub(crate) fn directories(&self) -> [&[u8]; 3] {
+        [&self.first, &self.second, &self.third]
     }
 
     pub(crate) fn should_skip(

@@ -61,113 +61,65 @@ impl Queue {
         boot_dirs.sort();
 
         for boot_dir_entry in &boot_dirs {
-            if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                if boot_dir_entry.as_bytes() < cursor.first.as_slice() {
-                    continue;
-                }
+            if directory_before_cursor(
+                self.recovery_cursor
+                    .reap_leases
+                    .as_ref()
+                    .map(FourLevelCursor::directories),
+                &[],
+                boot_dir_entry.as_bytes(),
+            ) {
+                continue;
             }
             if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(boot_dir_name) = boot_dir_entry.as_ascii_str() else {
-                Self::record_error(
-                    stats,
-                    "reap_boot_name",
-                    &raw_name_for_error(boot_dir_entry),
-                    "boot directory name is not ASCII",
-                );
+            let Some(boot_dir_name) = boot_directory_name(stats, "reap_boot_name", boot_dir_entry)
+            else {
                 continue;
             };
-            if steadq_names::boot_id_bytes(boot_dir_name).is_none() {
-                Self::record_error(
-                    stats,
-                    "reap_boot_name",
-                    boot_dir_name,
-                    "boot directory name is not canonical",
-                );
-                continue;
-            }
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
-            let boot_dir_fd = match fs::open_directory(leased_fd.as_fd(), boot_dir_name) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::ReapLeases,
-                        RecoveryHierarchyRetryKind::Open,
-                        &[boot_dir_entry.as_bytes()],
-                        stats,
-                        boot_dir_name,
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let mut bucket_dirs = match read_recovery_directory(
-                boot_dir_fd.as_fd(),
+            let boot_path = format!("leased/{boot_dir_name}");
+            let (boot_dir_fd, bucket_dirs) = match self.descend_level(
+                leased_fd.as_fd(),
+                &Level {
+                    phase: RecoveryPhase::ReapLeases,
+                    name: boot_dir_name,
+                    components: &[boot_dir_entry.as_bytes()],
+                    open_operation: "reap_boot_open",
+                    read_operation: "reap_bucket_read",
+                    path: &boot_path,
+                },
+                scan,
+                stats,
                 deadline_mono,
-                scan.budget,
-                scan.stats,
             ) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    if Self::record_directory_error(
-                        stats,
-                        "reap_bucket_read",
-                        boot_dir_name,
-                        &error,
-                    ) {
-                        return;
-                    }
-                    if !self.remember_hierarchy_retry_or_block(
-                        RecoveryPhase::ReapLeases,
-                        RecoveryHierarchyRetryKind::Enumerate,
-                        &[boot_dir_entry.as_bytes()],
-                        stats,
-                        boot_dir_name,
-                    ) {
-                        return;
-                    }
-                    continue;
-                }
+                Descend::Entries(fd, entries) => (fd, entries),
+                Descend::Skip => continue,
+                Descend::Stop => return,
             };
-            bucket_dirs.sort();
 
             for bucket_entry in &bucket_dirs {
-                if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                    if boot_dir_entry.as_bytes() == cursor.first
-                        && bucket_entry.as_bytes() < cursor.second.as_slice()
-                    {
-                        continue;
-                    }
+                if directory_before_cursor(
+                    self.recovery_cursor
+                        .reap_leases
+                        .as_ref()
+                        .map(FourLevelCursor::directories),
+                    &[boot_dir_entry.as_bytes()],
+                    bucket_entry.as_bytes(),
+                ) {
+                    continue;
                 }
                 if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
                 }
-                let Some(bucket_name) = bucket_entry.as_ascii_str() else {
-                    Self::record_error(
-                        stats,
-                        "reap_bucket_name",
-                        &raw_name_for_error(bucket_entry),
-                        "bucket directory name is not ASCII",
-                    );
-                    continue;
-                };
-                let Some(bucket_num) = steadq_names::bucket_from_hex(bucket_name) else {
-                    Self::record_error(
-                        stats,
-                        "reap_bucket_name",
-                        bucket_name,
-                        "bucket directory name is not canonical",
-                    );
+                let Some((bucket_name, bucket_num)) =
+                    bucket_directory_name(stats, "reap_bucket_name", bucket_entry)
+                else {
                     continue;
                 };
 
@@ -190,157 +142,68 @@ impl Queue {
                     }
                 }
 
-                let bucket_fd = match fs::open_directory(boot_dir_fd.as_fd(), bucket_name) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "reap_bucket_open",
-                            &format!("leased/{boot_dir_name}/{bucket_name}"),
-                            &error.to_string(),
-                        );
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::ReapLeases,
-                            RecoveryHierarchyRetryKind::Open,
-                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
-                            stats,
-                            &format!("leased/{boot_dir_name}/{bucket_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let mut shard_dirs = match read_recovery_directory(
-                    bucket_fd.as_fd(),
+                let bucket_path = format!("leased/{boot_dir_name}/{bucket_name}");
+                let (bucket_fd, shard_dirs) = match self.descend_level(
+                    boot_dir_fd.as_fd(),
+                    &Level {
+                        phase: RecoveryPhase::ReapLeases,
+                        name: bucket_name,
+                        components: &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                        open_operation: "reap_bucket_open",
+                        read_operation: "reap_shard_read",
+                        path: &bucket_path,
+                    },
+                    scan,
+                    stats,
                     deadline_mono,
-                    scan.budget,
-                    scan.stats,
                 ) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        if Self::record_directory_error(
-                            stats,
-                            "reap_shard_read",
-                            &format!("leased/{boot_dir_name}/{bucket_name}"),
-                            &error,
-                        ) {
-                            return;
-                        }
-                        if !self.remember_hierarchy_retry_or_block(
-                            RecoveryPhase::ReapLeases,
-                            RecoveryHierarchyRetryKind::Enumerate,
-                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
-                            stats,
-                            &format!("leased/{boot_dir_name}/{bucket_name}"),
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
+                    Descend::Entries(fd, entries) => (fd, entries),
+                    Descend::Skip => continue,
+                    Descend::Stop => return,
                 };
-                shard_dirs.sort();
 
                 for shard_entry in &shard_dirs {
-                    if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                        if boot_dir_entry.as_bytes() == cursor.first
-                            && bucket_entry.as_bytes() == cursor.second
-                            && shard_entry.as_bytes() < cursor.third.as_slice()
-                        {
-                            continue;
-                        }
-                    }
-                    let Some(shard_name) = shard_entry.as_ascii_str() else {
-                        Self::record_error(
-                            stats,
-                            "reap_shard_name",
-                            &raw_name_for_error(shard_entry),
-                            "shard directory name is not ASCII",
-                        );
-                        continue;
-                    };
-                    let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
-                        Self::record_error(
-                            stats,
-                            "reap_shard_name",
-                            shard_name,
-                            "shard directory name is not canonical",
-                        );
-                        continue;
-                    };
-                    if shard >= self.format.shard_count() {
-                        Self::record_error(
-                            stats,
-                            "reap_shard_name",
-                            shard_name,
-                            "shard directory is outside the queue shard range",
-                        );
-                        continue;
-                    }
-                    let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
-                        Ok(fd) => fd,
-                        Err(error) => {
-                            stats.scan_skips += 1;
-                            Self::block_phase(
-                                stats,
-                                "reap_shard_open",
-                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                                &error.to_string(),
-                            );
-                            if !self.remember_hierarchy_retry_or_block(
-                                RecoveryPhase::ReapLeases,
-                                RecoveryHierarchyRetryKind::Open,
-                                &[
-                                    boot_dir_entry.as_bytes(),
-                                    bucket_entry.as_bytes(),
-                                    shard_entry.as_bytes(),
-                                ],
-                                stats,
-                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                            ) {
-                                return;
-                            }
-                            continue;
-                        }
-                    };
-
-                    let mut entries = match read_recovery_directory(
-                        shard_fd.as_fd(),
-                        deadline_mono,
-                        scan.budget,
-                        scan.stats,
+                    if directory_before_cursor(
+                        self.recovery_cursor
+                            .reap_leases
+                            .as_ref()
+                            .map(FourLevelCursor::directories),
+                        &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                        shard_entry.as_bytes(),
                     ) {
-                        Ok(e) => e,
-                        Err(error) => {
-                            stats.scan_skips += 1;
-                            if Self::record_directory_error(
-                                stats,
-                                "reap_entry_read",
-                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                                &error,
-                            ) {
-                                return;
-                            }
-                            if !self.remember_hierarchy_retry_or_block(
-                                RecoveryPhase::ReapLeases,
-                                RecoveryHierarchyRetryKind::Enumerate,
-                                &[
-                                    boot_dir_entry.as_bytes(),
-                                    bucket_entry.as_bytes(),
-                                    shard_entry.as_bytes(),
-                                ],
-                                stats,
-                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                            ) {
-                                return;
-                            }
-                            continue;
-                        }
+                        continue;
+                    }
+                    let Some((shard_name, shard)) = shard_directory_name(
+                        stats,
+                        "reap_shard_name",
+                        shard_entry,
+                        self.format.shard_count(),
+                    ) else {
+                        continue;
                     };
-                    entries.sort();
+                    let shard_path = format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}");
+                    let (shard_fd, entries) = match self.descend_level(
+                        bucket_fd.as_fd(),
+                        &Level {
+                            phase: RecoveryPhase::ReapLeases,
+                            name: shard_name,
+                            components: &[
+                                boot_dir_entry.as_bytes(),
+                                bucket_entry.as_bytes(),
+                                shard_entry.as_bytes(),
+                            ],
+                            open_operation: "reap_shard_open",
+                            read_operation: "reap_entry_read",
+                            path: &shard_path,
+                        },
+                        scan,
+                        stats,
+                        deadline_mono,
+                    ) {
+                        Descend::Entries(fd, entries) => (fd, entries),
+                        Descend::Skip => continue,
+                        Descend::Stop => return,
+                    };
 
                     for raw_entry in &entries {
                         if let Some(cursor) = &self.recovery_cursor.reap_leases {
