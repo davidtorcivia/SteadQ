@@ -72,9 +72,17 @@ pub mod fault {
         errno: i32,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct NamedFault {
+        func_name: String,
+        name: String,
+        errno: i32,
+    }
+
     struct State {
         tracking: bool,
         faults: HashMap<String, Fault>,
+        named_faults: Vec<NamedFault>,
         counts: HashMap<String, u64>,
         fd_identities: HashMap<String, Vec<(u64, u64)>>,
         readdir_rotation: usize,
@@ -89,6 +97,7 @@ pub mod fault {
             State {
                 tracking: false,
                 faults: HashMap::new(),
+                named_faults: Vec::new(),
                 counts: HashMap::new(),
                 fd_identities: HashMap::new(),
                 readdir_rotation: 0,
@@ -110,6 +119,7 @@ pub mod fault {
             let mut s = s.borrow_mut();
             s.tracking = false;
             s.faults.clear();
+            s.named_faults.clear();
             s.counts.clear();
             s.fd_identities.clear();
             s.readdir_rotation = 0;
@@ -200,6 +210,24 @@ pub mod fault {
         });
     }
 
+    /// Fail the next call to `func_name` that names `name` with `errno`.
+    ///
+    /// Only wrappers that take a path component honor it: `open_directory`,
+    /// `openat`, `renameat2_noreplace` and `renameat` (either name),
+    /// `unlinkat`, and `unlinkat_dir`. A bounded directory read reopens its
+    /// directory as `open_directory(fd, ".")`, so `"."` fails the next read.
+    pub fn inject_errno_for(func_name: &str, name: &str, errno: i32) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.tracking = true;
+            s.named_faults.push(NamedFault {
+                func_name: func_name.to_string(),
+                name: name.to_string(),
+                errno,
+            });
+        });
+    }
+
     /// Number of times `func_name` has been checked since tracking began
     /// (the first `inject*` or `track()` after the last `reset()`).
     pub fn call_count(func_name: &str) -> u64 {
@@ -245,6 +273,13 @@ pub mod fault {
     /// Called by instrumented functions. Returns an error when a fault fires.
     #[inline]
     pub fn check(func_name: &str) -> Option<io::Error> {
+        check_names(func_name, &[])
+    }
+
+    /// `check` for a call on the path components `names`, which also fires
+    /// faults armed by `inject_errno_for`.
+    #[inline]
+    pub fn check_names(func_name: &str, names: &[&str]) -> Option<io::Error> {
         STATE.with(|s| {
             let mut s = s.borrow_mut();
             if !s.tracking {
@@ -259,14 +294,30 @@ pub mod fault {
                     return Some(io::Error::from_raw_os_error(errno));
                 }
             }
-            None
+            take_named_fault(&mut s.named_faults, func_name, names)
         })
+    }
+
+    fn take_named_fault(
+        faults: &mut Vec<NamedFault>,
+        func_name: &str,
+        names: &[&str],
+    ) -> Option<io::Error> {
+        let index = faults.iter().position(|fault| {
+            fault.func_name == func_name && names.contains(&fault.name.as_str())
+        })?;
+        Some(io::Error::from_raw_os_error(faults.remove(index).errno))
     }
 }
 
 macro_rules! fault_check {
     ($name:expr) => {
         if let Some(e) = $crate::fault::check($name) {
+            return Err(e);
+        }
+    };
+    ($name:expr, $($component:expr),+) => {
+        if let Some(e) = $crate::fault::check_names($name, &[$($component),+]) {
             return Err(e);
         }
     };
@@ -365,7 +416,7 @@ fn proc_self_fd_path_raw(value: u32) -> [u8; 32] {
 
 /// Open a directory for reading.
 pub fn open_directory(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
-    fault_check!("open_directory");
+    fault_check!("open_directory", name);
     // O_NOFOLLOW: state directories must not be symlinks.
     let c_name = cstr_from_name(name)?;
     // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
@@ -415,7 +466,7 @@ pub fn open_directory_beneath(
 
 /// Open a path relative to a directory fd with given flags.
 pub fn openat(dir_fd: BorrowedFd<'_>, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
-    fault_check!("openat");
+    fault_check!("openat", name);
     let c_name = cstr_from_name(name)?;
     // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, mode) };
@@ -480,7 +531,7 @@ pub fn renameat2_noreplace(
     new_dir_fd: BorrowedFd<'_>,
     new_name: &str,
 ) -> io::Result<()> {
-    fault_check!("renameat2_noreplace");
+    fault_check!("renameat2_noreplace", old_name, new_name);
     const RENAME_NOREPLACE: u32 = 1 << 0;
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
@@ -508,7 +559,7 @@ pub fn renameat(
     new_dir_fd: BorrowedFd<'_>,
     new_name: &str,
 ) -> io::Result<()> {
-    fault_check!("renameat");
+    fault_check!("renameat", old_name, new_name);
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
     // SAFETY: both names are NUL-terminated and both directory borrows remain live.
@@ -581,7 +632,7 @@ pub fn linkat_proc_self_fd(
 
 /// unlinkat - remove a file.
 pub fn unlinkat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
-    fault_check!("unlinkat");
+    fault_check!("unlinkat", name);
     let c_name = cstr_from_name(name)?;
     // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0) };
@@ -593,7 +644,7 @@ pub fn unlinkat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
 
 /// Remove a directory (must be empty).
 pub fn unlinkat_dir(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
-    fault_check!("unlinkat_dir");
+    fault_check!("unlinkat_dir", name);
     const AT_REMOVEDIR: i32 = 0x200;
     let c_name = cstr_from_name(name)?;
     // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
@@ -1608,6 +1659,42 @@ mod tests {
         fsync(fd.as_fd()).unwrap();
         assert_eq!(fault::call_count("fsync"), 2);
         fault::reset();
+    }
+
+    #[test]
+    fn fault_inject_errno_for_fires_once_on_the_named_component() {
+        let dir = test_dir("named");
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        fault::reset();
+        fault::inject_errno_for("open_directory", "b", libc::ELOOP);
+        // Another name, and the right name under another wrapper, pass.
+        open_directory(fd.as_fd(), "a").unwrap();
+        openat(fd.as_fd(), "b", libc::O_RDONLY | libc::O_CLOEXEC, 0).unwrap();
+        let error = open_directory(fd.as_fd(), "b").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        open_directory(fd.as_fd(), "b").unwrap();
+        assert_eq!(fault::call_count("open_directory"), 3);
+        fault::reset();
+    }
+
+    #[test]
+    fn fault_inject_errno_for_matches_either_rename_name() {
+        let dir = test_dir("named-rename");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("src"), b"x").unwrap();
+        fault::reset();
+        fault::inject_errno_for("renameat", "dst", libc::EXDEV);
+        fault::inject_errno_for("renameat2_noreplace", "src", libc::EIO);
+        let error = renameat(fd.as_fd(), "src", fd.as_fd(), "dst").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        let error = renameat2_noreplace(fd.as_fd(), "src", fd.as_fd(), "dst").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        fault::inject_errno_for("unlinkat", "src", libc::EIO);
+        fault::reset();
+        unlinkat(fd.as_fd(), "src").unwrap();
     }
 
     #[test]
