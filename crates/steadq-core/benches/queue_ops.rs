@@ -182,6 +182,43 @@ fn bench_lease_empty(c: &mut Criterion) {
     group.finish();
 }
 
+// An idle poll on one open handle, so queue setup and teardown stay out of
+// the measured time.
+fn bench_lease_empty_steady(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lease_empty_steady");
+    for shard_count in [64u32, 256].iter() {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(shard_count),
+            shard_count,
+            |b, &sc| {
+                let tmp = benchmark_tempdir();
+                Queue::init(
+                    tmp.path(),
+                    &CreateOptions {
+                        shard_count: sc,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut q = Queue::open(
+                    tmp.path(),
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                b.iter(|| {
+                    let outcome = q.lease(0, 30_000_000_000);
+                    assert!(matches!(outcome, LeaseOutcome::Empty));
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_lease_hit(c: &mut Criterion) {
     let mut group = c.benchmark_group("lease_hit");
     for n_jobs in [1u32, 10, 100].iter() {
@@ -549,6 +586,7 @@ criterion_group!(
     bench_fsck,
     bench_enqueue,
     bench_lease_empty,
+    bench_lease_empty_steady,
     bench_lease_hit,
     bench_ack,
     bench_sustained_enqueue,
