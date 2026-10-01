@@ -129,12 +129,14 @@ A queue lives in a directory on a local Linux filesystem (ext4, XFS, btrfs, f2fs
         recovery.lock         OFD write lock for exclusive recovery
         wall-watermark        Authenticated wall-time floor
       ready/<shard>/          Ready jobs; leased jobs stay here with boot id in the filename
-      leased/<boot>/<bucket>/<shard>/   Previous-layout leases, still scanned on recovery
+      leased/<boot>/<bucket>/<shard>/   Previous-layout leases, still scanned on recovery;
+                                        drained directories of earlier boots are removed
       delayed/<bucket>/<shard>/         Jobs waiting for scheduled delivery
       dead/<bucket>/<shard>/            Jobs that exhausted retries
       receipts/<bucket>/<shard>/        Acknowledgment records
       quarantine/            Corrupt objects isolated for inspection
-      tmp/                   Temporary staging for publication
+      tmp/<boot>/<shard>/    Temporary staging for publication; drained directories
+                             of earlier boots are removed
 
 Every job filename encodes its identity: queue ID, job ID, generation, attempt count, lease token, content digest, and an integrity tag. State transitions are no-overwrite renames through a phase-aware executor that classifies every failure as either not-committed (before the rename) or outcome-unknown (after the rename).
 
@@ -153,7 +155,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 867 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 871 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
