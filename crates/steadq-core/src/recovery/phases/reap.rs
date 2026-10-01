@@ -111,6 +111,7 @@ impl Queue {
                 Descend::Skip => continue,
                 Descend::Stop => return,
             };
+            let mut absent_buckets = 0usize;
 
             for bucket_entry in &bucket_dirs {
                 if directory_before_cursor(
@@ -171,6 +172,7 @@ impl Queue {
                     Descend::Skip => continue,
                     Descend::Stop => return,
                 };
+                let mut absent_shards = 0usize;
 
                 for shard_entry in &shard_dirs {
                     if directory_before_cursor(
@@ -214,6 +216,7 @@ impl Queue {
                         Descend::Skip => continue,
                         Descend::Stop => return,
                     };
+                    let mut absent_entries = 0usize;
 
                     for raw_entry in &entries {
                         if let Some(cursor) = &self.recovery_cursor.reap_leases {
@@ -363,29 +366,108 @@ impl Queue {
                                 DeadReason::AttemptsExhausted,
                                 wall_floor,
                             ) {
-                                Ok(()) => stats.leases_to_dead += 1,
-                                Err(failure) => Self::record_move_failure(
-                                    stats,
-                                    "reap_to_dead",
-                                    &relative_path,
-                                    failure,
-                                ),
+                                Ok(()) => {
+                                    stats.leases_to_dead += 1;
+                                    absent_entries += 1;
+                                }
+                                Err(failure) => {
+                                    if matches!(failure, MoveFailure::SourceMissing) {
+                                        absent_entries += 1;
+                                    }
+                                    Self::record_move_failure(
+                                        stats,
+                                        "reap_to_dead",
+                                        &relative_path,
+                                        failure,
+                                    )
+                                }
                             }
                         } else {
                             stats.operations_attempted += 1;
                             match self.reap_to_ready(shard_fd.as_fd(), shard, entry, &parsed.common)
                             {
-                                Ok(()) => stats.leases_reaped += 1,
-                                Err(failure) => Self::record_move_failure(
-                                    stats,
-                                    "reap_to_ready",
-                                    &relative_path,
-                                    failure,
-                                ),
+                                Ok(()) => {
+                                    stats.leases_reaped += 1;
+                                    absent_entries += 1;
+                                }
+                                Err(failure) => {
+                                    if matches!(failure, MoveFailure::SourceMissing) {
+                                        absent_entries += 1;
+                                    }
+                                    Self::record_move_failure(
+                                        stats,
+                                        "reap_to_ready",
+                                        &relative_path,
+                                        failure,
+                                    )
+                                }
                             }
                         }
                     }
+
+                    // New leases stay in ready/, so only a process from an
+                    // older release running on that boot writes here.
+                    if is_current_boot
+                        || !all_observed_children_absent(absent_entries, entries.len())
+                    {
+                        continue;
+                    }
+                    match Self::prune_empty_directory(
+                        bucket_fd.as_fd(),
+                        shard_name,
+                        "reap_shard_remove",
+                        &shard_path,
+                        budget,
+                        stats,
+                        deadline_mono,
+                    ) {
+                        Prune::Removed => {
+                            stats.shards_removed += 1;
+                            absent_shards += 1;
+                        }
+                        Prune::Missing => absent_shards += 1,
+                        Prune::Kept => {}
+                        Prune::Stop => return,
+                    }
                 }
+
+                if is_current_boot || !all_observed_children_absent(absent_shards, shard_dirs.len())
+                {
+                    continue;
+                }
+                match Self::prune_empty_directory(
+                    boot_dir_fd.as_fd(),
+                    bucket_name,
+                    "reap_bucket_remove",
+                    &bucket_path,
+                    budget,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Prune::Removed => {
+                        stats.buckets_removed += 1;
+                        absent_buckets += 1;
+                    }
+                    Prune::Missing => absent_buckets += 1,
+                    Prune::Kept => {}
+                    Prune::Stop => return,
+                }
+            }
+
+            if is_current_boot || !all_observed_children_absent(absent_buckets, bucket_dirs.len()) {
+                continue;
+            }
+            match Self::prune_empty_directory(
+                leased_fd.as_fd(),
+                boot_dir_name,
+                "reap_boot_remove",
+                &boot_path,
+                budget,
+                stats,
+                deadline_mono,
+            ) {
+                Prune::Removed | Prune::Missing | Prune::Kept => {}
+                Prune::Stop => return,
             }
         }
         self.recovery_cursor.reap_leases = None;

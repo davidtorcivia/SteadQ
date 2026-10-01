@@ -81,6 +81,7 @@ impl Queue {
                 Descend::Skip => continue,
                 Descend::Stop => return,
             };
+            let mut absent_shards = 0usize;
 
             for shard_entry in &shard_dirs {
                 if directory_before_cursor(
@@ -120,6 +121,7 @@ impl Queue {
                     Descend::Skip => continue,
                     Descend::Stop => return,
                 };
+                let mut absent_entries = 0usize;
 
                 for raw_entry in &entries {
                     if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -167,16 +169,62 @@ impl Queue {
                         let relative_path = format!("tmp/{boot_dir_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
                         match unlink_verified(shard_fd.as_fd(), entry) {
-                            Ok(()) => stats.temp_files_deleted += 1,
-                            Err(failure) => Self::record_unlink_failure(
-                                stats,
-                                "temp_delete",
-                                &relative_path,
-                                failure,
-                            ),
+                            Ok(()) => {
+                                stats.temp_files_deleted += 1;
+                                absent_entries += 1;
+                            }
+                            Err(failure) => {
+                                if matches!(failure, UnlinkFailure::SourceMissing) {
+                                    absent_entries += 1;
+                                }
+                                Self::record_unlink_failure(
+                                    stats,
+                                    "temp_delete",
+                                    &relative_path,
+                                    failure,
+                                )
+                            }
                         }
                     }
                 }
+
+                // Only a process running on that boot writes under tmp/<boot>.
+                if is_current_boot || !all_observed_children_absent(absent_entries, entries.len()) {
+                    continue;
+                }
+                match Self::prune_empty_directory(
+                    boot_dir_fd.as_fd(),
+                    shard_name,
+                    "temp_shard_remove",
+                    &shard_path,
+                    budget,
+                    stats,
+                    deadline_mono,
+                ) {
+                    Prune::Removed => {
+                        stats.shards_removed += 1;
+                        absent_shards += 1;
+                    }
+                    Prune::Missing => absent_shards += 1,
+                    Prune::Kept => {}
+                    Prune::Stop => return,
+                }
+            }
+
+            if is_current_boot || !all_observed_children_absent(absent_shards, shard_dirs.len()) {
+                continue;
+            }
+            match Self::prune_empty_directory(
+                tmp_fd.as_fd(),
+                boot_dir_name,
+                "temp_boot_remove",
+                &boot_path,
+                budget,
+                stats,
+                deadline_mono,
+            ) {
+                Prune::Removed | Prune::Missing | Prune::Kept => {}
+                Prune::Stop => return,
             }
         }
         self.recovery_cursor.cleanup_temp = None;

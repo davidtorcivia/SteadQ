@@ -1377,16 +1377,24 @@ fn readdir_permutations_preserve_reap_budget_boundaries() {
     drop(queue);
     assert!(leased.iter().all(|path| path.exists()));
 
-    for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+    for (pass, &(rotation, reversed)) in RECOVERY_READ_PERMUTATIONS.iter().enumerate() {
         let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
-        let stats = reap_expired_with_budget(&mut queue, &budget);
-        fs::fault::reset();
-        assert_eq!(stats.operations_attempted, 1, "pass={pass}");
-        assert_eq!(
-            stats.leases_reaped, 1,
-            "pass={pass} errors={:?}",
-            stats.errors
-        );
+        // Removing a drained shard, bucket, or boot spends the one operation too.
+        for attempt in 0.. {
+            fs::fault::permute_readdir(rotation, reversed);
+            let stats = reap_expired_with_budget(&mut queue, &budget);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert!(
+                stats.errors.is_empty(),
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            if stats.leases_reaped == 1 {
+                break;
+            }
+            assert!(attempt < 3, "pass={pass} made no reap progress");
+        }
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
         assert_removed_prefix(&leased, pass);
@@ -1560,23 +1568,31 @@ fn readdir_permutations_preserve_temp_cleanup_budget_boundaries() {
     drop(queue);
     assert!(temp_paths.iter().all(|path| path.exists()));
 
-    for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+    for (pass, &(rotation, reversed)) in RECOVERY_READ_PERMUTATIONS.iter().enumerate() {
         let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
-        let scan_budget = RecoveryScanBudget::default();
-        let mut scan_stats = RecoveryScanStats::default();
-        let mut scan = RecoveryScanContext {
-            budget: &scan_budget,
-            stats: &mut scan_stats,
-        };
-        let mut stats = RecoveryStats::default();
-        queue.cleanup_temp_files(u64::MAX, &budget, &mut scan, &mut stats, u64::MAX);
-        fs::fault::reset();
-        assert_eq!(stats.operations_attempted, 1, "pass={pass}");
-        assert_eq!(
-            stats.temp_files_deleted, 1,
-            "pass={pass} errors={:?}",
-            stats.errors
-        );
+        // Removing a drained shard or boot spends the one operation too.
+        for attempt in 0.. {
+            fs::fault::permute_readdir(rotation, reversed);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            queue.cleanup_temp_files(u64::MAX, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert!(
+                stats.errors.is_empty(),
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            if stats.temp_files_deleted == 1 {
+                break;
+            }
+            assert!(attempt < 2, "pass={pass} made no cleanup progress");
+        }
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
         assert_removed_prefix(&temp_paths, pass);
@@ -4633,7 +4649,9 @@ fn temporary_cleanup_records_unlink_phase_without_counting_commit() {
                 category == "outcome_unknown",
             );
         } else {
-            assert_eq!(stats.operations_attempted, 1);
+            // The shard removal attempt finds the file still present.
+            assert_eq!(stats.operations_attempted, 2);
+            assert_eq!(stats.shards_removed, 0);
             assert_eq!(stats.errors.len(), 1);
             assert_eq!(stats.errors[0].operation, "temp_delete_source_missing");
         }
@@ -6141,7 +6159,9 @@ fn temp_cleanup_deletes_other_boot_temps_and_current_boot_temps_past_the_ttl() {
     assert!(current.join(&at_ttl).exists());
     assert!(!current.join(&past_ttl).exists());
     assert!(current.join("junk.tmp").exists());
-    assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
+    assert_eq!(stats.shards_removed, 1);
+    assert!(!other.parent().unwrap().exists());
+    assert!(current.exists());
 }
 
 #[test]
@@ -6183,4 +6203,101 @@ fn retention_counts_a_missing_shard_as_absent_before_removing_its_bucket() {
     assert!(!receipt.exists());
     assert!(shard_dir.exists());
     assert!(bucket_dir.exists());
+}
+
+#[test]
+fn temp_cleanup_prunes_drained_directories_of_other_boots_only() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let other = tmp.path().join("tmp/00000000-0000-0000-0000-000000000001");
+    let current = tmp.path().join("tmp").join(queue.boot_id()).join("0000");
+    std::fs::create_dir_all(other.join("0000")).unwrap();
+    std::fs::create_dir_all(other.join("0001")).unwrap();
+    std::fs::create_dir_all(&current).unwrap();
+    let name = steadq_names::temp_filename(0, &[0xAB; 16]);
+    std::fs::write(other.join("0000").join(&name), b"").unwrap();
+    std::fs::write(current.join(&name), b"").unwrap();
+
+    let stats = cleanup_temp_with_budget(&mut queue);
+
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.temp_files_deleted, 2);
+    assert_eq!(stats.shards_removed, 2);
+    assert_eq!(stats.operations_attempted, 5);
+    assert!(!other.exists());
+    assert!(!current.join(&name).exists());
+    assert!(current.exists());
+}
+
+#[test]
+fn temp_cleanup_keeps_a_boot_directory_with_a_remaining_entry() {
+    let (tmp, mut queue) = create_test_queue_with_shards(2);
+    let other = tmp.path().join("tmp/00000000-0000-0000-0000-000000000001");
+    std::fs::create_dir_all(other.join("0000")).unwrap();
+    std::fs::create_dir_all(other.join("0001")).unwrap();
+    std::fs::write(other.join("0001/unrelated"), b"").unwrap();
+
+    let stats = cleanup_temp_with_budget(&mut queue);
+
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 1);
+    assert_eq!(stats.operations_attempted, 1);
+    assert!(!other.join("0000").exists());
+    assert!(other.join("0001/unrelated").exists());
+}
+
+#[test]
+fn temp_cleanup_counts_a_vanished_shard_directory_as_absent() {
+    let (tmp, mut queue) = create_test_queue();
+    let other = tmp.path().join("tmp/00000000-0000-0000-0000-000000000001");
+    std::fs::create_dir_all(other.join("0000")).unwrap();
+
+    fs::fault::reset();
+    fs::fault::inject_errno_for("unlinkat_dir", "0000", libc::ENOENT);
+    let stats = cleanup_temp_with_budget(&mut queue);
+    fs::fault::reset();
+
+    // The boot removal is attempted and finds the shard still present.
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.shards_removed, 0);
+    assert_eq!(stats.operations_attempted, 2);
+    assert!(other.join("0000").exists());
+}
+
+#[test]
+fn reap_prunes_drained_legacy_lease_directories_of_other_boots_only() {
+    let (tmp, mut queue) = create_test_queue();
+    let current_boot = queue.boot_id.clone();
+    let old_boot = "00000000-0000-0000-0000-000000000001";
+    queue.boot_id = old_boot.into();
+    assert!(matches!(
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"legacy".to_vec(),
+            ..Default::default()
+        }),
+        EnqueueOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        queue.lease(0, 30_000_000_000),
+        LeaseOutcome::Leased(_)
+    ));
+    queue.boot_id = current_boot.clone();
+    relocate_colocated_leases_into_legacy_tree(tmp.path(), &queue);
+    let old = tmp.path().join("leased").join(old_boot);
+    let current = tmp
+        .path()
+        .join("leased")
+        .join(&current_boot)
+        .join("0000000000000000/0000");
+    std::fs::create_dir_all(&current).unwrap();
+
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+
+    assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+    assert_eq!(stats.leases_reaped, 1);
+    assert_eq!(stats.shards_removed, 1);
+    assert_eq!(stats.buckets_removed, 1);
+    assert!(!old.exists());
+    assert!(current.exists());
 }
